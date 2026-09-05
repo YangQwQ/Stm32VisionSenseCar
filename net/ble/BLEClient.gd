@@ -22,6 +22,18 @@ func _set_state(s: String) -> void:
 	ble_state_changed.emit(s)
 
 func _ready() -> void:
+	# ---- 诊断：打印 GDExtension 加载状态 ----
+	var mgr_singleton: Object = Engine.get_singleton("GDExtensionManager")
+	if mgr_singleton != null:
+		print("GDBLE-DIAG loaded_extensions=", str(mgr_singleton.call("get_loaded_extensions")))
+		print("GDBLE-DIAG is_loaded=", str(mgr_singleton.call("is_extension_loaded", "res://addons/gdble/gdble.gdextension")))
+	var all_cls := ClassDB.get_class_list()
+	var ble_cls: Array = []
+	for c: String in all_cls:
+		if c.to_lower().contains("bluetooth") or c.to_lower().contains("gdble"):
+			ble_cls.append(c)
+	print("GDBLE-DIAG ble_classes=", str(ble_cls))
+	# ---- 诊断结束 ----
 	# GDBLE 通过 ClassDB 注册蓝牙管理器；用 derive/即时化避免未加载时解析失败
 	if not ClassDB.class_exists("BluetoothManager"):
 		push_warning("GDBLE 未加载，蓝牙扫描不可用")
