@@ -96,6 +96,111 @@ static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
 
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+// =================== WebSocket（端口 81 根路径，手机 App WSCarClient 通道） ===================
+#include "ArduinoJson.h"
+#include "camera.h"
+
+#define WS_STREAM_FPS 10
+
+static volatile bool ws_streaming = false;
+
+static esp_err_t ws_send_text(int fd, const char *text)
+{
+    httpd_ws_frame_t frame = {0};
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    frame.payload = (uint8_t *)text;
+    frame.len = strlen(text);
+    return httpd_ws_send_frame_async(stream_httpd, fd, &frame);
+}
+
+static esp_err_t ws_send_jpeg(int fd, camera_fb_t *fb)
+{
+    httpd_ws_frame_t frame = {0};
+    frame.type = HTTPD_WS_TYPE_BINARY;
+    frame.payload = fb->buf;
+    frame.len = fb->len;
+    return httpd_ws_send_frame_async(stream_httpd, fd, &frame);
+}
+
+// 文本帧 = 指令 JSON；stream/snapshot/ping 就地处理，其余类型后续交给 command 模块
+static void ws_handle_text(const char *json, int fd)
+{
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) {
+        log_w("[ws] bad json: %s", json);
+        return;
+    }
+    const char *type = doc["type"] | "";
+    JsonObject params = doc["params"].as<JsonObject>();
+
+    if (!strcmp(type, "stream")) {
+        ws_streaming = params["on"] | false;
+        log_i("[ws] stream=%u", ws_streaming);
+    } else if (!strcmp(type, "snapshot")) {
+        camera_fb_t *fb = cam::grab();
+        if (fb) {
+            ws_send_jpeg(fd, fb);
+            cam::return_frame(fb);
+        }
+    } else if (!strcmp(type, "ping")) {
+        ws_send_text(fd, "{\"type\":\"pong\"}");
+    } else {
+        log_i("[ws] unhandled type: %s", type); // TODO: 移交 command 模块
+    }
+}
+
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        // 非 WS 升级的浏览器访问根路径 → 重定向到 /stream
+        if (httpd_req_get_hdr_value_len(req, "Upgrade") == 0) {
+            httpd_resp_set_status(req, "302 Found");
+            httpd_resp_set_hdr(req, "Location", "/stream");
+            httpd_resp_send(req, NULL, 0);
+            return ESP_OK;
+        }
+        return ESP_OK; // WS 握手，101 由 httpd 自动完成
+    }
+
+    httpd_ws_frame_t pkt = {0};
+    pkt.type = HTTPD_WS_TYPE_TEXT;
+    esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
+    if (ret != ESP_OK) return ret;
+    if (pkt.len == 0) return ESP_OK;
+    if (pkt.len > 4096) return ESP_FAIL; // 异常大帧，断开连接
+
+    char *buf = (char *)malloc(pkt.len + 1);
+    if (!buf) return ESP_ERR_NO_MEM;
+    pkt.payload = (uint8_t *)buf;
+    ret = httpd_ws_recv_frame(req, &pkt, pkt.len);
+    if (ret == ESP_OK && pkt.type == HTTPD_WS_TYPE_TEXT && pkt.len <= 512) {
+        buf[pkt.len] = 0;
+        ws_handle_text(buf, httpd_req_to_sockfd(req));
+    }
+    free(buf);
+    return ret;
+}
+
+// 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧
+static void ws_stream_task(void *arg)
+{
+    while (true) {
+        if (ws_streaming) {
+            camera_fb_t *fb = cam::grab();
+            if (fb) {
+                int fd = -1;
+                while (httpd_ws_client_iterate(stream_httpd, &fd) == ESP_OK) {
+                    ws_send_jpeg(fd, fb);
+                }
+                cam::return_frame(fb);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
+    }
+}
+#endif // CONFIG_HTTPD_WS_SUPPORT
+
 #if CONFIG_ESP_FACE_DETECT_ENABLED
 
 static int8_t detection_enabled = 0;
@@ -1285,6 +1390,19 @@ void startCameraServer()
 #endif
     };
 
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    // WS 通道挂在端口 81（流服务器）根路径，与 /stream 共存
+    httpd_uri_t ws_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = ws_handler,
+        .user_ctx = NULL,
+        .is_websocket = true,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = NULL
+    };
+#endif
+
     httpd_uri_t xclk_uri = {
         .uri = "/xclk",
         .method = HTTP_GET,
@@ -1380,6 +1498,10 @@ void startCameraServer()
     if (httpd_start(&stream_httpd, &config) == ESP_OK)
     {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+        httpd_register_uri_handler(stream_httpd, &ws_uri);
+        xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 4096, NULL, 5, NULL, 1);
+#endif
     }
 }
 
