@@ -100,6 +100,8 @@ httpd_handle_t camera_httpd = NULL;
 // =================== WebSocket（端口 81 根路径，手机 App WSCarClient 通道） ===================
 #include "ArduinoJson.h"
 #include "camera.h"
+#include "command.h"
+#include "ble.h"
 
 #define WS_STREAM_FPS 10
 
@@ -123,7 +125,14 @@ static esp_err_t ws_send_jpeg(int fd, camera_fb_t *fb)
     return httpd_ws_send_frame_async(stream_httpd, fd, &frame);
 }
 
-// 文本帧 = 指令 JSON；stream/snapshot/ping 就地处理，其余类型后续交给 command 模块
+// cmd::Reply 适配：把应答文本发回给指定 fd
+static void ws_cmd_reply(void *ctx, const char *text)
+{
+    int fd = *(int *)ctx;
+    ws_send_text(fd, text);
+}
+
+// 文本帧 = 指令 JSON；stream/snapshot/ping 就地处理，其余类型统一移交 command 模块
 static void ws_handle_text(const char *json, int fd)
 {
     JsonDocument doc;
@@ -146,7 +155,9 @@ static void ws_handle_text(const char *json, int fd)
     } else if (!strcmp(type, "ping")) {
         ws_send_text(fd, "{\"type\":\"pong\"}");
     } else {
-        log_i("[ws] unhandled type: %s", type); // TODO: 移交 command 模块
+        // 统一词表：move/stop/arm/config/ai_goal 等交给 command（含 UART 翻译/配网）
+        log_i("[ws] forward to cmd: %s", type);
+        cmd::handle(json, true, ws_cmd_reply, &fd);
     }
 }
 
@@ -182,20 +193,29 @@ static esp_err_t ws_handler(httpd_req_t *req)
     return ret;
 }
 
-// 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧
+// 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧；
+// 同时探测 WS 客户端存在性，喂给 ble::set_ws_connected（status.ws）。
 static void ws_stream_task(void *arg)
 {
     while (true) {
+        bool has_client = false;
         if (ws_streaming) {
             camera_fb_t *fb = cam::grab();
             if (fb) {
                 int fd = -1;
                 while (httpd_ws_client_iterate(stream_httpd, &fd) == ESP_OK) {
+                    has_client = true;
                     ws_send_jpeg(fd, fb);
                 }
                 cam::return_frame(fb);
             }
+        } else {
+            int fd = -1;
+            if (httpd_ws_client_iterate(stream_httpd, &fd) == ESP_OK) {
+                has_client = true;  // 有客户端挂着（即便未开流）
+            }
         }
+        ble::set_ws_connected(has_client);
         vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
     }
 }

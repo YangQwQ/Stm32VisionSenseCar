@@ -2,6 +2,9 @@
 #include "config.h"
 #include "network.h"
 #include "camera.h"
+#include "uart.h"
+#include "command.h"
+#include "ble.h"
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -44,25 +47,31 @@ void setup() {
 
   cfg::init();
 
-  if (!cam::init()) {
-    Serial.println("Camera init failed");
-    return;
-  }
+  // BLE GATT Server 不依赖摄像头/WiFi——配网阶段无网可用，也要先能连上手机
+  ble::init();
 
+  uart::init();  // Serial2 → 执行板（STM32）
+
+  if (!cam::init()) {
+    Serial.println("Camera init failed (继续：BLE 配网/控制仍可用)");
+  } else {
 // Setup LED FLash if LED pin is defined in camera_pins.h
 #if defined(LED_GPIO_NUM)
-  setupLedFlash(LED_GPIO_NUM);
+    setupLedFlash(LED_GPIO_NUM);
 #endif
+  }
 
   net::init();
-
   startCameraServer();
 
-  Serial.println("Camera Ready!");
+  Serial.println("Ready!");
 }
 
 void loop() {
-  // WiFi 断线重连由 network 模块处理，其余工作在其他任务中完成
+  // WiFi 断线重连由 network 模块处理
   net::update();
+  ble::update();   // 处理 BLE cmd 队列 + WiFi 状态变化上报
+  cmd::update();   // 延迟重启（配网生效）
+  uart::update();  // 收执行板状态帧（骨架）
   delay(10);
 }
