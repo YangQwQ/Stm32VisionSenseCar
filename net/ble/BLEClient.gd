@@ -25,6 +25,7 @@ var _state := "off"      # off / unavailable / initializing / idle / scanning / 
 var _mgr: Node = null
 var _initialized := false
 var _pending_scan := false
+var _restart_scan := false   # 扫描中又点刷新：当前扫描结束后立即重扫一轮
 
 # GATT 客户端状态
 var _dev: Variant = null            # BleDevice (RefCounted)，connect_device 返回的句柄
@@ -82,6 +83,11 @@ func scan() -> void:
 		_scan_finish_empty()
 		return
 	if _state == "scanning":
+		# 扫描中又点刷新：不吞掉，先停旧扫描，结束后 _on_scan_stopped 里立即重扫。
+		# 也顺带自愈"上一轮没收到 scan_stopped 导致状态卡死 scanning"的情况。
+		_restart_scan = true
+		print("[BLE] scan() 遇扫描中，当前轮结束后重扫")
+		_mgr.call("stop_scan")
 		return
 	if not _initialized:
 		_pending_scan = true
@@ -103,10 +109,18 @@ func _on_scan_stopped() -> void:
 	var named := _named_devices(devs)
 	print("[BLE] 扫描结束，发现设备: ", str(named))
 	scan_finished.emit(named)
+	if _restart_scan:
+		_restart_scan = false
+		_start_real_scan()
 
 func _on_error(message: String) -> void:
 	push_warning("蓝牙错误: %s" % message)
+	var was_scanning := _state == "scanning"
 	_set_state("idle")
+	if was_scanning:
+		# 扫描失败也要收尾下拉框，否则停在"扫描中…"；顺带清掉排队重扫
+		_restart_scan = false
+		_scan_finish_empty()
 
 func _named_devices(devs: Array) -> Array:
 	# 只收广播了名字的设备，丢弃匿名（name=null/空）——那是周边耳机/手环噪音。

@@ -1,2 +1,4 @@
 .godot
-android
+/android
+.claude
+addons/gdble/~libgdble.windows.x86_64.dll

@@ -46,10 +46,27 @@ func _ready() -> void:
 	_device_list.item_selected.connect(_on_device_selected)
 
 	AppState.hook_auto_ws()
+	_request_ble_permissions()
 	# 启动即尝试连接小车（默认软 AP 地址；离线只显示未连接，不阻塞 UI）
 	$Net/WS.connect_car()
 	_update_status()
 	set_process_input(true)
+
+# Android 运行时权限：BLE 扫描/连接 + 定位。声明在 export_presets（BLUETOOTH_* 等），
+# 这里启动即申请，新装手机首次打开会弹窗，无需 adb pm grant。
+# 注：ACCESS_FINE_LOCATION 要 toggle=true 与 custom_permissions 双声明，才会额外带一条
+# 无 maxSdkVersion 的声明（toggle 单独那条被写死 maxSdk=30，API>=31 实为未声明）。MIUI 门禁认
+# FINE，无 cap 条存在即可弹窗授权，见 CLAUDE.md「已知坑」。无需 apktool / pm grant。
+func _request_ble_permissions() -> void:
+	if OS.get_name() != "Android":
+		return
+	for p: String in [
+			"android.permission.BLUETOOTH_SCAN",
+			"android.permission.BLUETOOTH_CONNECT",
+			"android.permission.ACCESS_FINE_LOCATION",
+		]:
+		if not OS.get_granted_permissions().has(p):
+			OS.request_permission(p)
 
 # ============================== BLE ==============================
 
@@ -72,6 +89,8 @@ func _on_scan_finished(devices: Array) -> void:
 	if _device_list.item_count == 0:
 		_device_list.add_item("（未发现设备，点刷新）")
 		_device_list.set_item_metadata(0, {})
+		if OS.get_name() == "Android" and not OS.get_granted_permissions().has("android.permission.BLUETOOTH_SCAN"):
+			_chat("提示", "未授予蓝牙/附近设备权限，扫描不到设备——请到系统设置允许本 App 权限后刷新")
 
 func _on_device_selected(index: int) -> void:
 	var meta: Variant = _device_list.get_item_metadata(index)
@@ -112,6 +131,10 @@ func _on_ble_status(data: Dictionary) -> void:
 	_update_status()
 
 func _on_refresh_pressed() -> void:
+	# 立即让下拉框进入"扫描中"态，点一次必有可见反应；结果由 scan_finished 覆盖
+	_device_list.clear()
+	_device_list.add_item("扫描中…")
+	_device_list.set_item_metadata(0, {})
 	$Net/BLE.scan()
 
 func _on_provision_pressed() -> void:
