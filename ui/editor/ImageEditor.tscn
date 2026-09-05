@@ -1,0 +1,140 @@
+[gd_scene load_steps=4 format=3 uid="uid://c4imgreader0001"]
+
+[ext_resource type="Script" path="res://ui/editor/ImageEditor.gd" id="1_img"]
+[ext_resource type="Script" path="res://ui/editor/EditorCanvas.gd" id="2_can"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBox_editor"]
+content_margin_left = 24.0
+content_margin_top = 24.0
+content_margin_right = 24.0
+content_margin_bottom = 24.0
+bg_color = Color(0.12, 0.13, 0.17, 0.98)
+corner_radius_top_left = 12
+corner_radius_top_right = 12
+corner_radius_bottom_right = 12
+corner_radius_bottom_left = 12
+
+[node name="ImageEditor" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+visible = false
+script = ExtResource("1_img")
+
+[node name="Dim" type="ColorRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0, 0, 0, 0.65)
+
+[node name="Panel" type="PanelContainer" parent="." unique_name_in_owner = true]
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -430.0
+offset_top = -290.0
+offset_right = 430.0
+offset_bottom = 290.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_styles/panel = SubResource("StyleBox_editor")
+
+[node name="VBox" type="VBoxContainer" parent="Panel"]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="Toolbar" type="HBoxContainer" parent="Panel/VBox"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="RectBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+custom_minimum_size = Vector2(88, 0)
+layout_mode = 2
+toggle_mode = true
+text = "框"
+
+[node name="ArrowBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+custom_minimum_size = Vector2(88, 0)
+layout_mode = 2
+toggle_mode = true
+text = "箭头"
+
+[node name="TextBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+custom_minimum_size = Vector2(88, 0)
+layout_mode = 2
+toggle_mode = true
+text = "文字"
+
+[node name="TextInput" type="LineEdit" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+custom_minimum_size = Vector2(200, 0)
+layout_mode = 2
+placeholder_text = "标注文字"
+
+[node name="UndoBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+layout_mode = 2
+text = "撤销"
+
+[node name="ClearBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+layout_mode = 2
+text = "清除"
+
+[node name="Spacer" type="Control" parent="Panel/VBox/Toolbar"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CancelBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+layout_mode = 2
+text = "取消"
+
+[node name="DoneBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+layout_mode = 2
+text = "完成"
+
+[node name="SendAIBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
+layout_mode = 2
+text = "发送给AI"
+
+[node name="ViewportWrap" type="Control" parent="Panel/VBox"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="SubViewportContainer" type="SubViewportContainer" parent="Panel/VBox/ViewportWrap"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+stretch = true
+
+[node name="Viewport" type="SubViewport" parent="Panel/VBox/ViewportWrap/SubViewportContainer" unique_name_in_owner = true]
+render_target_update_mode = 3
+transparent_bg = true
+
+[node name="Canvas" type="Control" parent="Panel/VBox/ViewportWrap/SubViewportContainer/Viewport" unique_name_in_owner = true]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("2_can")
+
+[connection signal="pressed" from="Panel/VBox/Toolbar/RectBtn" to="." method="_on_rect_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/ArrowBtn" to="." method="_on_arrow_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/TextBtn" to="." method="_on_text_pressed"]
+[connection signal="text_submitted" from="Panel/VBox/Toolbar/TextInput" to="." method="_on_text_text_submitted"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/UndoBtn" to="." method="_on_undo_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/ClearBtn" to="." method="_on_clear_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/CancelBtn" to="." method="_on_cancel_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/DoneBtn" to="." method="_on_done_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/SendAIBtn" to="." method="_on_send_ai_pressed"]

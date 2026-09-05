@@ -1,0 +1,469 @@
+[gd_scene format=3 uid="uid://djeb0cuoeaeet"]
+
+[ext_resource type="Script" uid="uid://d1tmutexp2vuy" path="res://Main.gd" id="1_main"]
+[ext_resource type="Script" uid="uid://cat6olj1u350v" path="res://net/ble/BLEClient.gd" id="2_ble"]
+[ext_resource type="Script" uid="uid://coab8np8s88w0" path="res://net/ws/WSCarClient.gd" id="3_ws"]
+[ext_resource type="Script" uid="uid://deelide4k4qql" path="res://net/ai/AIClient.gd" id="4_ai"]
+[ext_resource type="Script" uid="uid://c7y01patjmc1s" path="res://ui/video/VideoView.gd" id="5_trn2v"]
+[ext_resource type="Script" uid="uid://dmgue5hwo2dt3" path="res://DirectControl.gd" id="6_03owx"]
+[ext_resource type="Script" uid="uid://cnuwqenuysr1h" path="res://ui/provision/WifiConfigPopup.gd" id="7_trn2v"]
+[ext_resource type="PackedScene" uid="uid://b3nn00g0v4o37" path="res://ui/editor/ImageEditor.tscn" id="8_editor"]
+
+[sub_resource type="Theme" id="Theme_trn2v"]
+Button/font_sizes/font_size = 42
+Label/font_sizes/font_size = 32
+LineEdit/font_sizes/font_size = 64
+
+[sub_resource type="StyleBoxFlat" id="StyleBox_topbar"]
+content_margin_left = 20.0
+content_margin_top = 110.0
+content_margin_right = 20.0
+content_margin_bottom = 12.0
+
+[sub_resource type="StyleBoxFlat" id="StyleBox_panel"]
+content_margin_left = 14.0
+content_margin_top = 10.0
+content_margin_right = 14.0
+content_margin_bottom = 10.0
+bg_color = Color(0, 0, 0, 0.4)
+corner_radius_top_left = 8
+corner_radius_top_right = 8
+corner_radius_bottom_right = 8
+corner_radius_bottom_left = 8
+
+[sub_resource type="StyleBoxFlat" id="StyleBox_approve"]
+content_margin_left = 14.0
+content_margin_top = 10.0
+content_margin_right = 14.0
+content_margin_bottom = 10.0
+bg_color = Color(0.2, 0.18, 0.08, 0.92)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.9, 0.7, 0.2, 1)
+
+[sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3y6u5"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_trn2v"]
+content_margin_left = 20.0
+content_margin_top = 10.0
+content_margin_right = 20.0
+content_margin_bottom = 10.0
+bg_color = Color(0.1, 0.1, 0.1, 0.6)
+corner_radius_top_left = 3
+corner_radius_top_right = 3
+corner_radius_bottom_right = 3
+corner_radius_bottom_left = 3
+corner_detail = 5
+
+[node name="Main" type="Control" unique_id=642551059]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme = SubResource("Theme_trn2v")
+script = ExtResource("1_main")
+
+[node name="Net" type="Node" parent="." unique_id=152732727]
+
+[node name="BLE" type="Node" parent="Net" unique_id=1301374098]
+script = ExtResource("2_ble")
+
+[node name="WS" type="Node" parent="Net" unique_id=901716668]
+script = ExtResource("3_ws")
+
+[node name="AI" type="Node" parent="Net" unique_id=1590777490]
+script = ExtResource("4_ai")
+
+[node name="TopBar" type="PanelContainer" parent="." unique_id=442524444]
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+offset_bottom = 220.0
+grow_horizontal = 2
+theme_override_styles/panel = SubResource("StyleBox_topbar")
+
+[node name="HBox" type="HBoxContainer" parent="TopBar" unique_id=1230683004]
+layout_mode = 2
+theme_override_constants/separation = 15
+
+[node name="DeviceList" type="OptionButton" parent="TopBar/HBox" unique_id=1060434549]
+custom_minimum_size = Vector2(340, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="BleStat" type="Label" parent="TopBar/HBox/DeviceList" unique_id=980589519]
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+offset_left = 40.0
+grow_horizontal = 2
+grow_vertical = 0
+size_flags_horizontal = 3
+text = "BLE:-"
+
+[node name="BleDot" type="Label" parent="TopBar/HBox/DeviceList/BleStat" unique_id=1173862068]
+custom_minimum_size = Vector2(10, 0)
+layout_mode = 1
+anchors_preset = -1
+anchor_bottom = 1.0
+grow_horizontal = 0
+grow_vertical = 2
+text = "●"
+
+[node name="RefreshBtn" type="Button" parent="TopBar/HBox" unique_id=1839737582]
+custom_minimum_size = Vector2(150, 0)
+layout_mode = 2
+text = "刷新"
+
+[node name="ConnectionStat" type="Label" parent="TopBar/HBox" unique_id=1571381783]
+custom_minimum_size = Vector2(200, 0)
+layout_mode = 2
+size_flags_vertical = 1
+offset_transform_enabled = true
+offset_transform_position = Vector2(0, -5)
+vertical_alignment = 2
+
+[node name="WsStat" type="Label" parent="TopBar/HBox/ConnectionStat" unique_id=35795757]
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+offset_left = 25.0
+grow_horizontal = 2
+size_flags_horizontal = 3
+text = "WS:-"
+
+[node name="WsDot" type="Label" parent="TopBar/HBox/ConnectionStat/WsStat" unique_id=1600361813]
+custom_minimum_size = Vector2(10, 0)
+layout_mode = 1
+anchors_preset = -1
+anchor_bottom = 1.0
+grow_horizontal = 0
+grow_vertical = 2
+theme_override_colors/font_color = Color(1, 0.8, 0.2, 0.4)
+text = "●"
+
+[node name="ProvisionBtn" type="Button" parent="TopBar/HBox" unique_id=1405664487]
+custom_minimum_size = Vector2(150, 0)
+layout_mode = 2
+text = "配网"
+
+[node name="Body" type="VBoxContainer" parent="." unique_id=1978894225]
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 10.0
+offset_top = 220.0
+offset_right = -10.0
+offset_bottom = 131.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/separation = 16
+
+[node name="Video" type="Control" parent="Body" unique_id=1319034480]
+custom_minimum_size = Vector2(1080, 720)
+layout_mode = 2
+size_flags_vertical = 3
+script = ExtResource("5_trn2v")
+
+[node name="Feed" type="TextureRect" parent="Body/Video" unique_id=353400016]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+stretch_mode = 5
+
+[node name="NoSignal" type="Label" parent="Body/Video" unique_id=1381034797]
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -200.0
+offset_top = -40.0
+offset_right = 200.0
+offset_bottom = 40.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_colors/font_color = Color(1, 1, 1, 0.5)
+theme_override_font_sizes/font_size = 40
+text = "未连接 / 无信号"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="VidControls" type="HBoxContainer" parent="Body" unique_id=1105787060]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="StreamToggle" type="CheckButton" parent="Body/VidControls" unique_id=1274197512]
+layout_mode = 2
+text = "图传"
+
+[node name="SnapshotBtn" type="Button" parent="Body/VidControls" unique_id=1878314621]
+custom_minimum_size = Vector2(150, 0)
+layout_mode = 2
+text = "截图"
+
+[node name="EditBtn" type="Button" parent="Body/VidControls" unique_id=888636054]
+custom_minimum_size = Vector2(150, 0)
+layout_mode = 2
+text = "编辑"
+
+[node name="ModeBar" type="HBoxContainer" parent="Body" unique_id=1112318939]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="ModeLabel" type="Label" parent="Body/ModeBar" unique_id=1746565721]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "AI 模式:"
+
+[node name="RelayBtn" type="Button" parent="Body/ModeBar" unique_id=1928248631]
+custom_minimum_size = Vector2(250, 0)
+layout_mode = 2
+toggle_mode = true
+text = "手机中转"
+
+[node name="DirectBtn" type="Button" parent="Body/ModeBar" unique_id=665315438]
+custom_minimum_size = Vector2(250, 0)
+layout_mode = 2
+toggle_mode = true
+button_pressed = true
+text = "小车直连"
+
+[node name="AILog" type="RichTextLabel" parent="Body" unique_id=612757021]
+custom_minimum_size = Vector2(0, 200)
+layout_mode = 2
+theme_override_styles/normal = SubResource("StyleBox_panel")
+bbcode_enabled = true
+
+[node name="ApprovalCard" type="PanelContainer" parent="Body" unique_id=96979607]
+visible = false
+layout_mode = 2
+theme_override_styles/panel = SubResource("StyleBox_approve")
+
+[node name="VBox" type="VBoxContainer" parent="Body/ApprovalCard" unique_id=988141283]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="Title" type="Label" parent="Body/ApprovalCard/VBox" unique_id=15279586]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.9, 0.7, 0.2, 1)
+theme_override_font_sizes/font_size = 30
+text = "建议动作，是否执行？"
+
+[node name="Reason" type="Label" parent="Body/ApprovalCard/VBox" unique_id=1773612431]
+layout_mode = 2
+autowrap_mode = 3
+
+[node name="Detail" type="Label" parent="Body/ApprovalCard/VBox" unique_id=1985066097]
+layout_mode = 2
+theme_override_colors/font_color = Color(1, 1, 1, 0.6)
+text = "-"
+autowrap_mode = 3
+
+[node name="Btns" type="HBoxContainer" parent="Body/ApprovalCard/VBox" unique_id=180555047]
+layout_mode = 2
+alignment = 2
+
+[node name="ApproveCancel" type="Button" parent="Body/ApprovalCard/VBox/Btns" unique_id=1383728893]
+custom_minimum_size = Vector2(140, 0)
+layout_mode = 2
+text = "取消"
+
+[node name="ApproveExecute" type="Button" parent="Body/ApprovalCard/VBox/Btns" unique_id=123945074]
+custom_minimum_size = Vector2(140, 0)
+layout_mode = 2
+text = "执行"
+
+[node name="ChatPanel" type="VBoxContainer" parent="Body" unique_id=745781195]
+custom_minimum_size = Vector2(0, 200)
+layout_mode = 2
+size_flags_vertical = 3
+theme_override_constants/separation = 8
+
+[node name="ChatLog" type="RichTextLabel" parent="Body/ChatPanel" unique_id=590147692]
+layout_mode = 2
+size_flags_vertical = 3
+theme_override_styles/normal = SubResource("StyleBox_panel")
+bbcode_enabled = true
+
+[node name="InputRow" type="HBoxContainer" parent="Body/ChatPanel" unique_id=1129907710]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="MessageInput" type="LineEdit" parent="Body/ChatPanel/InputRow" unique_id=1882221105]
+custom_minimum_size = Vector2(0, 120)
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "输入消息 / 指令…"
+
+[node name="SendBtn" type="Button" parent="Body/ChatPanel/InputRow" unique_id=1447337239]
+custom_minimum_size = Vector2(180, 0)
+layout_mode = 2
+text = "发送"
+
+[node name="CtrlArea" type="Panel" parent="Body" unique_id=242386826]
+custom_minimum_size = Vector2(0, 980)
+layout_mode = 2
+size_flags_stretch_ratio = 1.22
+theme_override_styles/panel = SubResource("StyleBoxEmpty_3y6u5")
+script = ExtResource("6_03owx")
+
+[node name="Joystick" type="VirtualJoystick" parent="Body/CtrlArea" unique_id=204024791]
+layout_mode = 1
+anchors_preset = -1
+offset_left = 50.0
+offset_top = 140.0
+offset_right = 720.0
+offset_bottom = 513.89996
+joystick_size = 350.0
+tip_size = 200.0
+action_left = &""
+action_right = &""
+action_up = &""
+action_down = &""
+
+[node name="Btns" type="GridContainer" parent="Body/CtrlArea" unique_id=415193377]
+layout_mode = 1
+anchors_preset = -1
+anchor_left = 0.5
+anchor_right = 1.0
+anchor_bottom = 0.7
+offset_top = 100.0
+offset_right = -50.0
+offset_bottom = -100.0
+grow_horizontal = 0
+grow_vertical = 2
+theme_override_constants/h_separation = 10
+theme_override_constants/v_separation = 10
+columns = 2
+
+[node name="ClawUpBtn" type="Button" parent="Body/CtrlArea/Btns" unique_id=834495831]
+custom_minimum_size = Vector2(150, 150)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 6
+text = "升爪"
+
+[node name="ClawClipBtn" type="Button" parent="Body/CtrlArea/Btns" unique_id=1930993390]
+custom_minimum_size = Vector2(150, 150)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 6
+text = "夹取"
+
+[node name="ClawDownBtn" type="Button" parent="Body/CtrlArea/Btns" unique_id=1495522071]
+custom_minimum_size = Vector2(150, 150)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 6
+text = "降爪"
+
+[node name="ClawReleaseBtn" type="Button" parent="Body/CtrlArea/Btns" unique_id=802783876]
+custom_minimum_size = Vector2(150, 150)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 6
+text = "松爪"
+
+[node name="ClawForwardBtn" type="Button" parent="Body/CtrlArea/Btns" unique_id=576355115]
+custom_minimum_size = Vector2(150, 150)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 6
+text = "爪前进"
+
+[node name="ClawBackwardBtn" type="Button" parent="Body/CtrlArea/Btns" unique_id=1436906632]
+custom_minimum_size = Vector2(150, 150)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 6
+text = "爪后退"
+
+[node name="BottomPadding" type="Control" parent="Body" unique_id=1255334218]
+custom_minimum_size = Vector2(0, 130)
+layout_mode = 2
+
+[node name="WifiPopup" type="PanelContainer" parent="." unique_id=1667705642]
+visible = false
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -400.0
+offset_top = -225.0
+offset_right = 400.0
+offset_bottom = 225.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_styles/panel = SubResource("StyleBoxFlat_trn2v")
+script = ExtResource("7_trn2v")
+
+[node name="VBox" type="VBoxContainer" parent="WifiPopup" unique_id=556224896]
+layout_mode = 2
+theme_override_constants/separation = 16
+
+[node name="Title" type="Label" parent="WifiPopup/VBox" unique_id=718162131]
+layout_mode = 2
+theme_override_font_sizes/font_size = 32
+text = "WiFi 配网"
+
+[node name="Ssid" type="LineEdit" parent="WifiPopup/VBox" unique_id=531159831]
+custom_minimum_size = Vector2(0, 64)
+layout_mode = 2
+placeholder_text = "WiFi 名称 (SSID)"
+
+[node name="Password" type="LineEdit" parent="WifiPopup/VBox" unique_id=1995450679]
+custom_minimum_size = Vector2(0, 64)
+layout_mode = 2
+placeholder_text = "WiFi 密码"
+secret = true
+
+[node name="Btns" type="HBoxContainer" parent="WifiPopup/VBox" unique_id=1387880900]
+layout_mode = 2
+theme_override_constants/separation = 16
+
+[node name="Cancel" type="Button" parent="WifiPopup/VBox/Btns" unique_id=1894054236]
+custom_minimum_size = Vector2(180, 64)
+layout_mode = 2
+size_flags_horizontal = 3
+text = "取消"
+
+[node name="Confirm" type="Button" parent="WifiPopup/VBox/Btns" unique_id=1796869398]
+custom_minimum_size = Vector2(180, 64)
+layout_mode = 2
+size_flags_horizontal = 3
+text = "配网"
+
+[node name="Status" type="Label" parent="WifiPopup/VBox" unique_id=269971016]
+layout_mode = 2
+horizontal_alignment = 1
+
+[node name="ImageEditor" parent="." unique_id=204808822 instance=ExtResource("8_editor")]
+layout_mode = 1
+
+[connection signal="pressed" from="TopBar/HBox/RefreshBtn" to="." method="_on_refresh_pressed"]
+[connection signal="pressed" from="TopBar/HBox/ProvisionBtn" to="." method="_on_provision_pressed"]
+[connection signal="toggled" from="Body/VidControls/StreamToggle" to="." method="_on_stream_toggled"]
+[connection signal="pressed" from="Body/VidControls/SnapshotBtn" to="." method="_on_snapshot_pressed"]
+[connection signal="pressed" from="Body/VidControls/EditBtn" to="." method="_on_edit_pressed"]
+[connection signal="pressed" from="Body/ModeBar/RelayBtn" to="." method="_on_relay_pressed"]
+[connection signal="pressed" from="Body/ModeBar/DirectBtn" to="." method="_on_direct_pressed"]
+[connection signal="pressed" from="Body/ApprovalCard/VBox/Btns/ApproveCancel" to="." method="_on_approve_cancel"]
+[connection signal="pressed" from="Body/ApprovalCard/VBox/Btns/ApproveExecute" to="." method="_on_approve_execute"]
+[connection signal="text_submitted" from="Body/ChatPanel/InputRow/MessageInput" to="." method="_on_send_pressed"]
+[connection signal="pressed" from="Body/ChatPanel/InputRow/SendBtn" to="." method="_on_send_pressed"]
+[connection signal="pressed" from="Body/CtrlArea/Joystick" to="." method="_on_joystick_pressed"]
+[connection signal="released" from="Body/CtrlArea/Joystick" to="." method="_on_joystick_release"]
+[connection signal="pressed" from="WifiPopup/VBox/Btns/Cancel" to="WifiPopup" method="_on_cancel_pressed"]
+[connection signal="pressed" from="WifiPopup/VBox/Btns/Confirm" to="WifiPopup" method="_on_confirm_pressed"]
