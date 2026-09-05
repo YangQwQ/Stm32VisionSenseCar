@@ -46,3 +46,6 @@ func _get_android_manifest_application_element_contents(_platform, _debug: bool)
 	# 注册官方 GDBLE 插件（负责加载 libgdble.so）与桥接插件（向引擎提供 gdextension 路径）
 	return '<meta-data android:name="org.godotengine.plugin.v2.GDBLE" android:value="org.gdble.android.GDBLEPlugin" />' + \
 		   '<meta-data android:name="org.godotengine.plugin.v2.GDBLEBridge" android:value="com.ctrlapp.gdble.GDBLEBridgePlugin" />'
+# 注：曾尝试在此注入无 maxSdk 的 ACCESS_FINE_LOCATION（Godot 导出器会把该权限固定写成
+# maxSdkVersion=30，API>=31 等于未声明，MIUI 仍用它门禁扫描结果），但根级 hook 在标准导出
+# 里不生效，实测无效，已移除。规避方案见 CLAUDE.md「构建环境」段落（导出后 apktool 处理）。

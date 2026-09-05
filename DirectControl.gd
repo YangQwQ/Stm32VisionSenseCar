@@ -2,7 +2,7 @@ extends Panel
 
 const CP := preload("res://net/proto/CommandProto.gd")
 
-@onready var _ws = $"../../Net/WS"
+# 爪控经 AppState.send_command 统一发送：WS 优先、BLE 兜底（不再只认 WS）。
 
 const _ACTIONS := {
 	"ClawUpBtn": "lift_up",
@@ -21,9 +21,7 @@ func _ready() -> void:
 		btn.button_up.connect(_on_claw_up)
 
 func _on_claw_down(act: String) -> void:
-	if _ws.is_connected_car():
-		_ws.send_command(CP.arm(act))
+	AppState.send_command(CP.arm(act))
 
 func _on_claw_up() -> void:
-	if _ws.is_connected_car():
-		_ws.send_command(CP.stop("arm"))
+	AppState.send_command(CP.stop("arm"))

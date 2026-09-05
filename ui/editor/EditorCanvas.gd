@@ -38,6 +38,35 @@ func clear() -> void:
 	annotations = []
 	queue_redraw()
 
+## 取第一个 rect 标注 → 归一化区域 {x,y,w,h}（相对源图 0..1），供 ai_goal.annotation。
+## 换算用与 _draw 相同的居中缩放矩形 ir（视口坐标 → 贴图坐标 → 归一化）。无 rect 返回空。
+func first_rect_norm() -> Dictionary:
+	for a: Variant in annotations:
+		if not (a is Dictionary):
+			continue
+		if (a as Dictionary).get("kind") == "rect":
+			var p: Vector2 = (a as Dictionary).get("a", Vector2.ZERO)
+			var q: Vector2 = (a as Dictionary).get("b", Vector2.ZERO)
+			return _norm_rect(p, q)
+	return {}
+
+func _norm_rect(p: Vector2, q: Vector2) -> Dictionary:
+	if texture == null:
+		return {}
+	var ts := Vector2(texture.get_width(), texture.get_height())
+	if ts.x <= 0.0 or ts.y <= 0.0:
+		return {}
+	var s: float = min(size.x / ts.x, size.y / ts.y)
+	var ir := Rect2((size - ts * s) / 2.0, ts * s)
+	var p0 := _clamp01((p - ir.position) / ir.size)
+	var p1 := _clamp01((q - ir.position) / ir.size)
+	var x0: float = min(p0.x, p1.x)
+	var y0: float = min(p0.y, p1.y)
+	return {"x": x0, "y": y0, "w": absf(p1.x - p0.x), "h": absf(p1.y - p0.y)}
+
+func _clamp01(v: Vector2) -> Vector2:
+	return Vector2(clampf(v.x, 0.0, 1.0), clampf(v.y, 0.0, 1.0))
+
 func _draw() -> void:
 	if texture == null:
 		return

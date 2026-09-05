@@ -29,6 +29,12 @@ func connect_car(target_url: String = "") -> void:
 		_state = "disconnected"
 		push_warning("WS 连接失败: %s" % url)
 
+## 配网闭环：板子经 BLE 上报 IP 后，据此连 WS（ws://<ip>:81）。
+func connect_car_ip(ip: String) -> void:
+	if ip.is_empty():
+		return
+	connect_car("ws://%s:81" % ip)
+
 func disconnect_car() -> void:
 	_teardown()
 

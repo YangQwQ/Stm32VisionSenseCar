@@ -3,7 +3,6 @@
 [ext_resource type="Script" uid="uid://d1tmutexp2vuy" path="res://Main.gd" id="1_main"]
 [ext_resource type="Script" uid="uid://cat6olj1u350v" path="res://net/ble/BLEClient.gd" id="2_ble"]
 [ext_resource type="Script" uid="uid://coab8np8s88w0" path="res://net/ws/WSCarClient.gd" id="3_ws"]
-[ext_resource type="Script" uid="uid://deelide4k4qql" path="res://net/ai/AIClient.gd" id="4_ai"]
 [ext_resource type="Script" uid="uid://c7y01patjmc1s" path="res://ui/video/VideoView.gd" id="5_trn2v"]
 [ext_resource type="Script" uid="uid://dmgue5hwo2dt3" path="res://DirectControl.gd" id="6_03owx"]
 [ext_resource type="Script" uid="uid://cnuwqenuysr1h" path="res://ui/provision/WifiConfigPopup.gd" id="7_trn2v"]
@@ -30,18 +29,6 @@ corner_radius_top_left = 8
 corner_radius_top_right = 8
 corner_radius_bottom_right = 8
 corner_radius_bottom_left = 8
-
-[sub_resource type="StyleBoxFlat" id="StyleBox_approve"]
-content_margin_left = 14.0
-content_margin_top = 10.0
-content_margin_right = 14.0
-content_margin_bottom = 10.0
-bg_color = Color(0.2, 0.18, 0.08, 0.92)
-border_width_left = 2
-border_width_top = 2
-border_width_right = 2
-border_width_bottom = 2
-border_color = Color(0.9, 0.7, 0.2, 1)
 
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3y6u5"]
 
@@ -74,9 +61,6 @@ script = ExtResource("2_ble")
 
 [node name="WS" type="Node" parent="Net" unique_id=901716668]
 script = ExtResource("3_ws")
-
-[node name="AI" type="Node" parent="Net" unique_id=1590777490]
-script = ExtResource("4_ai")
 
 [node name="TopBar" type="PanelContainer" parent="." unique_id=442524444]
 layout_mode = 1
@@ -206,82 +190,17 @@ theme_override_constants/separation = 12
 layout_mode = 2
 text = "图传"
 
-[node name="SnapshotBtn" type="Button" parent="Body/VidControls" unique_id=1878314621]
-custom_minimum_size = Vector2(150, 0)
+[node name="AnnotateBtn" type="Button" parent="Body/VidControls"]
+custom_minimum_size = Vector2(200, 0)
 layout_mode = 2
-text = "截图"
+text = "框选目标"
 
-[node name="EditBtn" type="Button" parent="Body/VidControls" unique_id=888636054]
-custom_minimum_size = Vector2(150, 0)
-layout_mode = 2
-text = "编辑"
-
-[node name="ModeBar" type="HBoxContainer" parent="Body" unique_id=1112318939]
-layout_mode = 2
-theme_override_constants/separation = 12
-
-[node name="ModeLabel" type="Label" parent="Body/ModeBar" unique_id=1746565721]
+[node name="BoxHint" type="Label" parent="Body/VidControls"]
+custom_minimum_size = Vector2(0, 60)
 layout_mode = 2
 size_flags_horizontal = 3
-text = "AI 模式:"
-
-[node name="RelayBtn" type="Button" parent="Body/ModeBar" unique_id=1928248631]
-custom_minimum_size = Vector2(250, 0)
-layout_mode = 2
-toggle_mode = true
-text = "手机中转"
-
-[node name="DirectBtn" type="Button" parent="Body/ModeBar" unique_id=665315438]
-custom_minimum_size = Vector2(250, 0)
-layout_mode = 2
-toggle_mode = true
-button_pressed = true
-text = "小车直连"
-
-[node name="AILog" type="RichTextLabel" parent="Body" unique_id=612757021]
-custom_minimum_size = Vector2(0, 200)
-layout_mode = 2
-theme_override_styles/normal = SubResource("StyleBox_panel")
-bbcode_enabled = true
-
-[node name="ApprovalCard" type="PanelContainer" parent="Body" unique_id=96979607]
-visible = false
-layout_mode = 2
-theme_override_styles/panel = SubResource("StyleBox_approve")
-
-[node name="VBox" type="VBoxContainer" parent="Body/ApprovalCard" unique_id=988141283]
-layout_mode = 2
-theme_override_constants/separation = 8
-
-[node name="Title" type="Label" parent="Body/ApprovalCard/VBox" unique_id=15279586]
-layout_mode = 2
-theme_override_colors/font_color = Color(0.9, 0.7, 0.2, 1)
-theme_override_font_sizes/font_size = 30
-text = "建议动作，是否执行？"
-
-[node name="Reason" type="Label" parent="Body/ApprovalCard/VBox" unique_id=1773612431]
-layout_mode = 2
-autowrap_mode = 3
-
-[node name="Detail" type="Label" parent="Body/ApprovalCard/VBox" unique_id=1985066097]
-layout_mode = 2
-theme_override_colors/font_color = Color(1, 1, 1, 0.6)
-text = "-"
-autowrap_mode = 3
-
-[node name="Btns" type="HBoxContainer" parent="Body/ApprovalCard/VBox" unique_id=180555047]
-layout_mode = 2
-alignment = 2
-
-[node name="ApproveCancel" type="Button" parent="Body/ApprovalCard/VBox/Btns" unique_id=1383728893]
-custom_minimum_size = Vector2(140, 0)
-layout_mode = 2
-text = "取消"
-
-[node name="ApproveExecute" type="Button" parent="Body/ApprovalCard/VBox/Btns" unique_id=123945074]
-custom_minimum_size = Vector2(140, 0)
-layout_mode = 2
-text = "执行"
+vertical_alignment = 1
+text = "无框选"
 
 [node name="ChatPanel" type="VBoxContainer" parent="Body" unique_id=745781195]
 custom_minimum_size = Vector2(0, 200)
@@ -455,12 +374,7 @@ layout_mode = 1
 [connection signal="pressed" from="TopBar/HBox/RefreshBtn" to="." method="_on_refresh_pressed"]
 [connection signal="pressed" from="TopBar/HBox/ProvisionBtn" to="." method="_on_provision_pressed"]
 [connection signal="toggled" from="Body/VidControls/StreamToggle" to="." method="_on_stream_toggled"]
-[connection signal="pressed" from="Body/VidControls/SnapshotBtn" to="." method="_on_snapshot_pressed"]
-[connection signal="pressed" from="Body/VidControls/EditBtn" to="." method="_on_edit_pressed"]
-[connection signal="pressed" from="Body/ModeBar/RelayBtn" to="." method="_on_relay_pressed"]
-[connection signal="pressed" from="Body/ModeBar/DirectBtn" to="." method="_on_direct_pressed"]
-[connection signal="pressed" from="Body/ApprovalCard/VBox/Btns/ApproveCancel" to="." method="_on_approve_cancel"]
-[connection signal="pressed" from="Body/ApprovalCard/VBox/Btns/ApproveExecute" to="." method="_on_approve_execute"]
+[connection signal="pressed" from="Body/VidControls/AnnotateBtn" to="." method="_on_annotate_pressed"]
 [connection signal="text_submitted" from="Body/ChatPanel/InputRow/MessageInput" to="." method="_on_send_pressed"]
 [connection signal="pressed" from="Body/ChatPanel/InputRow/SendBtn" to="." method="_on_send_pressed"]
 [connection signal="pressed" from="Body/CtrlArea/Joystick" to="." method="_on_joystick_pressed"]

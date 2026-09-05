@@ -97,11 +97,7 @@ text = "取消"
 
 [node name="DoneBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
 layout_mode = 2
-text = "完成"
-
-[node name="SendAIBtn" type="Button" parent="Panel/VBox/Toolbar" unique_name_in_owner = true]
-layout_mode = 2
-text = "发送给AI"
+text = "采用"
 
 [node name="ViewportWrap" type="Control" parent="Panel/VBox"]
 layout_mode = 2
@@ -132,9 +128,8 @@ script = ExtResource("2_can")
 [connection signal="pressed" from="Panel/VBox/Toolbar/RectBtn" to="." method="_on_rect_pressed"]
 [connection signal="pressed" from="Panel/VBox/Toolbar/ArrowBtn" to="." method="_on_arrow_pressed"]
 [connection signal="pressed" from="Panel/VBox/Toolbar/TextBtn" to="." method="_on_text_pressed"]
-[connection signal="text_submitted" from="Panel/VBox/Toolbar/TextInput" to="." method="_on_text_text_submitted"]
+[connection signal="text_submitted" from="Panel/VBox/Toolbar/TextInput" to="." method="_on_text_submitted"]
 [connection signal="pressed" from="Panel/VBox/Toolbar/UndoBtn" to="." method="_on_undo_pressed"]
 [connection signal="pressed" from="Panel/VBox/Toolbar/ClearBtn" to="." method="_on_clear_pressed"]
 [connection signal="pressed" from="Panel/VBox/Toolbar/CancelBtn" to="." method="_on_cancel_pressed"]
 [connection signal="pressed" from="Panel/VBox/Toolbar/DoneBtn" to="." method="_on_done_pressed"]
-[connection signal="pressed" from="Panel/VBox/Toolbar/SendAIBtn" to="." method="_on_send_ai_pressed"]

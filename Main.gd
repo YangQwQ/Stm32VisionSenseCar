@@ -1,5 +1,7 @@
 extends Control
-## App 壳：组装各子视图，维护连接对象与交互逻辑。
+## App 壳：组装子视图，维护连接对象与交互。
+## 传输语义（与用户确认）：/ 前缀=指令；纯文本=AI 目标（DIRECT ai_goal）。
+## 所有指令经 AppState.send_command：WS 优先、BLE 兜底。
 
 const CP := preload("res://net/proto/CommandProto.gd")
 
@@ -9,56 +11,105 @@ const CP := preload("res://net/proto/CommandProto.gd")
 @onready var _editor: Control = $ImageEditor
 
 @onready var _device_list: OptionButton = $TopBar/HBox/DeviceList
-@onready var _provision_btn: Button = $TopBar/HBox/ProvisionBtn
 @onready var _ble_dot: Label = $TopBar/HBox/DeviceList/BleStat/BleDot
 @onready var _ble_stat: Label = $TopBar/HBox/DeviceList/BleStat
 @onready var _ws_dot: Label = $TopBar/HBox/ConnectionStat/WsStat/WsDot
 @onready var _ws_stat: Label = $TopBar/HBox/ConnectionStat/WsStat
 @onready var _conn_stat: Label = $TopBar/HBox/ConnectionStat
 
-@onready var _ai_log: RichTextLabel = $Body/AILog
-@onready var _approval: PanelContainer = $Body/ApprovalCard
-@onready var _approve_reason: Label = $Body/ApprovalCard/VBox/Reason
-@onready var _approve_detail: Label = $Body/ApprovalCard/VBox/Detail
-@onready var _relay_btn: Button = $Body/ModeBar/RelayBtn
-@onready var _direct_btn: Button = $Body/ModeBar/DirectBtn
 @onready var _chat_log: RichTextLabel = $Body/ChatPanel/ChatLog
 @onready var _message_input: LineEdit = $Body/ChatPanel/InputRow/MessageInput
-@onready var _send_btn: Button = $Body/ChatPanel/InputRow/SendBtn
 @onready var _stream_toggle: CheckButton = $Body/VidControls/StreamToggle
-@onready var _snapshot_btn: Button = $Body/VidControls/SnapshotBtn
-@onready var _edit_btn: Button = $Body/VidControls/EditBtn
+@onready var _box_hint: Label = $Body/VidControls/BoxHint
 
 var _joy_held := false
 var _last_joy := Vector2.ZERO
+var _region: Dictionary = {}  # 编辑器框选出的目标区域（ai_goal.annotation，发一次后清除）
 
 func _ready() -> void:
-	# 通信层节点由 Main.tscn 挂在 $Net 下，注册到全局状态
 	AppState.ble = $Net/BLE
 	AppState.ws = $Net/WS
-	AppState.ai = $Net/AI
 
 	$Net/BLE.ble_state_changed.connect(_on_ble_state)
 	$Net/BLE.scan_finished.connect(_on_scan_finished)
+	$Net/BLE.device_connected.connect(_on_device_connected)
+	$Net/BLE.device_disconnected.connect(_on_device_disconnected)
+	$Net/BLE.status_received.connect(_on_ble_status)
 	$Net/WS.connected.connect(_on_ws_connected)
 	$Net/WS.disconnected.connect(_on_ws_disconnected)
 	$Net/WS.frame_received.connect(_on_frame)
-	$Net/AI.ai_response.connect(_on_ai_response)
+	$Net/WS.text_received.connect(_on_ws_text)
+	# 编辑器信号是脚本自定义信号，对基类不可静态访问，用字符串 connect
+	_editor.connect("annotated", Callable(self, "_on_annotated"))
+	_editor.connect("cancelled", Callable(self, "_on_editor_cancelled"))
+	_wifi_popup.connect("confirmed", Callable(self, "_on_wifi_confirmed"))
+	_device_list.item_selected.connect(_on_device_selected)
 
-	# 启动即尝试连接小车（离线时显示"未连接"即可，不阻塞 UI）
+	AppState.hook_auto_ws()
+	# 启动即尝试连接小车（默认软 AP 地址；离线只显示未连接，不阻塞 UI）
 	$Net/WS.connect_car()
-
 	_update_status()
 	set_process_input(true)
 
-# ----- BLE -----
+# ============================== BLE ==============================
+
 func _on_ble_state(_s: String) -> void:
 	_update_status()
 
 func _on_scan_finished(devices: Array) -> void:
 	_device_list.clear()
-	for d in devices:
-		_device_list.add_item(d)
+	for d: Variant in devices:
+		if not (d is Dictionary):
+			continue
+		var dd: Dictionary = d as Dictionary
+		var raw_name: Variant = dd.get("name")
+		var raw_addr: Variant = dd.get("address")
+		if not (raw_name is String) or not (raw_addr is String):
+			continue
+		var name: String = raw_name as String
+		_device_list.add_item(name)
+		_device_list.set_item_metadata(_device_list.item_count - 1, dd)
+	if _device_list.item_count == 0:
+		_device_list.add_item("（未发现设备，点刷新）")
+		_device_list.set_item_metadata(0, {})
+
+func _on_device_selected(index: int) -> void:
+	var meta: Variant = _device_list.get_item_metadata(index)
+	if not (meta is Dictionary):
+		return
+	var addr: String = str((meta as Dictionary).get("address", ""))
+	if addr.is_empty():
+		return
+	var name: String = str((meta as Dictionary).get("name", addr))
+	_chat("提示", "连接 %s …" % name)
+	$Net/BLE.connect_device(addr, name)
+
+func _on_device_connected(_address: String, name: String) -> void:
+	_device_list.text = name
+	_update_status()
+	_chat("提示", "已连接设备 %s；可在聊天框用 / 指令或直接发文字目标" % name)
+
+func _on_device_disconnected(reason: String) -> void:
+	_update_status()
+	_chat("提示", "设备已断开：%s" % reason)
+
+func _on_ble_status(data: Dictionary) -> void:
+	# 板子 BLE status：含 reply 时展示（如配网/指令应答）；自动连 WS 由 AppState 处理。
+	# 板子 reply 可能是词表应答 JSON（{"type":status,pong,"params":{reason}}），解析出可读文本。
+	var reply: Variant = data.get("reply")
+	if reply is String and not (reply as String).is_empty():
+		var txt: String = reply as String
+		var parsed: Variant = JSON.parse_string(txt)
+		if parsed is Dictionary:
+			var t: String = str((parsed as Dictionary).get("type", ""))
+			if t == "pong":
+				txt = "pong"
+			elif (parsed as Dictionary).has("params"):
+				var pm: Variant = (parsed as Dictionary).get("params")
+				if pm is Dictionary and (pm as Dictionary).has("reason"):
+					txt = str((pm as Dictionary).get("reason"))
+		_chat("板", txt)
+	_update_status()
 
 func _on_refresh_pressed() -> void:
 	$Net/BLE.scan()
@@ -67,11 +118,18 @@ func _on_provision_pressed() -> void:
 	_wifi_popup.call("popup")
 
 func _on_wifi_confirmed(ssid: String, password: String) -> void:
-	$Net/BLE.provision(ssid, password)
-	_push_ai_log("已通过蓝牙下发配网参数: %s" % ssid)
+	if AppState.ble == null or not AppState.ble.is_device_connected():
+		_chat("提示", "配网需先连接小车蓝牙（在顶部列表选中设备）")
+		return
+	if AppState.ble.provision(ssid, password):
+		_chat("提示", "已下发 WiFi: %s；板子将重启连网，稍后会自动重连并显示 IP" % ssid)
+	else:
+		_chat("提示", "配网下发失败")
 
-# ----- WS / 视频 -----
+# ============================== WS / 视频 ==============================
+
 func _on_ws_connected() -> void:
+	_chat("板", "WS 已连接")
 	_update_status()
 
 func _on_ws_disconnected(_reason: String) -> void:
@@ -80,84 +138,140 @@ func _on_ws_disconnected(_reason: String) -> void:
 
 func _on_frame(img: Image) -> void:
 	_video.call("set_frame", img)
-	AppState.current_image = img  # 保留最新一帧供(未编辑)发送
+	AppState.current_image = img
+
+func _on_ws_text(data: Dictionary) -> void:
+	var t: String = str(data.get("type", ""))
+	if t == "pong":
+		_chat("板", "pong")
+		return
+	if t != "status":
+		return
+	# status：尽量展示人类可读字段（reason / reply），纯机器状态略
+	var params: Variant = data.get("params")
+	var line := ""
+	if params is Dictionary:
+		var r: Variant = (params as Dictionary).get("reason")
+		if r is String and not (r as String).is_empty():
+			line = r as String
+	elif data.has("reply"):
+		var rp: Variant = data.get("reply")
+		if rp is String and not (rp as String).is_empty():
+			line = rp as String
+	if line != "":
+		_chat("板", line)
 
 func _on_stream_toggled(on: bool) -> void:
-	$Net/WS.send_command(CP.stream(on))
+	AppState.send_command(CP.stream(on))
 
-# ----- 截图 / 编辑 -----
-func _on_snapshot_pressed() -> void:
-	if _video.current_texture != null:
-		_editor.call("open", _video.current_texture)
+# ============================== 框选（编辑器） ==============================
 
-func _on_edit_pressed() -> void:
-	if _video.current_texture != null:
-		_editor.call("open", _video.current_texture)
+func _on_annotate_pressed() -> void:
+	# _video 以基类 Control 持有，脚本成员只能动态取
+	var tex: Variant = _video.get("current_texture")
+	if tex == null:
+		_chat("提示", "先开启图传、等画面出现再框选目标")
+		return
+	_editor.call("open", tex)
 
-func _on_ai_image_sent(image: Image) -> void:
-	AppState.current_image = image
-	_trigger_ai(image)
-
-func _trigger_ai(image: Image) -> void:
-	if AppState.ai_mode == AppState.AiMode.RELAY:
-		_push_ai_log("发送给云端 AI 处理…")
-		$Net/AI.ask(image, _message_input.text)
+func _on_annotated(annotation: Dictionary) -> void:
+	_region = annotation
+	if _region.is_empty():
+		_box_hint.text = "无框选"
+		_chat("提示", "已清除框选范围")
 	else:
-		_push_ai_log("小车直连模式：AI 由小车端处理，请在设备日志查看")
+		_box_hint.text = "已框选：发文字目标将带上此范围（一次有效）"
+		_chat("提示", "已框选目标区域，输入文字目标后发送")
 
-# ----- AI -----
-func _on_ai_response(tool: Dictionary, text: String) -> void:
-	AppState.pending_tool = tool
-	_push_ai_log(text)
-	_approval.visible = true
-	_approve_reason.text = tool.get("reason", "")
-	_approve_detail.text = CP.encode(tool)
-	AnimationManager.fade_scale_in(_approval)
+func _on_editor_cancelled() -> void:
+	pass  # 取消不改变已框选范围
 
-func _on_approve_execute() -> void:
-	var tool: Dictionary = AppState.pending_tool
-	if not tool.is_empty():
-		$Net/WS.send_command(tool)
-		_push_ai_log("已执行：%s" % tool.get("type", "?"))
-	_approval.visible = false
-	AppState.pending_tool = {}
+# ============================== 聊天 / 指令 ==============================
 
-func _on_approve_cancel() -> void:
-	_approval.visible = false
-	AppState.pending_tool = {}
-
-func _set_ai_mode(mode) -> void:
-	AppState.ai_mode = mode
-	_relay_btn.button_pressed = (mode == AppState.AiMode.RELAY)
-	_direct_btn.button_pressed = (mode == AppState.AiMode.DIRECT)
-
-func _on_relay_pressed() -> void:
-	_set_ai_mode(AppState.AiMode.RELAY)
-
-func _on_direct_pressed() -> void:
-	_set_ai_mode(AppState.AiMode.DIRECT)
-
-# ----- 聊天 -----
 func _on_send_pressed() -> void:
 	var text: String = _message_input.text.strip_edges()
 	if text.is_empty():
 		return
-	_chat_log.append_text("[b]我:[/b] %s\n" % text)
 	_message_input.text = ""
-	if AppState.ai_mode == AppState.AiMode.RELAY and AppState.current_image != null:
-		_trigger_ai(AppState.current_image)
+	if text.begins_with("/"):
+		_handle_slash(text)
+	else:
+		_send_ai_goal(text)
 
-func _push_ai_log(msg: String) -> void:
-	_ai_log.append_text(msg + "\n")
+func _send_ai_goal(text: String) -> void:
+	_chat("我", text)
+	var cmd: Dictionary
+	if _region.is_empty():
+		cmd = CP.ai_goal(text)
+	else:
+		cmd = CP.ai_goal(text, _region)
+		_region = {}
+		_box_hint.text = "无框选"
+	if not AppState.send_command(cmd):
+		_chat("提示", "目标未发送：AI 目标走 WiFi（当前离线）")
 
-# ----- 手动控制 -----
+func _handle_slash(text: String) -> void:
+	var pieces := text.split(" ", true, 1)  # 最多拆一次，保住剩余文本原样
+	var verb: String = pieces[0].to_lower()
+	var cmd: Dictionary = {}
+	match verb:
+		"/ping":
+			cmd = CP.ping()
+		"/snapshot", "/snap":
+			cmd = CP.snapshot()
+		"/stream":
+			var on := true
+			if pieces.size() > 1:
+				var arg: String = pieces[1].strip_edges().to_lower()
+				on = arg != "off" and arg != "0" and arg != "false"
+			cmd = CP.stream(on)
+			_stream_toggle.set_pressed_no_signal(on)
+		"/stop":
+			var scope := "all"
+			if pieces.size() > 1 and pieces[1].strip_edges().to_lower() in ["wheels", "arm"]:
+				scope = pieces[1].strip_edges().to_lower()
+			cmd = CP.stop(scope)
+		"/config":
+			var rest := pieces[1] if pieces.size() > 1 else ""
+			var kv := rest.strip_edges().split(" ", true, 1)
+			if kv.size() < 2 or kv[0].is_empty():
+				_chat("提示", "用法: /config <WiFi名> <密码>")
+				return
+			cmd = CP.config_wifi(kv[0], kv[1])
+		"/goal":
+			var rest := pieces[1] if pieces.size() > 1 else ""
+			var msg: String = rest.strip_edges()
+			if msg.is_empty():
+				_chat("提示", "用法: /goal <目标文本>")
+				return
+			var ann: Dictionary = _region.duplicate()
+			_region = {}
+			_box_hint.text = "无框选"
+			cmd = CP.ai_goal(msg, ann)
+		_:
+			_chat("提示", "未知指令: %s（支持 /ping /snapshot /stream [on|off] /stop [wheels|arm] /config /goal）" % verb)
+			return
+	_chat("我", text)
+	if not AppState.send_command(cmd):
+		_chat("提示", "指令未发送（当前离线）")
+
+func _chat(who: String, msg: String) -> void:
+	if who == "我":
+		_chat_log.append_text("[b]我[/b]: %s\n" % msg)
+	elif who == "板":
+		_chat_log.append_text("[color=#6fc3ff]小车[/color]: %s\n" % msg)
+	elif who == "提示":
+		_chat_log.append_text("[color=#ffd75e]系统[/color]: %s\n" % msg)
+	else:
+		_chat_log.append_text(msg + "\n")
+
+# ============================== 手动控制 ==============================
+
 func _process(_delta: float) -> void:
 	if _joy_held:
 		_update_joystick()
 
 func _update_joystick() -> void:
-	if not $Net/WS.is_connected_car():
-		return
 	var v: Vector2 = _joystick.get_value()
 	# 上=前进：推力取 -y；左右取 x
 	var throttle: float = clampf(-v.y, -1.0, 1.0)
@@ -165,7 +279,7 @@ func _update_joystick() -> void:
 	if v.distance_to(_last_joy) < 0.001:
 		return
 	_last_joy = v
-	$Net/WS.send_command(CP.move(throttle, steering))
+	AppState.send_command(CP.move(throttle, steering))
 
 func _on_joystick_pressed(_v: Variant = null) -> void:
 	_joy_held = true
@@ -173,21 +287,18 @@ func _on_joystick_pressed(_v: Variant = null) -> void:
 func _on_joystick_release(_v: Variant = null) -> void:
 	_joy_held = false
 	_last_joy = Vector2.ZERO
-	if $Net/WS.is_connected_car():
-		$Net/WS.send_command(CP.stop("wheels"))
+	AppState.send_command(CP.stop("wheels"))
 
-func _on_stop_pressed() -> void:
-	_joystick.call("reset")
-	$Net/WS.send_command(CP.stop())
+# ============================== 状态 ==============================
 
-# ----- 状态 -----
 func _update_status() -> void:
 	var ble: String = $Net/BLE.get_ble_state()
-	var ws: String = $Net/WS.get_state()
-	var online: bool = ws == "connected"
-	_ble_dot.modulate = Color.GREEN if ble != "off" else Color(1, 1, 1, 0.3)
+	var ws_state: String = $Net/WS.get_state()
+	var online: bool = ws_state == "connected"
+	var ble_on: bool = ble != "off" and ble != "unavailable"
+	_ble_dot.modulate = Color.GREEN if ble_on else Color(1, 1, 1, 0.3)
 	_ws_dot.modulate = Color.GREEN if online else Color(1, 1, 1, 0.3)
 	_ble_stat.text = "BLE:%s" % ble
 	_ws_stat.text = "WS:%s" % ("已连接" if online else "未连接")
-	var ctrl: String = "已连接" if online else "未连接"
-	_conn_stat.text = "已连: %s" % ctrl
+	var transport: String = AppState.best_transport_name() if AppState.has_method("best_transport_name") else "离线"
+	_conn_stat.text = "已连: %s" % transport

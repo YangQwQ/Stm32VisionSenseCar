@@ -1,7 +1,8 @@
 extends Control
-## 全屏模态图片编辑面板：冻结帧 + 标注工具，输出编辑后的 Image。
+## 全屏模态标注面板：冻结帧 + 框选工具。完成时输出首个框的归一化区域
+## {x,y,w,h}（供 DIRECT ai_goal.annotation），不在本面板发图/调云 AI。
 
-signal sent_to_ai(image: Image)
+signal annotated(annotation: Dictionary)
 signal cancelled
 
 @onready var _canvas: Control = $Panel/VBox/ViewportWrap/SubViewportContainer/Viewport/Canvas
@@ -23,14 +24,6 @@ func close_modal() -> void:
 	AnimationManager.fade_scale_out(_panel)
 	await get_tree().create_timer(0.2).timeout
 	visible = false
-
-func _rasterize() -> Image:
-	_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
-	await get_tree().process_frame
-	var img: Image = _viewport.get_texture().get_image()
-	if img == null:
-		return null
-	return img
 
 func _set_tool(t: String) -> void:
 	_canvas.call("set_tool", t)
@@ -61,10 +54,10 @@ func _on_cancel_pressed() -> void:
 	close_modal()
 
 func _on_done_pressed() -> void:
+	var ann: Dictionary = {}
+	if _canvas != null and _canvas.has_method("first_rect_norm"):
+		var got: Variant = _canvas.call("first_rect_norm")
+		if got is Dictionary:
+			ann = got
 	close_modal()
-
-func _on_send_ai_pressed() -> void:
-	var img := await _rasterize()
-	if img != null:
-		sent_to_ai.emit(img)
-	close_modal()
+	annotated.emit(ann)
