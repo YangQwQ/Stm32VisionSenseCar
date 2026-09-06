@@ -49,23 +49,6 @@ func _ready() -> void:
 	AppState.ble = $Net/BLE
 	AppState.ws = $Net/WS
 
-	$Net/BLE.ble_state_changed.connect(_on_ble_state)
-	$Net/BLE.scan_finished.connect(_on_scan_finished)
-	$Net/BLE.device_connected.connect(_on_device_connected)
-	$Net/BLE.device_disconnected.connect(_on_device_disconnected)
-	$Net/BLE.status_received.connect(_on_ble_status)
-	$Net/WS.connected.connect(_on_ws_connected)
-	$Net/WS.disconnected.connect(_on_ws_disconnected)
-	$Net/WS.frame_received.connect(_on_frame)
-	$Net/WS.text_received.connect(_on_ws_text)
-	# 编辑器信号是脚本自定义信号，对基类不可静态访问，用字符串 connect
-	_editor.connect("cancelled", Callable(self, "_on_editor_cancelled"))
-	_editor.connect("image_sent", Callable(self, "_on_image_sent"))
-	_message_input.text_changed.connect(_on_input_text_changed)
-	_wifi_popup.connect("confirmed", Callable(self, "_on_wifi_confirmed"))
-	# 刷新按钮：toggle 按下=开始扫描（+旋转动画），松开=停止并复位。
-	_refresh_btn.toggled.connect(_on_refresh_toggled)
-	# 底部导航：暂在 _ready 里连（tscn 信号待布局定稿后再连）。
 	# 用 toggled + bind 页码；按钮同属一个 ButtonGroup，互斥单选。
 	_nav_bt.toggled.connect(_on_nav_toggled.bind(0))
 	_nav_ctrl.toggled.connect(_on_nav_toggled.bind(1))
