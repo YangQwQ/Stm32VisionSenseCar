@@ -135,6 +135,40 @@ int main(void)
 		      "arm 升降指定距离 -> LiftBy(dir=1,10cm)");
 	}
 
+	/* 10) P1-1：定距指令进入执行清除完成标志 */
+	g_status.car_done = 1;
+	LogClear();
+	Build(&f, 0x01, 0x02, (const uint8_t[]){0x01, 0x1E, 0x00, 200}, 4);
+	Dispatch_Process(&f);
+	CHECK(g_status.car_done == 0, "P1-1: 新定距指令 -> car_done 清 0(执行中)");
+
+	/* 11) P1-1：Relay 到位 -> car_done 置 1 */
+	g_status.car_done = 0;
+	LogClear();
+	g_relay_active = 1; g_relay_check = 1; g_arm_busy = 0;
+	Dispatch_Periodic();
+	CHECK(g_status.car_done == 1, "P1-1: 定距到位 -> car_done 置 1(已完成)");
+
+	/* 12) P1-3：夹爪指令 -> grip_done 清 0，夹爪到位 -> grip_done 置 1 */
+	g_status.arm_grip_done = 1; g_arm_busy = 1; g_relay_active = 0; g_relay_check = 0;
+	Build(&f, 0x02, 0x05, (const uint8_t[]){0x01}, 1);
+	Dispatch_Process(&f);
+	CHECK(g_status.arm_grip_done == 0, "P1-3: 新夹爪指令 -> grip_done 清 0");
+	g_status.arm_state = ARM_STATE_REACH;
+	g_arm_busy = 0;
+	Dispatch_Periodic();
+	CHECK(g_status.arm_grip_done == 1, "P1-3: 夹爪动作完成 -> grip_done 置 1");
+
+	/* 13) P1-1：机械臂定距完成 -> arm_done 置 1 */
+	g_status.arm_done = 0; g_arm_busy = 1; g_status.arm_state = ARM_STATE_IDLE;
+	Build(&f, 0x02, 0x04, (const uint8_t[]){0x01, 0x0A, 0x00, 100}, 4);
+	Dispatch_Process(&f);
+	CHECK(g_status.arm_done == 0 && g_status.arm_state == ARM_STATE_REACH,
+	      "P1-1: 新移爪定距指令 -> arm_done 清 0 且进入 REACH");
+	g_arm_busy = 0;
+	Dispatch_Periodic();
+	CHECK(g_status.arm_done == 1, "P1-1: 移爪到位 -> arm_done 置 1(已完成)");
+
 	printf("---- %d/%d passed ----\n", total - failed, total);
 	return failed ? 1 : 0;
 }

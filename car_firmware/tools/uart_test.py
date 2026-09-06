@@ -102,9 +102,32 @@ def selfcheck():
     print('selfcheck OK: CRC=0x%04X, frame roundtrip OK, corrupt-frame rejected.' % crc16_modbus(b'123456789'))
 
 
+def describe_status(dev, payload):
+    """将 0x0A 状态帧 payload 翻译为可读文本（含 P1-1/P1-3 flag 位）。"""
+    if len(payload) < 5:
+        return 'payload=%r' % (payload,)
+    try:
+        state = payload[0]
+        param = payload[2] | (payload[3] << 8)
+        flag = payload[4]
+        bits = []
+        if dev == DEV_CAR:
+            if flag & 0x01: bits.append('打滑/堵转')
+            if flag & 0x02: bits.append('指令完成')
+            name = {0: '停止', 1: '移动中', 2: '转动中'}
+        else:
+            if flag & 0x01: bits.append('指令完成')
+            if flag & 0x02: bits.append('夹爪完成')
+            if flag & 0x04: bits.append('夹到东西')
+            name = {0: '空闲', 1: '升降中', 2: '移爪中'}
+        state_label = name.get(state, str(state))
+    except Exception:
+        return 'payload=%r' % (payload,)
+    return 'state=%s(%s,param=%d), flag=0x%02X[%s]' % (state, state_label, param, flag, ','.join(bits) if bits else '无')
+
+
 def stream_read(ser, timeout_s=1.0):
     """尝试解析串口流中的一条状态帧。"""
-    buf = bytearray()
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if ser.in_waiting:
@@ -168,6 +191,8 @@ def main():
     resp = stream_read(ser, timeout_s=0.8)
     if resp:
         print('RX:', resp)
+        if resp.get('valid') and resp['cmd'] == CMD_STATUS:
+            print('    ->', describe_status(resp['dev'], resp['payload']))
     ser.close()
 
 

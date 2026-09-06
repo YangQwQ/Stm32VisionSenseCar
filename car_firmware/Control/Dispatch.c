@@ -30,12 +30,16 @@ typedef enum { CAR_IDLE, CAR_MOVE, CAR_TURN } CarMove;
 static CarMove car_move;
 static uint8_t car_dir, car_speed;
 
+/* P1-3：机械臂最近下发的待完成动作类型（用于区分"定距完成"与"夹爪完成"） */
+static uint8_t arm_pending;   /* 0=无 1=定距(升降/移爪) 2=夹爪 */
+
 static uint16_t PayloadU16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
 void Dispatch_Init(void)
 {
 	car_move = CAR_IDLE;
 	car_dir = 0; car_speed = 0;
+	arm_pending = 0;
 	Relay_Stop();
 	g_status.car_state = CAR_STATE_STOP;
 	g_status.arm_state = ARM_STATE_IDLE;
@@ -61,6 +65,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 		dist = PayloadU16(&f->b[3]);
 		sp = f->b[5];
 		car_dir = dir; car_speed = sp;
+		g_status.car_done = 0;                    /* 进入执行：清除上次完成标志 */
 		AckermannDrive_Straight(dir, sp);
 		Relay_Start(RLY_DIST, (int32_t)dist * 10);   /* 0.1cm */
 		car_move = CAR_MOVE;
@@ -79,6 +84,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 		ang = PayloadU16(&f->b[3]);
 		sp = f->b[5];
 		car_dir = dir; car_speed = sp;
+		g_status.car_done = 0;                    /* 进入执行：清除上次完成标志 */
 		AckermannDrive_TurnAngle(dir, (uint8_t)ang, sp);
 		Relay_Start(RLY_YAW, (int32_t)ang * 10);     /* 0.1° */
 		car_move = CAR_TURN;
@@ -93,12 +99,14 @@ static void HandleCarCmd(const UartFrame_t *f)
 			Relay_Stop();
 			car_move = CAR_IDLE;
 			car_speed = 0;
+			g_status.car_done = 0;
 			break;
 		}
 		if (f->b[2] == STOP_ALL || f->b[2] == STOP_ARM)
 		{
 			RobotArmAct_Stop();
 			g_status.arm_state = ARM_STATE_IDLE;
+			arm_pending = 0;                      /* 中断动作：清除待完成标记 */
 		}
 		break;
 
@@ -127,6 +135,8 @@ static void HandleArmCmd(const UartFrame_t *f)
 		dir = f->b[2];
 		dist = PayloadU16(&f->b[3]);
 		sp = f->b[5];
+		arm_pending = 1;                          /* 待完成：定距 */
+		g_status.arm_done = 0;
 		RobotArmAct_LiftBy(dir, dist, sp);
 		g_status.arm_state = ARM_STATE_LIFT;
 		break;
@@ -141,12 +151,16 @@ static void HandleArmCmd(const UartFrame_t *f)
 		dir = f->b[2];
 		dist = PayloadU16(&f->b[3]);
 		sp = f->b[5];
+		arm_pending = 1;                          /* 待完成：定距 */
+		g_status.arm_done = 0;
 		RobotArmAct_ReachBy(dir, dist, sp);
 		g_status.arm_state = ARM_STATE_REACH;
 		break;
 
 	case ARM_CMD_GRIP:                           /* act */
 		act = f->b[2];
+		arm_pending = 2;                          /* 待完成：夹爪动作 */
+		g_status.arm_grip_done = 0;
 		RobotArmAct_StartGrip(act);
 		g_status.arm_grip = (act == 0x01) ? GRIP_CLOSED : GRIP_OPEN;
 		g_status.arm_state = ARM_STATE_REACH;
@@ -181,13 +195,24 @@ void Dispatch_Periodic(void)
 		Relay_Stop();
 		car_move = CAR_IDLE;
 		car_speed = 0;
+		g_status.car_done = 1;                    /* P1-1：定距/定角已达成 */
 		Status_SendCar();                     /* 上报"已完成" */
 	}
 
-	/* 机械臂指定距离到位 → 状态复位 */
+	/* 机械臂指定距离/夹爪到位 → 状态复位并置完成标志 */
 	if (!RobotArmAct_Busy() && g_status.arm_state != ARM_STATE_IDLE)
 	{
 		g_status.arm_state = ARM_STATE_IDLE;
+		if (arm_pending == 2)
+		{
+			g_status.arm_grip_done = 1;         /* P1-3：夹取/松开动作完成 */
+			arm_pending = 0;
+		}
+		else if (arm_pending == 1)
+		{
+			g_status.arm_done = 1;              /* P1-1：升降/移爪定距完成 */
+			arm_pending = 0;
+		}
 	}
 
 	/* 刷新小车运动状态 */

@@ -12,6 +12,11 @@ void Status_Init(void)
 	g_status.arm_state = ARM_STATE_IDLE;
 	g_status.arm_grip  = GRIP_OPEN;
 	g_status.arm_flag  = 0;
+
+	g_status.car_done       = 0;
+	g_status.arm_done       = 0;
+	g_status.arm_grip_done  = 0;
+	g_status.arm_has_load   = 0;
 }
 
 void Status_SendCar(void)
@@ -19,6 +24,11 @@ void Status_SendCar(void)
 	uint8_t p[6];
 	int32_t dist = Odom_GetDistCm();
 	uint16_t param = (dist > 0) ? (uint16_t)dist : (uint16_t)(-dist);
+
+	/* flag 合成：打滑/堵转 + 小车指令完成标志（P1-1） */
+	g_status.car_flag = 0;
+	if (Odom_ErrFlag() & 1)  g_status.car_flag |= CAR_FLAG_SLIP;
+	if (g_status.car_done)   g_status.car_flag |= CAR_FLAG_DONE;
 
 	p[0] = g_status.car_state;
 	p[1] = g_status.car_speed;
@@ -33,6 +43,12 @@ void Status_SendCar(void)
 void Status_SendArm(void)
 {
 	uint8_t p[6];
+
+	/* flag 合成：机械臂定距完成 + 夹爪动作完成 + 是否夹到东西（P1-3） */
+	g_status.arm_flag = 0;
+	if (g_status.arm_done)       g_status.arm_flag |= ARM_FLAG_DONE;
+	if (g_status.arm_grip_done)  g_status.arm_flag |= ARM_FLAG_GRIP_DONE;
+	if (g_status.arm_has_load)   g_status.arm_flag |= ARM_FLAG_HAS_LOAD;
 
 	p[0] = g_status.arm_state;
 	p[1] = g_status.arm_grip;
