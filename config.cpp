@@ -19,9 +19,9 @@ void cfg::init() {
   prefs.begin(k_ns, true);
   g_cfg.wifi_ssid = prefs.getString("wifi_ssid", "");
   g_cfg.wifi_pass = prefs.getString("wifi_pass", "");
-  g_cfg.ai_url = prefs.getString("ai_url", "");
+  g_cfg.ai_url = prefs.getString("ai_url", "https://api.deepseek.com/chat/completions");
   g_cfg.ai_key = prefs.getString("ai_key", "");
-  g_cfg.ai_model = prefs.getString("ai_model", "deepseek-v4-flash");
+  g_cfg.ai_model = prefs.getString("ai_model", "deepseek-v4-flash-vision-exp");
   g_cfg.uart_baud = prefs.getUInt("uart_baud", 115200);
   prefs.end();
 }

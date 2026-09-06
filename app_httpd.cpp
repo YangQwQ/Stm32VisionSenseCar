@@ -93,10 +93,10 @@ httpd_handle_t camera_httpd = NULL;
 #include "camera.h"
 #include "command.h"
 #include "ble.h"
+#include "ai_client.h"
 
 #define WS_STREAM_FPS 10
-
-static volatile bool ws_streaming = false;
+#define WS_EDIT_IMG_MAX (128 * 1024)  // 编辑图（二进制上行）上限，与 ai_client 一致
 
 static esp_err_t ws_send_text(int fd, const char *text)
 {
@@ -123,7 +123,7 @@ static void ws_cmd_reply(void *ctx, const char *text)
     ws_send_text(fd, text);
 }
 
-// 文本帧 = 指令 JSON；stream/snapshot/ping 就地处理，其余类型统一移交 command 模块
+// 文本帧 = 指令 JSON；snapshot/ping 就地处理，其余类型统一移交 command 模块
 static void ws_handle_text(const char *json, int fd)
 {
     JsonDocument doc;
@@ -132,12 +132,8 @@ static void ws_handle_text(const char *json, int fd)
         return;
     }
     const char *type = doc["type"] | "";
-    JsonObject params = doc["params"].as<JsonObject>();
 
-    if (!strcmp(type, "stream")) {
-        ws_streaming = params["on"] | false;
-        log_i("[ws] stream=%u", ws_streaming);
-    } else if (!strcmp(type, "snapshot")) {
+    if (!strcmp(type, "snapshot")) {
         camera_fb_t *fb = cam::grab();
         if (fb) {
             ws_send_jpeg(fd, fb);
@@ -146,7 +142,8 @@ static void ws_handle_text(const char *json, int fd)
     } else if (!strcmp(type, "ping")) {
         ws_send_text(fd, "{\"type\":\"pong\"}");
     } else {
-        // 统一词表：move/stop/arm/config/ai_goal 等交给 command（含 UART 翻译/配网）
+        // 统一词表：move/stop/arm/config/stream/ai_goal/ai_cancel 等交给 command
+        // （stream 由 command 更新全局图传开关；ai_goal 异步结果回传）。
         log_i("[ws] forward to cmd: %s", type);
         cmd::handle(json, true, ws_cmd_reply, &fd);
     }
@@ -170,13 +167,28 @@ static esp_err_t ws_handler(httpd_req_t *req)
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
     if (ret != ESP_OK) return ret;
     if (pkt.len == 0) return ESP_OK;
-    if (pkt.len > 4096) return ESP_FAIL; // 异常大帧，断开连接
 
+    // 二进制帧 = 编辑图（裸 JPEG，手机→板）：覆盖暂存供 ai_goal{use_image}消费。
+    if (pkt.type == HTTPD_WS_TYPE_BINARY) {
+        if (pkt.len > WS_EDIT_IMG_MAX) return ESP_FAIL;  // 超大帧，断开
+        char *ibuf = (char *)malloc(pkt.len);
+        if (!ibuf) return ESP_ERR_NO_MEM;
+        pkt.payload = (uint8_t *)ibuf;
+        ret = httpd_ws_recv_frame(req, &pkt, pkt.len);
+        if (ret == ESP_OK && pkt.type == HTTPD_WS_TYPE_BINARY) {
+            ai::set_edited_image((uint8_t *)ibuf, pkt.len);
+        }
+        free(ibuf);
+        return ret;
+    }
+
+    // 文本帧 = 指令 JSON（≤512B，异常长帧断开）
+    if (pkt.len > 512) return ESP_FAIL;
     char *buf = (char *)malloc(pkt.len + 1);
     if (!buf) return ESP_ERR_NO_MEM;
     pkt.payload = (uint8_t *)buf;
     ret = httpd_ws_recv_frame(req, &pkt, pkt.len);
-    if (ret == ESP_OK && pkt.type == HTTPD_WS_TYPE_TEXT && pkt.len <= 512) {
+    if (ret == ESP_OK && pkt.type == HTTPD_WS_TYPE_TEXT) {
         buf[pkt.len] = 0;
         ws_handle_text(buf, httpd_req_to_sockfd(req));
     }
@@ -210,7 +222,7 @@ static void ws_stream_task(void *arg)
 {
     while (true) {
         bool has_client = false;
-        if (ws_streaming) {
+        if (cmd::streaming()) {
             camera_fb_t *fb = cam::grab();
             if (fb) {
                 ws_send_jpeg_to_ws_clients(fb, &has_client);

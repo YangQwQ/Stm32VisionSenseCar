@@ -5,6 +5,7 @@
 #include "uart.h"
 #include "command.h"
 #include "ble.h"
+#include "ai_client.h"
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -45,6 +46,8 @@ void setup() {
   net::init();
   startCameraServer();
 
+  ai::init();  // AI worker 任务（DIRECT 链路；依赖 WiFi 与摄像头）
+
   Serial.println("Ready!");
 }
 
@@ -54,5 +57,6 @@ void loop() {
   ble::update();   // 处理 BLE cmd 队列 + WiFi 状态变化上报
   cmd::update();   // 延迟重启（配网生效）
   uart::update();  // 收执行板状态帧（骨架）
+  ai::update();    // 排空 AI 结果队列（回传 Godot ai_result）
   delay(10);
 }

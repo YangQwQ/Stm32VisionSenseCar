@@ -2,6 +2,7 @@
 #include "command.h"
 #include "config.h"
 #include "wifi_net.h"
+#include "ai_client.h"
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -51,7 +52,8 @@ static String build_status(const char* reply) {
   s += cfg::wifi_ssid();
   s += "\",\"ws\":";
   s += g_ws_connected ? "true" : "false";
-  s += ",\"ai_busy\":false";
+  s += ",\"ai_busy\":";
+  s += ai::busy() ? "true" : "false";
   if (reply && reply[0]) {
     s += ",\"reply\":\"";
     s += reply;

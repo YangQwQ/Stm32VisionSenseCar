@@ -15,6 +15,10 @@ typedef void (*ReplyFn)(void* ctx, const char* text);
 // reply/reply_ctx 可为 NULL（静默丢弃，仅记录日志）。
 void handle(const char* json, bool has_frames, ReplyFn reply, void* reply_ctx);
 
+// 图传开关全局状态：由 command 接收 stream 指令更新，WS 推流任务读取。
+bool streaming();
+void set_streaming(bool on);
+
 // 调度约 1s 后重启（BLE 配网写 SSID/PASS 后由 ble 调用，使新 WiFi 生效）
 void schedule_restart();
 
