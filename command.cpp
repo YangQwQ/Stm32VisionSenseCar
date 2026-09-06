@@ -12,7 +12,7 @@ static bool has_id(const JsonDocument& doc) {
 }
 
 // 组一段带原 id 的应答文本并发出（reply 可空）。
-static void reply_status(JsonDocument& src, ReplyFn reply, void* ctx,
+static void reply_status(JsonDocument& src, cmd::ReplyFn reply, void* ctx,
                          const char* reason) {
   if (!reply) {
     Serial.printf("[cmd] (无回复通道) %s\n", reason);
@@ -29,7 +29,7 @@ static void reply_status(JsonDocument& src, ReplyFn reply, void* ctx,
 }
 
 // 与手机 /ping 对齐：回 {type:pong}（手机 WSCarClient 对 pong 直接读文本）。
-static void reply_pong(JsonDocument& src, ReplyFn reply, void* ctx) {
+static void reply_pong(JsonDocument& src, cmd::ReplyFn reply, void* ctx) {
   if (!reply) return;
   JsonDocument out;
   out["type"] = "pong";

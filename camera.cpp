@@ -1,4 +1,5 @@
-#include "camera.h"
+#include <Arduino.h>  // psramFound / Serial / pinMode
+#include "camera.h"    // 内含 CAMERA_MODEL_* 与 camera_pins.h
 #include "camera_pins.h"
 
 namespace cam {

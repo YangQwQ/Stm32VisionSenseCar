@@ -1,7 +1,7 @@
 #include "ble.h"
 #include "command.h"
 #include "config.h"
-#include "network.h"
+#include "wifi_net.h"
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -65,27 +65,27 @@ static void notify_status(const char* reply) {
   if (!g_status_char) return;
   String s = build_status(reply);
   g_status_char->setValue((uint8_t*)s.c_str(), s.length());
-  if (g_status_char->getNotifyProperty()) g_status_char->notify();
+  g_status_char->notify();  // core 3.x 已移除 getNotifyProperty()；特征含 NOTIFY 即可通知
 }
 
 // ---------------- GATT 回调 ----------------
 
 class CharCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* c) override {
-    std::string v = c->getValue();
+    String v = c->getValue();  // core 3.x：getValue() 返回 Arduino String
     const char* data = v.c_str();
     if (BLEUUID(c->getUUID()).equals(BLEUUID(k_cmd))) {
       enqueue(data);  // 词表 JSON，交给 cmd（loop 上下文统一处理）
     } else if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ssid)) ||
                BLEUUID(c->getUUID()).equals(BLEUUID(k_pass))) {
       // 配网（BleProfile provision 走 SSID/PASS 两特征）：先收齐再落 NVS
-      static std::string s_ssid, s_pass;
+      static String s_ssid, s_pass;
       if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ssid))) s_ssid = v;
       else s_pass = v;
-      if (!s_ssid.empty() && !s_pass.empty()) {
-        cfg::set_wifi(s_ssid.c_str(), s_pass.c_str());
-        s_ssid.clear();
-        s_pass.clear();
+      if (!s_ssid.isEmpty() && !s_pass.isEmpty()) {
+        cfg::set_wifi(s_ssid, s_pass);
+        s_ssid = "";
+        s_pass = "";
         cmd::schedule_restart();  // ~1s 后重启，新 WiFi 生效
         Serial.println("[ble] wifi 已写，准备重启");
       }
@@ -94,18 +94,18 @@ class CharCB : public BLECharacteristicCallbacks {
                BLEUUID(c->getUUID()).equals(BLEUUID(k_ai_model))) {
       // 手机只写非空字段（BleProfile.write_ai_config 逐特征写）。
       // 用 cfg 现值做底、逐字段覆盖，避免用空串清掉其余已存配置。
-      static std::string a_url, a_key, a_model;
+      static String a_url, a_key, a_model;
       static bool seeded = false;
       if (!seeded) {
-        a_url = cfg::ai_url().c_str();
-        a_key = cfg::ai_key().c_str();
-        a_model = cfg::ai_model().c_str();
+        a_url = cfg::ai_url();
+        a_key = cfg::ai_key();
+        a_model = cfg::ai_model();
         seeded = true;
       }
       if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ai_url))) a_url = v;
       else if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ai_key))) a_key = v;
       else a_model = v;
-      cfg::set_ai(a_url.c_str(), a_key.c_str(), a_model.c_str());
+      cfg::set_ai(a_url, a_key, a_model);
       Serial.println("[ble] ai 配置已写");
     }
   }
@@ -134,7 +134,7 @@ class ServerCB : public BLEServerCallbacks {
 void ble::init() {
   if (g_server) return;
   BLEDevice::init("VisionS3");  // 广播名，手机扫描按 name 过滤
-  BLEDevice::setPower(ESP_PWR_LVL_P7);
+  BLEDevice::setPower(ESP_PWR_LVL_P9);  // core 3.x 发射功率枚举改为 _P9 封顶（对应 +9dBm）
 
   g_q = xQueueCreate(8, sizeof(char*));
 

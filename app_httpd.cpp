@@ -24,20 +24,11 @@
 #include "esp32-hal-log.h"
 #endif
 
-// Face Detection will not work on boards without (or with disabled) PSRAM
-#ifdef BOARD_HAS_PSRAM
-#define CONFIG_ESP_FACE_DETECT_ENABLED 1
-// Face Recognition takes upward from 15 seconds per frame on chips other than ESP32S3
-// Makes no sense to have it enabled for them
-#if CONFIG_IDF_TARGET_ESP32S3
-#define CONFIG_ESP_FACE_RECOGNITION_ENABLED 1
-#else
-#define CONFIG_ESP_FACE_RECOGNITION_ENABLED 0
-#endif
-#else
+// 板载人脸检测/识别已关闭：其依赖 Espressif esp-face 的模型头文件，
+// 且本项目视觉识别交由云端多模态大模型完成，板载人脸检测非必需。
+// 若日后需要启用：引入 espressif/esp-face 模型头文件后，将下面两宏置 1 即可。
 #define CONFIG_ESP_FACE_DETECT_ENABLED 0
 #define CONFIG_ESP_FACE_RECOGNITION_ENABLED 0
-#endif
 
 #if CONFIG_ESP_FACE_DETECT_ENABLED
 
@@ -74,11 +65,11 @@
 // LED FLASH setup
 #if CONFIG_LED_ILLUMINATOR_ENABLED
 
-#define LED_LEDC_CHANNEL 2 //Using different ledc channel/timer than camera
 #define CONFIG_LED_MAX_INTENSITY 255
 
 int led_duty = 0;
 bool isStreaming = false;
+static uint8_t s_led_pin = 0;  // core 3.x LEDC 改引脚式 API，不再手动分 channel（与摄像头 timer 冲突由驱动内部处理）
 
 #endif
 
@@ -193,6 +184,26 @@ static esp_err_t ws_handler(httpd_req_t *req)
     return ret;
 }
 
+// core 3.x / IDF 无 httpd_ws_client_iterate：改由 httpd_get_client_list 取全部活跃
+// fd，再用 httpd_ws_get_fd_info 筛出 WEBSOCKET 会话（HTTP 会话不计入）。数组须 >=
+// 服务器 max_open_sockets；给足余量，过长时本次跳过。
+#define WS_MAX_CLIENTS 32
+
+static bool ws_send_jpeg_to_ws_clients(camera_fb_t *fb, bool *has_client)
+{
+    bool any = false;
+    int fds[WS_MAX_CLIENTS];
+    size_t n = WS_MAX_CLIENTS;
+    if (httpd_get_client_list(stream_httpd, &n, fds) != ESP_OK) return false;
+    for (size_t i = 0; i < n; i++) {
+        if (httpd_ws_get_fd_info(stream_httpd, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) continue;
+        any = true;
+        if (has_client) *has_client = true;
+        if (fb) ws_send_jpeg(fds[i], fb);
+    }
+    return any;
+}
+
 // 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧；
 // 同时探测 WS 客户端存在性，喂给 ble::set_ws_connected（status.ws）。
 static void ws_stream_task(void *arg)
@@ -202,18 +213,11 @@ static void ws_stream_task(void *arg)
         if (ws_streaming) {
             camera_fb_t *fb = cam::grab();
             if (fb) {
-                int fd = -1;
-                while (httpd_ws_client_iterate(stream_httpd, &fd) == ESP_OK) {
-                    has_client = true;
-                    ws_send_jpeg(fd, fb);
-                }
+                ws_send_jpeg_to_ws_clients(fb, &has_client);
                 cam::return_frame(fb);
             }
         } else {
-            int fd = -1;
-            if (httpd_ws_client_iterate(stream_httpd, &fd) == ESP_OK) {
-                has_client = true;  // 有客户端挂着（即便未开流）
-            }
+            ws_send_jpeg_to_ws_clients(nullptr, &has_client);  // 探测挂着的 WS 客户端
         }
         ble::set_ws_connected(has_client);
         vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
@@ -411,9 +415,7 @@ void enable_led(bool en)
     {
         duty = CONFIG_LED_MAX_INTENSITY;
     }
-    ledcWrite(LED_LEDC_CHANNEL, duty);
-    //ledc_set_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL, duty);
-    //ledc_update_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL);
+    ledcWrite(s_led_pin, duty);
     log_i("Set LED intensity to %d", duty);
 }
 #endif
@@ -1525,11 +1527,11 @@ void startCameraServer()
     }
 }
 
-void setupLedFlash(int pin) 
+void setupLedFlash(int pin)
 {
     #if CONFIG_LED_ILLUMINATOR_ENABLED
-    ledcSetup(LED_LEDC_CHANNEL, 5000, 8);
-    ledcAttachPin(pin, LED_LEDC_CHANNEL);
+    s_led_pin = (uint8_t)pin;
+    ledcAttach(pin, 5000, 8);  // core 3.x：引脚式绑定（频率 5kHz、8bit 分辨率）
     #else
     log_i("LED flash is disabled -> CONFIG_LED_ILLUMINATOR_ENABLED = 0");
     #endif
