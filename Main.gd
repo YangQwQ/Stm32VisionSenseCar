@@ -445,8 +445,11 @@ func _process(_delta: float) -> void:
 		_update_joystick()
 
 func _update_joystick() -> void:
-	var v: Vector2 = _joystick.get_value()
-	# 上=前进：推力取 -y；左右取 x
+	# 内置 VirtualJoystick 把分量写入 4 个 vjoy_* action，据此还原方向向量
+	var x: float = Input.get_action_strength("vjoy_right") - Input.get_action_strength("vjoy_left")
+	var y: float = Input.get_action_strength("vjoy_down") - Input.get_action_strength("vjoy_up")
+	var v: Vector2 = Vector2(x, y)
+	# 上=前进：推进取 -y；左右取 x
 	var throttle: float = clampf(-v.y, -1.0, 1.0)
 	var steering: float = clampf(v.x, -1.0, 1.0)
 	if v.distance_to(_last_joy) < 0.001:

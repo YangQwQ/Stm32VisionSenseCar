@@ -37,6 +37,25 @@ project/assembly_name="新建游戏项目"
 
 enabled=PackedStringArray("res://addons/gdble_export/plugin.cfg")
 
+[input]
+
+vjoy_left={
+"deadzone": 0.2,
+"events": []
+}
+vjoy_right={
+"deadzone": 0.2,
+"events": []
+}
+vjoy_up={
+"deadzone": 0.2,
+"events": []
+}
+vjoy_down={
+"deadzone": 0.2,
+"events": []
+}
+
 [physics]
 
 3d/physics_engine="Jolt Physics"
@@ -46,3 +65,4 @@ enabled=PackedStringArray("res://addons/gdble_export/plugin.cfg")
 rendering_device/driver.windows="d3d12"
 renderer/rendering_method="mobile"
 textures/vram_compression/import_etc2_astc=true
+environment/defaults/default_clear_color=Color(0.024, 0.039, 0.075, 1)

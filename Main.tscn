@@ -2,6 +2,7 @@
 
 [ext_resource type="Script" uid="uid://d1tmutexp2vuy" path="res://Main.gd" id="1_main"]
 [ext_resource type="Script" uid="uid://cat6olj1u350v" path="res://net/ble/BLEClient.gd" id="2_ble"]
+[ext_resource type="Texture2D" uid="uid://dcyjjrs18hhhd" path="res://bg.jpg" id="2_trn2v"]
 [ext_resource type="Script" uid="uid://coab8np8s88w0" path="res://net/ws/WSCarClient.gd" id="3_ws"]
 [ext_resource type="Script" uid="uid://c7y01patjmc1s" path="res://ui/video/VideoView.gd" id="5_trn2v"]
 [ext_resource type="Script" uid="uid://dmgue5hwo2dt3" path="res://DirectControl.gd" id="6_03owx"]
@@ -13,7 +14,12 @@ content_margin_left = 20.0
 content_margin_top = 4.0
 content_margin_right = 20.0
 content_margin_bottom = 4.0
-bg_color = Color(0.1, 0.1, 0.1, 0.6)
+bg_color = Color(0.118, 0.161, 0.231, 0.94)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.278, 0.333, 0.412, 0.4)
 corner_radius_top_left = 12
 corner_radius_top_right = 12
 corner_radius_bottom_right = 12
@@ -25,7 +31,12 @@ content_margin_left = 20.0
 content_margin_top = 4.0
 content_margin_right = 20.0
 content_margin_bottom = 4.0
-bg_color = Color(0, 0, 0, 0.49411765)
+bg_color = Color(0.388, 0.4, 0.945, 0.97)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.647, 0.706, 0.988, 0.6)
 corner_radius_top_left = 12
 corner_radius_top_right = 12
 corner_radius_bottom_right = 12
@@ -52,9 +63,12 @@ content_margin_left = 20.0
 content_margin_top = 4.0
 content_margin_right = 4.0
 content_margin_bottom = 4.0
-bg_color = Color(0.1, 0.1, 0.1, 0.6)
+bg_color = Color(0.039, 0.067, 0.125, 0.97)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
 border_width_bottom = 2
-border_color = Color(0, 0, 0, 0.6)
+border_color = Color(0.388, 0.4, 0.945, 0.55)
 corner_radius_top_left = 8
 corner_radius_top_right = 8
 corner_radius_bottom_right = 8
@@ -71,7 +85,12 @@ content_margin_left = 20.0
 content_margin_top = 4.0
 content_margin_right = 8.0
 content_margin_bottom = 4.0
-bg_color = Color(0.1, 0.1, 0.1, 0.6)
+bg_color = Color(0.094, 0.133, 0.22, 0.94)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.278, 0.333, 0.412, 0.4)
 corner_radius_top_left = 8
 corner_radius_top_right = 8
 corner_radius_bottom_right = 8
@@ -83,7 +102,12 @@ content_margin_left = 20.0
 content_margin_top = 4.0
 content_margin_right = 8.0
 content_margin_bottom = 4.0
-bg_color = Color(0, 0, 0, 0.6)
+bg_color = Color(0.059, 0.09, 0.165, 0.97)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.333, 0.412, 0.506, 0.5)
 corner_radius_top_left = 8
 corner_radius_top_right = 8
 corner_radius_bottom_right = 8
@@ -100,11 +124,31 @@ _source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\">
 "
 base_scale = 2.5
 
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_popup"]
+content_margin_left = 8.0
+content_margin_top = 8.0
+content_margin_right = 8.0
+content_margin_bottom = 8.0
+bg_color = Color(0.059, 0.09, 0.165, 0.99)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.333, 0.412, 0.506, 0.55)
+corner_radius_top_left = 10
+corner_radius_top_right = 10
+corner_radius_bottom_right = 10
+corner_radius_bottom_left = 10
+shadow_color = Color(0, 0, 0, 0.45)
+shadow_size = 10
+
 [sub_resource type="Theme" id="Theme_trn2v"]
+default_font_size = 32
 Button/font_sizes/font_size = 42
 Button/styles/hover = SubResource("StyleBoxFlat_03owx")
 Button/styles/normal = SubResource("StyleBoxFlat_03owx")
 Button/styles/pressed = SubResource("StyleBoxFlat_20pc6")
+CheckButton/font_sizes/font_size = 40
 CheckButton/icons/checked = SubResource("DPITexture_lgr22")
 CheckButton/icons/checked_disabled = SubResource("DPITexture_trn2v")
 CheckButton/icons/unchecked = SubResource("DPITexture_03owx")
@@ -121,29 +165,48 @@ PopupMenu/constants/h_separation = 20
 PopupMenu/font_sizes/font_size = 42
 PopupMenu/icons/radio_checked = SubResource("DPITexture_20pc6")
 PopupMenu/icons/radio_unchecked = SubResource("DPITexture_5vvyt")
+PopupMenu/styles/panel = SubResource("StyleBoxFlat_popup")
 PopupPanel/font_sizes/title_font_size = 32
+PopupPanel/styles/panel = SubResource("StyleBoxFlat_popup")
 RichTextLabel/font_sizes/bold_font_size = 42
 RichTextLabel/font_sizes/bold_italics_font_size = 42
 RichTextLabel/font_sizes/italics_font_size = 42
 RichTextLabel/font_sizes/mono_font_size = 42
 RichTextLabel/font_sizes/normal_font_size = 42
 
+[sub_resource type="Gradient" id="Gradient_lgr22"]
+colors = PackedColorArray(0.067, 0.102, 0.18, 1, 0.008, 0.024, 0.09, 1)
+
+[sub_resource type="GradientTexture2D" id="GradientTexture2D_3y6u5"]
+gradient = SubResource("Gradient_lgr22")
+fill_to = Vector2(1, 1)
+
 [sub_resource type="StyleBoxFlat" id="StyleBox_topbar"]
 content_margin_left = 20.0
 content_margin_top = 110.0
 content_margin_right = 20.0
 content_margin_bottom = 12.0
+bg_color = Color(0.059, 0.09, 0.165, 0.6)
+border_width_bottom = 2
+border_color = Color(0.333, 0.412, 0.506, 0.5)
 
 [sub_resource type="StyleBoxFlat" id="StyleBox_panel"]
 content_margin_left = 14.0
 content_margin_top = 10.0
 content_margin_right = 14.0
 content_margin_bottom = 10.0
-bg_color = Color(0, 0, 0, 0.4)
-corner_radius_top_left = 8
-corner_radius_top_right = 8
-corner_radius_bottom_right = 8
-corner_radius_bottom_left = 8
+bg_color = Color(0.059, 0.09, 0.165, 0.78)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.2, 0.255, 0.333, 0.3)
+corner_radius_top_left = 14
+corner_radius_top_right = 14
+corner_radius_bottom_right = 14
+corner_radius_bottom_left = 14
+shadow_color = Color(0, 0, 0, 0.3)
+shadow_size = 6
 
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3y6u5"]
 
@@ -152,12 +215,19 @@ content_margin_left = 20.0
 content_margin_top = 10.0
 content_margin_right = 20.0
 content_margin_bottom = 10.0
-bg_color = Color(0.1, 0.1, 0.1, 0.6)
-corner_radius_top_left = 3
-corner_radius_top_right = 3
-corner_radius_bottom_right = 3
-corner_radius_bottom_left = 3
+bg_color = Color(0.059, 0.09, 0.165, 0.98)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.333, 0.412, 0.506, 0.6)
+corner_radius_top_left = 16
+corner_radius_top_right = 16
+corner_radius_bottom_right = 16
+corner_radius_bottom_left = 16
 corner_detail = 5
+shadow_color = Color(0, 0, 0, 0.5)
+shadow_size = 14
 
 [node name="Main" type="Control" unique_id=642551059]
 layout_mode = 3
@@ -168,6 +238,26 @@ grow_horizontal = 2
 grow_vertical = 2
 theme = SubResource("Theme_trn2v")
 script = ExtResource("1_main")
+
+[node name="Background" type="TextureRect" parent="." unique_id=95507716]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+texture = SubResource("GradientTexture2D_3y6u5")
+
+[node name="TextureRect" type="TextureRect" parent="Background" unique_id=1012463181]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+texture = ExtResource("2_trn2v")
+stretch_mode = 5
 
 [node name="Net" type="Node" parent="." unique_id=152732727]
 
@@ -256,7 +346,7 @@ anchors_preset = -1
 anchor_right = 1.0
 anchor_bottom = 1.0
 offset_left = 10.0
-offset_top = 220.0
+offset_top = 240.0
 offset_right = -10.0
 offset_bottom = 131.0
 grow_horizontal = 2
@@ -264,6 +354,7 @@ grow_vertical = 2
 theme_override_constants/separation = 16
 
 [node name="Video" type="Control" parent="Body" unique_id=1319034480]
+visible = false
 custom_minimum_size = Vector2(1080, 720)
 layout_mode = 2
 size_flags_vertical = 3
@@ -364,10 +455,10 @@ offset_right = 720.0
 offset_bottom = 513.89996
 joystick_size = 350.0
 tip_size = 200.0
-action_left = &""
-action_right = &""
-action_up = &""
-action_down = &""
+action_left = &"vjoy_left"
+action_right = &"vjoy_right"
+action_up = &"vjoy_up"
+action_down = &"vjoy_down"
 
 [node name="Btns" type="GridContainer" parent="Body/CtrlArea" unique_id=415193377]
 layout_mode = 1
