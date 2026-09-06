@@ -55,7 +55,8 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
 
   if (manual) {
     // 手动/词表动作：优先打断 AI 闭环，再立即译帧下发执行板（不文本应答）。
-    ai::cancel();
+    // arm 打断只停轮子（机械臂指令即接管）；move/stop 由用户指令覆盖，不补停。
+    ai::cancel(!strcmp(type, "arm") ? ai::StopMode::Wheels : ai::StopMode::None);
     uart::act(type, params);
     return;
   }
@@ -122,8 +123,8 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   }
 
   if (!strcmp(type, "ai_cancel")) {
-    // 显式取消 AI 任务（取消≠停车；需要停车请发 stop）。
-    ai::cancel();
+    // 显式取消 AI 任务：残留持续指令会在任务出口补停（≠强制停车）。
+    ai::cancel(ai::StopMode::All);
     reply_status(doc, reply, reply_ctx, "AI 任务已取消");
     return;
   }

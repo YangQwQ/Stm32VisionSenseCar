@@ -18,8 +18,12 @@ void update();                  // loop 中调用：排空结果队列（发送 
 void set_goal(const char* text, bool use_image, const char* annotation, long id,
               cmd::ReplyFn reply, void* reply_ctx);
 
-void cancel();                  // 中止当前任务（新目标 / 手动指令 / ai_cancel）
-bool busy();                    // 是否有任务进行中（BLE status.ai_busy 用）
+// 中止任务的兜底 stop 模式：None=被用户指令接管（执行板已被新指令覆盖，不补发）；
+// Wheels=手动 arm 打断（只停轮子）；All=取消/任务终结（全停）。
+enum class StopMode : uint8_t { None, Wheels, All };
+
+void cancel(StopMode m = StopMode::All);  // 中止当前任务（新目标 / 手动指令 / ai_cancel）
+bool busy();                              // 是否有任务进行中（BLE status.ai_busy 用）
 
 // 暂存一张编辑图（WS 二进制上行，裸 JPEG，覆盖式）。TTL 见常量。
 void set_edited_image(const uint8_t* data, size_t len);

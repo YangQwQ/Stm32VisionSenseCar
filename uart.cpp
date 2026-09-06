@@ -22,6 +22,11 @@ static uint16_t crc16(const uint8_t* data, size_t len) {
   return crc;
 }
 
+// 执行板状态缓存（0x0A 解析写入，AI 拼接读取；loop 写入 / worker 读取，互斥保护）。
+struct ExecState { uint8_t dev, state, speed, grip; uint16_t param; uint8_t flag; bool valid; };
+static ExecState g_exec = {};
+static SemaphoreHandle_t g_exec_mtx = nullptr;
+
 void uart::send_raw(uint8_t dev, uint8_t cmd, const uint8_t* payload, size_t len) {
   uint8_t frame[2 + 1 + 1 + 1 + 64 + 2];  // 头2 + LEN + DEV + CMD + PAYLOAD(≤64) + CRC2
   if (len > 64) len = 64;
@@ -137,10 +142,28 @@ bool uart::act(const char* type, const JsonObjectConst& params) {
   return false;
 }
 
+bool uart::is_continuous(const char* type, const JsonObjectConst& p) {
+  if (!strcmp(type, "move")) {
+    float th = p["throttle"] | 0.0f;
+    float st = p["steering"] | 0.0f;
+    bool has_dist = p["distance_cm"].is<int>();
+    bool has_angle = p["angle_deg"].is<int>();
+    return (fabsf_(th) > 0.001f && !has_dist) || (fabsf_(st) > 0.001f && !has_angle);
+  }
+  if (!strcmp(type, "arm")) {
+    const char* act_ = p["act"] | "";
+    bool cont_act = !strcmp(act_, "lift_up") || !strcmp(act_, "lift_down") ||
+                    !strcmp(act_, "reach_forward") || !strcmp(act_, "reach_backward");
+    return cont_act && !p["dist_cm"].is<int>();
+  }
+  return false;
+}
+
 // ---------------- 初始化 / RX（状态帧解析骨架） ----------------
 
 void uart::init() {
-  uint32_t baud = cfg::uart_baud() ? cfg::uart_baud() : 115200;
+  g_exec_mtx = xSemaphoreCreateMutex();
+  uint32_t baud = cfg::uart_baud();
 #if defined(UART_TX_PIN) && defined(UART_RX_PIN)
   u.begin(baud, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 #else
@@ -182,4 +205,22 @@ void uart::update() {
       }
     }
   }
+}
+
+// 读取最近一条执行板状态帧并拼成一行文本（供 AI 上下文）。无数据返回 false。
+bool uart::read_state(char* buf, size_t cap) {
+  ExecState s;
+  if (g_exec_mtx) xSemaphoreTake(g_exec_mtx, portMAX_DELAY);
+  s = g_exec;
+  if (g_exec_mtx) xSemaphoreGive(g_exec_mtx);
+  if (!s.valid) return false;
+  if (s.dev == 0x01) {  // 小车：state 0停止/1移动中/2转动中
+    const char* st = s.state == 1 ? "移动中" : (s.state == 2 ? "转动中" : "停止");
+    snprintf(buf, cap, "小车:%s 距%ucm%s", st, (unsigned)s.param, (s.flag & 1) ? " 打滑" : "");
+  } else {              // 机械臂：state 0空闲/1升降中/2移爪中；grip 0松/1夹
+    const char* st = s.state == 1 ? "升降中" : (s.state == 2 ? "移爪中" : "空闲");
+    snprintf(buf, cap, "机械臂:%s 夹爪:%s 距%ucm%s",
+             st, (s.grip & 1) ? "夹住" : "松开", (unsigned)s.param, (s.flag & 1) ? " 故障" : "");
+  }
+  return true;
 }

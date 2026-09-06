@@ -56,6 +56,15 @@ static SemaphoreHandle_t g_img_mtx = nullptr;
 // TLS 客户端（worker 唯一实例）：cancel/set_goal 可从其他任务 stop() 中止在途请求。
 static WiFiClientSecure g_client;
 
+// 最近一条下发执行板的是否持续型（sink：stop 兜底判定）。任务起点复位。
+static volatile bool g_last_continuous = false;
+
+// 最近一条持续指令的类型（0=无/1=move/2=arm）。兜底 stop 时 Wheels 模式只适用于轮子残留。
+static volatile int g_last_cont_type = 0;
+
+// 本轮任务终结时的兜底 stop 模式，由打断方写入；worker 出口统一解析一次。
+static volatile int g_stop_mode = (int)ai::StopMode::All;
+
 static void enqueue_result(const char* text, cmd::ReplyFn fn, void* ctx);
 
 // ---------------- 结果队列（worker → loop） ----------------
@@ -168,40 +177,66 @@ static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
   b.put("\",\"detail\":\"low\"}}");
 }
 
-// 构建请求 body。goal 目标文本；ann 标注 JSON 或空；corrective 为重试纠正语。
+// 构建请求 body。goal 目标文本；ann 标注 JSON 或空；hint 为纠正/引导语（重试或死循环打断）；
+// last_cmd 上一步已下发指令的短描述（状态而非历史，帮助 AI 判断上一步效果）；
+// exec_state 执行板状态一行文本（无数据为空串）。
 // 系统提示词 + 目标 + 标注先组进 PSRAM 缓冲，再整体 JSON 转义（内含引号）。
 // 有 edited 时带双图（编辑图作意图锚点 + 当前帧作实时反馈），否则仅当前帧。
-static void build_body(PsaBuf& b, const char* goal, const char* ann, const char* corrective,
+static void build_body(PsaBuf& b, const char* goal, const char* ann, const char* hint,
+                       const char* last_cmd, const char* exec_state,
                        const uint8_t* frame, size_t frame_len,
                        bool use_edited, const uint8_t* edited, size_t edited_len) {
   PsaBuf sys;
-  sys.put("你是「小车+机械臂」的视觉控制大脑。摄像头画面来自车载相机；画面中可能有操作者的红色标注（方框/箭头/文字），必须优先遵循。");
+  sys.put("你是「小车+机械臂」视觉控制大脑。画面中操作者的红色标注（方框/箭头/文字）必须优先遵循。");
   sys.put("当前任务目标：");
   sys.put(goal);
   if (ann && ann[0]) { sys.put("（操作者标注区域："); sys.put(ann); sys.put("）"); }
-  sys.put("每次只能输出【一个】合法 JSON 指令，格式严格如下：");
-  sys.put("{\"type\":\"move\",\"params\":{\"throttle\"..,\"steering\"..},\"reason\":\"..\"} 持续移动，直到收到 stop；");
-  sys.put("或 {\"type\":\"move\",\"params\":{\"throttle\":0.5,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 指定距离移动；");
-  sys.put("或 {\"type\":\"move\",\"params\":{\"throttle\":0,\"steering\":0.8,\"angle_deg\":90},\"reason\":\"..\"} 指定角度转向；");
-  sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\"..},\"reason\":\"..\"} act.其中 lift_up/lift_down/reach_forward/reach_backward/clip/release；");
-  sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"reach_forward\",\"dist_cm\":15},\"reason\":\"..\"} 指定距离；");
+  sys.put("上一步已下发：");
+  sys.put(last_cmd && last_cmd[0] ? last_cmd : "无");
+  sys.put("。每次只输出一个合法 JSON：");
+  sys.put("{\"type\":\"move\",\"params\":{\"throttle\":0.3,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 移动/转向：加 distance_cm 定距、angle_deg 定角，否则持续移动；低速优先 throttle/steering≤0.5；");
+  sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\",\"dist_cm\":15},\"reason\":\"..\"} act 取 lift_up/lift_down/reach_forward/reach_backward/clip/release；与操作者交接物品时先停稳、伸到其手边再 release；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\"} 任务完成、无法继续或需立即停车时。");
-  sys.put("规则：1.只输出 JSON，禁止多余文字/代码块标记。2.每次只规划一步。3.默认低速谨慎，优先用指定距离/角度版本。4.只能依据当前画面判断执行结果，若多轮无变化则输出 stop。5.reason 一句中文简要解释。");
-  if (corrective && corrective[0]) { sys.put("注意："); sys.put(corrective); }
+  sys.put("规则：1.只输出 JSON，每次只规划一步。2.画面多轮无变化时先小幅转向环视探索；障碍物挡路则尝试绕行；绕行多轮仍无进展才 stop 并说明原因。3.人明显靠近或做停止手势（掌心向前/挥手/不断挡在车前）→立即 stop 并等待操作者。4.目标为空或“巡视”时持续小幅转向环视四周。5.reason 一句中文简要解释。");
+  if (hint && hint[0]) { sys.put("注意："); sys.put(hint); }
 
   b.put("{\"model\":");
   esc_append(b, cfg::ai_model().c_str());
   b.put(",\"messages\":[{\"role\":\"system\",\"content\":");
   esc_append(b, sys.p ? sys.p : "");
 
-  b.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"请基于当前画面给出下一步动作。\"},");
+  b.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+  PsaBuf ut;  // user 文本：执行板状态 + 画面引导（整体转义一次）
+  if (exec_state && exec_state[0]) { ut.put(exec_state); ut.put("；"); }
+  ut.put("当前画面如下。");
+  esc_append(b, ut.p ? ut.p : "");
+  b.put("},");
   if (use_edited && edited) img_block(b, edited, edited_len);
   img_block(b, frame, frame_len);
   b.put("]}],\"max_tokens\":256,\"temperature\":0.2,\"response_format\":{\"type\":\"json_object\"}}");
 }
 
-// ---------------- 输出校验（防误动作） ----------------
+// 指令短描述（供"上一步已下发"拼接与死循环判定；含运动数值，便于识别"相同指令"）。
+static void fmt_last(char* buf, size_t cap, const char* type, const JsonObjectConst& p) {
+  if (!strcmp(type, "move")) {
+    float th = p["throttle"] | 0.0f;
+    float st = p["steering"] | 0.0f;
+    int dc = p["distance_cm"] | 0;
+    int ad = p["angle_deg"] | 0;
+    if (dc) snprintf(buf, cap, "move %dcm th=%.1f", dc, th);
+    else if (ad) snprintf(buf, cap, "move %d度 th=%.1f", ad, th);
+    else snprintf(buf, cap, "move 持续 th=%.1f st=%.1f", th, st);
+  } else if (!strcmp(type, "arm")) {
+    const char* act = p["act"] | "";
+    int pd = p["dist_cm"] | 0;
+    if (pd) snprintf(buf, cap, "arm %s %dcm", act, pd);
+    else snprintf(buf, cap, "arm %s 持续", act);
+  } else {
+    snprintf(buf, cap, "stop");
+  }
+}
 
+// ---------------- 输出校验（防误动作） ----------------
 // 校验并规范化 AI 输出到 out{type,params,reason}。返回 nullptr 通过；否则返回错误字符串。
 static const char* validate_cmd(const char* content, JsonDocument& out, char* err_buf, size_t err_cap) {
   // 剥代码块/首尾空白（Arduino String 无 find/left，用 indexOf/substring）
@@ -266,8 +301,9 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
 // 实测导致 iram0 溢出）。DeepSeek 返回固定 JSON，Content-Length 定长可可靠读完。
 
 static bool http_post(const char* url, const char* key, const char* body, String& resp) {
-  // 解析 https://host[:port]/path
-  const char* p = url + 8;  // 跳过 "https://"
+  // 解析 [scheme://]host[:port]/path
+  const char* p = strstr(url, "://");
+  p = p ? p + 3 : url;
   const char* slash = strchr(p, '/');
   String host_s = slash ? String(p, slash - p) : String(p);
   String path_s = slash ? String(slash) : String("/");
@@ -376,6 +412,8 @@ static void ai_worker(void*) {
     }
     xSemaphoreGive(g_mtx);
     if (!t.text) continue;
+    g_last_continuous = false;  // 本任务尚未下发过持续指令（防上一任务残留标志误判）
+    g_last_cont_type = 0;
     m_busy = true;
     Serial.printf("[ai] 任务开始 gen=%lu text=%s\n", t.generation, t.text);
 
@@ -383,6 +421,10 @@ static void ai_worker(void*) {
     bool done = false;
     const char* fail = nullptr;
     char err_buf[160];
+    // 死循环防线状态：上一步指令短描述 / 连续相同指令计数 / 已注入引导标记。
+    char last_cmd[48] = {0}, cur_cmd[48] = {0};
+    int stall = 0;
+    bool stall_hint = false;
 
     // 编辑图一次性取快照（供整轮任务复用，避免中途被覆盖）。
     uint8_t* edited = nullptr; size_t edited_len = 0;
@@ -391,30 +433,57 @@ static void ai_worker(void*) {
       if (edited && !take_edited(edited, AI_EDITED_IMG_MAX, &edited_len)) { free(edited); edited = nullptr; }
     }
 
+    // 兜底 stop（任务终结出口统一解析一次）。g_stop_mode 由打断方写入：
+    // None=手动 move/stop 接管（用户指令已覆盖，不补停）；Wheels=手动 arm（只停轮子）；All=其余。
+    // 仅当存在持续指令残留才补。
+    auto resolve_stop = [&]() {
+      if (g_stop_mode == (int)ai::StopMode::None) return;
+      if (!g_last_continuous) return;
+      // Wheels 模式只对轮子持续残留停轮子；臂持续残留（或未知）必须全停。
+      const char* scope = (g_stop_mode == (int)ai::StopMode::Wheels && g_last_cont_type == 1) ? "wheels" : "all";
+      JsonDocument d; d["scope"] = scope;   // d 即 stop 的 params 对象
+      uart::act("stop", d.as<JsonObjectConst>());
+      Serial.printf("[ai] 兜底 stop scope=%s\n", scope);
+      g_last_continuous = false;
+    };
+
     while (!done) {
-      // 中止检查（代际号变化即本任务作废）
+      uint64_t step_ts = esp_timer_get_time();  // 本轮起点（周期控制基准）
+      // 中止检查（代际号变化即本任务作废）；兜底停统一在任务出口解析。
       if (t.generation != m_generation) { Serial.println("[ai] 被新目标/手动中断"); break; }
       if (!net::is_connected()) { snprintf(err_buf, sizeof(err_buf), "WiFi 掉线"); fail = err_buf; break; }
       if (cfg::ai_key().isEmpty()) { snprintf(err_buf, sizeof(err_buf), "未配置 AI Key"); fail = err_buf; break; }
 
-      // 取当前帧
-      camera_fb_t* fb = cam::grab();
+      // 取当前帧（失败重试，避免推流占缓冲时一次失败即判死）
+      camera_fb_t* fb = nullptr;
+      for (int fr = 0; fr < 3 && !fb; fr++) {
+        fb = cam::grab();
+        if (!fb && fr < 2) vTaskDelay(pdMS_TO_TICKS(50));
+      }
       if (!fb) { snprintf(err_buf, sizeof(err_buf), "取帧失败"); fail = err_buf; break; }
       const uint8_t* frame = fb->buf; size_t frame_len = fb->len;
 
       bool got = false;
       for (int attempt = 0; attempt < 2 && !done; attempt++) {
-        const char* corrective = attempt ? "上次输出非法，请只输出合法 JSON 词表指令。" : "";
+        // 引导语：重试纠正 / 死循环打断（连续多轮相同指令）
+        const char* hint = attempt ? "上次输出非法，请只输出合法 JSON 词表指令。"
+                                   : (stall_hint ? "画面与指令多轮无进展：请先小幅转向环视探索，或判断任务无法达成则输出 stop。" : "");
         PsaBuf body;
-        build_body(body, t.text, t.ann, corrective,
+        char st[64];
+        const char* stp = uart::read_state(st, sizeof(st)) ? st : "";  // 执行板状态（无数据为空）
+        build_body(body, t.text, t.ann, hint, last_cmd, stp,
                    frame, frame_len, edited != nullptr, edited, edited_len);
         if (!body.ok) { fail = "组装请求 body 失败"; break; }
 
         String resp;
-        if (!http_post(cfg::ai_url().c_str(), cfg::ai_key().c_str(), body.p, resp)) {
+        bool http_ok = false;
+        for (int nr = 0; nr < 3 && !http_ok; nr++) {   // 网络失败指数退避重试（任务串行，代价可控）
+          if (http_post(cfg::ai_url().c_str(), cfg::ai_key().c_str(), body.p, resp)) { http_ok = true; break; }
           if (t.generation != m_generation) { done = true; break; }  // 被中止，静默作废
-          fail = "AI 请求失败"; break;
+          if (nr < 2) { vTaskDelay(pdMS_TO_TICKS(500 << nr)); Serial.printf("[ai] 网络失败重试 %d\n", nr + 1); }
         }
+        if (done) break;
+        if (!http_ok) { fail = "AI 请求失败"; break; }
         if (t.generation != m_generation) { done = true; break; }  // 在途结果作废
 
         String content;
@@ -427,9 +496,16 @@ static void ai_worker(void*) {
           const char* type = cmdD["type"] | "";
           JsonObjectConst params = cmdD["params"].as<JsonObjectConst>();
           uart::act(type, params);
-          Serial.printf("[ai] 执行 %s\n", type);
+          g_last_continuous = uart::is_continuous(type, params);
+          g_last_cont_type = g_last_continuous ? (!strcmp(type, "move") ? 1 : 2) : 0;
+          Serial.printf("[ai] 执行 %s%s\n", type, g_last_continuous ? "（持续）" : "");
           String fb = build_feedback(t.id, cmdD);
           enqueue_result(fb.c_str(), t.fn, t.ctx);
+          // 死循环防线：连续多轮下发相同指令 → 下轮注入引导语让 AI 主动变化
+          fmt_last(cur_cmd, sizeof(cur_cmd), type, params);
+          if (strcmp(cur_cmd, last_cmd)) { stall = 0; stall_hint = false; }
+          else if (++stall >= 4 && !stall_hint) { stall_hint = true; Serial.println("[ai] 多轮无进展，注入引导"); }
+          snprintf(last_cmd, sizeof(last_cmd), "%s", cur_cmd);
           if (!strcmp(type, "stop")) { done = true; break; }
           got = true;
           break;
@@ -447,12 +523,16 @@ static void ai_worker(void*) {
         JsonDocument e; e["done"] = true; String s = build_feedback(t.id, e); enqueue_result(s.c_str(), t.fn, t.ctx);
         break;
       }
-      vTaskDelay(pdMS_TO_TICKS(AI_INTERVAL_MS));
+      // 周期控制：以 2000ms 为节奏，扣掉本轮已耗时（含抓帧/HTTP/校验），快路径约 3.2s 一轮
+      uint64_t el = esp_timer_get_time() - step_ts;
+      long rem = (long)AI_INTERVAL_MS - (long)(el / 1000);
+      if (rem > 0) vTaskDelay(pdMS_TO_TICKS(rem));
     }
 
     if (edited) free(edited);
     if (t.ctx) delete (int*)t.ctx;  // 任务期 sink fd
     free(t.text); free(t.ann);
+    resolve_stop();   // 统一兜底：持续指令残留即补停
     m_busy = false;
     Serial.printf("[ai] 任务结束 gen=%lu\n", t.generation);
   }
@@ -489,10 +569,11 @@ void ai::set_goal(const char* text, bool use_image, const char* annotation, long
   xSemaphoreGive(g_mtx);
   // 尝试掐断在途请求，让 worker 尽快回到循环取新槽
   g_client.stop();
+  g_stop_mode = (int)StopMode::All;   // 新目标打断旧任务：残留持续指令在旧任务出口补停
   xSemaphoreGive(g_notify);
 }
 
-void ai::cancel() {
+void ai::cancel(StopMode m) {
   xSemaphoreTake(g_mtx, portMAX_DELAY);
   ++m_generation;         // 使在途结果作废
   if (g_slot.text) { free(g_slot.text); g_slot.text = nullptr; }
@@ -501,6 +582,7 @@ void ai::cancel() {
   g_slot.active = false;
   xSemaphoreGive(g_mtx);
   g_client.stop();
+  g_stop_mode = (int)m;   // 手动 move/stop 接管=None（不补停）；arm=Wheels；ai_cancel=All
   Serial.println("[ai] cancel");
 }
 

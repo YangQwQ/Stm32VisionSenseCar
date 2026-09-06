@@ -18,4 +18,12 @@ void send_raw(uint8_t dev, uint8_t cmd, const uint8_t* payload, size_t len);
 // 由 command 模块在收到 move/stop/arm 时调用。
 bool act(const char* type, const JsonObjectConst& params);
 
+// 词表指令是否为「持续型」（执行板会一直动作，直到收到后续 stop/新指令才停）。
+// 判定与 act 内部同源；ai 模块用它决定任务终结时是否补发兜底 stop。
+bool is_continuous(const char* type, const JsonObjectConst& params);
+
+// 读取最近一条执行板状态帧（0x0A），拼成一行文本（供 AI 上下文拼接）。
+// 无状态数据（执行板未接入/未上报）返回 false，buf 不变。
+bool read_state(char* buf, size_t cap);
+
 }  // namespace uart
