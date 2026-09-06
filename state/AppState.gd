@@ -24,6 +24,15 @@ func send_command(cmd: Dictionary) -> bool:
 	push_warning("指令未发送（WS/BLE 均不可用）: %s" % t)
 	return false
 
+## 编辑图（JPEG 二进制）直通：仅走 WS（板侧经 WS 二进制暂存，供 ai_goal{use_image:true} 消费）。
+## 调用方须保证先 send_image 后 send_command(ai_goal)，同一 WS 保序。
+func send_image(img: Image) -> bool:
+	if _ws_ready() and ws.has_method("send_image"):
+		ws.send_image(img)
+		return true
+	push_warning("编辑图未发送（WS 不可用）")
+	return false
+
 func best_transport_name() -> String:
 	if _ws_ready():
 		return "WS"

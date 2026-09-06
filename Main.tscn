@@ -8,10 +8,125 @@
 [ext_resource type="Script" uid="uid://cnuwqenuysr1h" path="res://ui/provision/WifiConfigPopup.gd" id="7_trn2v"]
 [ext_resource type="PackedScene" uid="uid://b3nn00g0v4o37" path="res://ui/editor/ImageEditor.tscn" id="8_editor"]
 
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_03owx"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 20.0
+content_margin_bottom = 4.0
+bg_color = Color(0.1, 0.1, 0.1, 0.6)
+corner_radius_top_left = 12
+corner_radius_top_right = 12
+corner_radius_bottom_right = 12
+corner_radius_bottom_left = 12
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_20pc6"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 20.0
+content_margin_bottom = 4.0
+bg_color = Color(0, 0, 0, 0.49411765)
+corner_radius_top_left = 12
+corner_radius_top_right = 12
+corner_radius_bottom_right = 12
+corner_radius_bottom_left = 12
+corner_detail = 5
+
+[sub_resource type="DPITexture" id="DPITexture_lgr22"]
+_source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"16\"><rect width=\"30\" height=\"14\" x=\"1\" y=\"1\" fill=\"#fff\" fill-opacity=\".75\" rx=\"7\"/><circle cx=\"24\" cy=\"8\" r=\"5\" fill=\"#1a1a1a\"/></svg>
+"
+base_scale = 3.0
+
+[sub_resource type="DPITexture" id="DPITexture_trn2v"]
+_source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"16\"><rect width=\"30\" height=\"14\" x=\"1\" y=\"1\" fill=\"#fff\" fill-opacity=\".37\" rx=\"7\"/><circle cx=\"24\" cy=\"8\" r=\"5\" fill=\"#1a1a1a\" fill-opacity=\".5\"/></svg>
+"
+base_scale = 3.0
+
+[sub_resource type="DPITexture" id="DPITexture_03owx"]
+_source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"16\"><g fill-opacity=\".5\"><rect width=\"30\" height=\"14\" x=\"1\" y=\"1\" fill=\"#1a1a1a\" rx=\"7\"/><circle cx=\"8\" cy=\"8\" r=\"5\" fill=\"#fff\"/></g></svg>
+"
+base_scale = 3.0
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_5vvyt"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 4.0
+content_margin_bottom = 4.0
+bg_color = Color(0.1, 0.1, 0.1, 0.6)
+border_width_bottom = 2
+border_color = Color(0, 0, 0, 0.6)
+corner_radius_top_left = 8
+corner_radius_top_right = 8
+corner_radius_bottom_right = 8
+corner_radius_bottom_left = 8
+corner_detail = 5
+
+[sub_resource type="DPITexture" id="DPITexture_wkp8b"]
+_source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\"><path fill=\"none\" stroke=\"#b2b2b2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-opacity=\".85\" stroke-width=\"2\" d=\"m2 4 4 4 4-4\"/></svg>
+"
+base_scale = 3.0
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_lgr22"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 8.0
+content_margin_bottom = 4.0
+bg_color = Color(0.1, 0.1, 0.1, 0.6)
+corner_radius_top_left = 8
+corner_radius_top_right = 8
+corner_radius_bottom_right = 8
+corner_radius_bottom_left = 8
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_wkp8b"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 8.0
+content_margin_bottom = 4.0
+bg_color = Color(0, 0, 0, 0.6)
+corner_radius_top_left = 8
+corner_radius_top_right = 8
+corner_radius_bottom_right = 8
+corner_radius_bottom_left = 8
+corner_detail = 5
+
+[sub_resource type="DPITexture" id="DPITexture_20pc6"]
+_source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"5.5\" fill=\"#1a1a1a\" stroke=\"#fff\" stroke-opacity=\".75\" stroke-width=\"3\"/></svg>
+"
+base_scale = 2.5
+
+[sub_resource type="DPITexture" id="DPITexture_5vvyt"]
+_source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"7\" fill=\"#1a1a1a\" fill-opacity=\".5\"/></svg>
+"
+base_scale = 2.5
+
 [sub_resource type="Theme" id="Theme_trn2v"]
 Button/font_sizes/font_size = 42
+Button/styles/hover = SubResource("StyleBoxFlat_03owx")
+Button/styles/normal = SubResource("StyleBoxFlat_03owx")
+Button/styles/pressed = SubResource("StyleBoxFlat_20pc6")
+CheckButton/icons/checked = SubResource("DPITexture_lgr22")
+CheckButton/icons/checked_disabled = SubResource("DPITexture_trn2v")
+CheckButton/icons/unchecked = SubResource("DPITexture_03owx")
 Label/font_sizes/font_size = 32
-LineEdit/font_sizes/font_size = 64
+LineEdit/font_sizes/font_size = 52
+LineEdit/styles/normal = SubResource("StyleBoxFlat_5vvyt")
+OptionButton/constants/arrow_margin = 20
+OptionButton/font_sizes/font_size = 32
+OptionButton/icons/arrow = SubResource("DPITexture_wkp8b")
+OptionButton/styles/hover = SubResource("StyleBoxFlat_lgr22")
+OptionButton/styles/normal = SubResource("StyleBoxFlat_lgr22")
+OptionButton/styles/pressed = SubResource("StyleBoxFlat_wkp8b")
+PopupMenu/constants/h_separation = 20
+PopupMenu/font_sizes/font_size = 42
+PopupMenu/icons/radio_checked = SubResource("DPITexture_20pc6")
+PopupMenu/icons/radio_unchecked = SubResource("DPITexture_5vvyt")
+PopupPanel/font_sizes/title_font_size = 32
+RichTextLabel/font_sizes/bold_font_size = 42
+RichTextLabel/font_sizes/bold_italics_font_size = 42
+RichTextLabel/font_sizes/italics_font_size = 42
+RichTextLabel/font_sizes/mono_font_size = 42
+RichTextLabel/font_sizes/normal_font_size = 42
 
 [sub_resource type="StyleBoxFlat" id="StyleBox_topbar"]
 content_margin_left = 20.0
@@ -187,20 +302,24 @@ layout_mode = 2
 theme_override_constants/separation = 12
 
 [node name="StreamToggle" type="CheckButton" parent="Body/VidControls" unique_id=1274197512]
+custom_minimum_size = Vector2(250, 100)
 layout_mode = 2
 text = "图传"
 
-[node name="AnnotateBtn" type="Button" parent="Body/VidControls"]
-custom_minimum_size = Vector2(200, 0)
+[node name="AnnotateBtn" type="Button" parent="Body/VidControls" unique_id=506274721]
+custom_minimum_size = Vector2(220, 80)
 layout_mode = 2
+size_flags_horizontal = 10
+size_flags_vertical = 4
 text = "框选目标"
 
-[node name="BoxHint" type="Label" parent="Body/VidControls"]
-custom_minimum_size = Vector2(0, 60)
+[node name="BoxHint" type="Label" parent="Body/VidControls" unique_id=2012061877]
+custom_minimum_size = Vector2(150, 60)
 layout_mode = 2
-size_flags_horizontal = 3
-vertical_alignment = 1
+size_flags_horizontal = 8
 text = "无框选"
+horizontal_alignment = 1
+vertical_alignment = 1
 
 [node name="ChatPanel" type="VBoxContainer" parent="Body" unique_id=745781195]
 custom_minimum_size = Vector2(0, 200)
@@ -349,7 +468,9 @@ placeholder_text = "WiFi 密码"
 secret = true
 
 [node name="Btns" type="HBoxContainer" parent="WifiPopup/VBox" unique_id=1387880900]
+custom_minimum_size = Vector2(0, 80)
 layout_mode = 2
+size_flags_vertical = 10
 theme_override_constants/separation = 16
 
 [node name="Cancel" type="Button" parent="WifiPopup/VBox/Btns" unique_id=1894054236]
@@ -369,6 +490,7 @@ layout_mode = 2
 horizontal_alignment = 1
 
 [node name="ImageEditor" parent="." unique_id=204808822 instance=ExtResource("8_editor")]
+visible = false
 layout_mode = 1
 
 [connection signal="pressed" from="TopBar/HBox/RefreshBtn" to="." method="_on_refresh_pressed"]

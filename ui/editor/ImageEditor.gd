@@ -1,22 +1,18 @@
 extends Control
-## 全屏模态标注面板：冻结帧 + 框选工具。完成时输出首个框的归一化区域
-## {x,y,w,h}（供 DIRECT ai_goal.annotation），不在本面板发图/调云 AI。
+## 全屏模态标注面板：冻结帧 + 「方框 / 圆圈」标注。
+## 取消 = 放弃这张图；采用 = 导出「底图+标注」，由 Main 以 [Image N] 附到聊天输入框。
 
-signal annotated(annotation: Dictionary)
 signal cancelled
+signal image_sent(img: Image, annotation: Dictionary)
 
 @onready var _canvas: Control = $Panel/VBox/ViewportWrap/SubViewportContainer/Viewport/Canvas
-@onready var _viewport: SubViewport = $Panel/VBox/ViewportWrap/SubViewportContainer/Viewport
 @onready var _panel: PanelContainer = $Panel
-@onready var _text_input: LineEdit = $Panel/VBox/Toolbar/TextInput
 @onready var _rect_btn: Button = $Panel/VBox/Toolbar/RectBtn
-@onready var _arrow_btn: Button = $Panel/VBox/Toolbar/ArrowBtn
-@onready var _text_btn: Button = $Panel/VBox/Toolbar/TextBtn
+@onready var _circle_btn: Button = $Panel/VBox/Toolbar/CircleBtn
 
 func open(texture: Texture2D) -> void:
 	_canvas.call("set_base_image", texture)
 	_set_tool("none")
-	_text_input.text = ""
 	visible = true
 	AnimationManager.fade_scale_in(_panel)
 
@@ -28,20 +24,13 @@ func close_modal() -> void:
 func _set_tool(t: String) -> void:
 	_canvas.call("set_tool", t)
 	_rect_btn.button_pressed = (t == "rect")
-	_arrow_btn.button_pressed = (t == "arrow")
-	_text_btn.button_pressed = (t == "text")
+	_circle_btn.button_pressed = (t == "circle")
 
 func _on_rect_pressed() -> void:
 	_set_tool("rect" if _rect_btn.button_pressed else "none")
 
-func _on_arrow_pressed() -> void:
-	_set_tool("arrow" if _arrow_btn.button_pressed else "none")
-
-func _on_text_pressed() -> void:
-	_set_tool("text" if _text_btn.button_pressed else "none")
-
-func _on_text_submitted(_new_text: String) -> void:
-	_canvas.draft_text = _text_input.text
+func _on_circle_pressed() -> void:
+	_set_tool("circle" if _circle_btn.button_pressed else "none")
 
 func _on_undo_pressed() -> void:
 	_canvas.call("undo")
@@ -54,10 +43,13 @@ func _on_cancel_pressed() -> void:
 	close_modal()
 
 func _on_done_pressed() -> void:
+	var img: Image
+	if _canvas != null and _canvas.has_method("export_capture"):
+		img = _canvas.call("export_capture")
 	var ann: Dictionary = {}
-	if _canvas != null and _canvas.has_method("first_rect_norm"):
-		var got: Variant = _canvas.call("first_rect_norm")
+	if _canvas != null and _canvas.has_method("first_region_norm"):
+		var got: Variant = _canvas.call("first_region_norm")
 		if got is Dictionary:
 			ann = got
 	close_modal()
-	annotated.emit(ann)
+	image_sent.emit(img, ann)

@@ -24,7 +24,8 @@ const CP := preload("res://net/proto/CommandProto.gd")
 
 var _joy_held := false
 var _last_joy := Vector2.ZERO
-var _region: Dictionary = {}  # 编辑器框选出的目标区域（ai_goal.annotation，发一次后清除）
+## 编辑器「采用」后暂存的编辑图与区域，随发送以 [Image N] 标记上行给 AI。
+var _attachments: Array = []
 
 func _ready() -> void:
 	AppState.ble = $Net/BLE
@@ -40,8 +41,9 @@ func _ready() -> void:
 	$Net/WS.frame_received.connect(_on_frame)
 	$Net/WS.text_received.connect(_on_ws_text)
 	# 编辑器信号是脚本自定义信号，对基类不可静态访问，用字符串 connect
-	_editor.connect("annotated", Callable(self, "_on_annotated"))
 	_editor.connect("cancelled", Callable(self, "_on_editor_cancelled"))
+	_editor.connect("image_sent", Callable(self, "_on_image_sent"))
+	_message_input.text_changed.connect(_on_input_text_changed)
 	_wifi_popup.connect("confirmed", Callable(self, "_on_wifi_confirmed"))
 	_device_list.item_selected.connect(_on_device_selected)
 
@@ -50,6 +52,7 @@ func _ready() -> void:
 	# 启动即尝试连接小车（默认软 AP 地址；离线只显示未连接，不阻塞 UI）
 	$Net/WS.connect_car()
 	_update_status()
+	_update_attach_hint()
 	set_process_input(true)
 
 # Android 运行时权限：BLE 扫描/连接 + 定位。声明在 export_presets（BLUETOOTH_* 等），
@@ -168,6 +171,9 @@ func _on_ws_text(data: Dictionary) -> void:
 	if t == "pong":
 		_chat("板", "pong")
 		return
+	if t == "ai_result":
+		_show_ai_result(data)
+		return
 	if t != "status":
 		return
 	# status：尽量展示人类可读字段（reason / reply），纯机器状态略
@@ -186,6 +192,7 @@ func _on_ws_text(data: Dictionary) -> void:
 
 func _on_stream_toggled(on: bool) -> void:
 	AppState.send_command(CP.stream(on))
+	_video.visible = on
 
 # ============================== 框选（编辑器） ==============================
 
@@ -197,24 +204,119 @@ func _on_annotate_pressed() -> void:
 		return
 	_editor.call("open", tex)
 
-func _on_annotated(annotation: Dictionary) -> void:
-	_region = annotation
-	if _region.is_empty():
-		_box_hint.text = "无框选"
-		_chat("提示", "已清除框选范围")
-	else:
-		_box_hint.text = "已框选：发文字目标将带上此范围（一次有效）"
-		_chat("提示", "已框选目标区域，输入文字目标后发送")
-
 func _on_editor_cancelled() -> void:
-	pass  # 取消不改变已框选范围
+	pass  # 取消 = 放弃这张图，不影响输入框与已附图
+
+## 编辑器「采用」：把编辑图作为附件以 [Image N] 标记附到输入框，供发送时上行给 AI。
+func _on_image_sent(img: Image, annotation: Dictionary) -> void:
+	if img == null:
+		_chat("提示", "未能导出编辑图（无可用画面），请先框选再采用")
+		return
+	_attachments.append({"image": img, "annotation": annotation})
+	_message_input.text += (_token_text(_attachments.size()) if _message_input.text.is_empty() else " " + _token_text(_attachments.size()))
+	_message_input.caret_column = _message_input.text.length()
+	_message_input.grab_focus()
+	_update_attach_hint()
+
+## 文本每次变化都重建附件与标记的对应：删除某段 [Image N] 时同步移除对应图并重编号，不会错位。
+func _on_input_text_changed(_new_text: String) -> void:
+	_reconcile_attachments()
+
+func _token_text(i: int) -> String:
+	return "[Image %d]" % i
+
+func _strip_tokens(txt: String) -> String:
+	var re := RegEx.new()
+	re.compile("\\[Image \\d+\\]")
+	return re.sub(txt, "", true).strip_edges()
+
+## 依据当前输入框内实际存在的标记，重建附件列表并以 1..N 重编号；无标记则清空附件。
+func _reconcile_attachments() -> void:
+	var txt := _message_input.text
+	var source: Array = _attachments
+	var re := RegEx.new()
+	re.compile("\\[Image \\d+\\]")
+	var matches := re.search_all(txt)
+	var kept: Array = []
+	var seen := {}
+	for m in matches:
+		var idx: int = int(m.get_string().trim_prefix("[Image ").trim_suffix("]")) - 1
+		if idx >= 0 and idx < source.size() and not seen.has(idx):
+			kept.append(source[idx])
+			seen[idx] = true
+	if not matches.is_empty() and kept.size() == source.size():
+		return  # 一一对应，无需改
+	# 重建文本：保留标记外的输入，按顺序重贴 1..kept.size()
+	var final := ""
+	var mi := 0
+	for m in matches:
+		final += txt.substr(0, m.get_start())
+		if mi < kept.size():
+			final += _token_text(mi + 1)
+			mi += 1
+		txt = txt.substr(m.get_end())
+	final += txt
+	_message_input.text = final
+	_message_input.caret_column = final.length()
+	_attachments = kept
+	_update_attach_hint()
+
+func _update_attach_hint() -> void:
+	var n := _attachments.size()
+	if n == 0:
+		_box_hint.text = "无附图"
+	else:
+		_box_hint.text = "已附图 %d 张" % n
+
+func _show_ai_result(data: Dictionary) -> void:
+	# ai_result：{type:"ai_result", id, params:{error?, reason?, done?, command:{type,params,reason}}}
+	var params: Variant = data.get("params")
+	var line := ""
+	if params is Dictionary:
+		var pd: Dictionary = params as Dictionary
+		var e: Variant = pd.get("error")
+		if e is String and not (e as String).is_empty():
+			line = "错误：%s" % (e as String)
+		else:
+			var r: Variant = pd.get("reason")
+			if r is String and not (r as String).is_empty():
+				line = r as String
+			var inner: Variant = pd.get("command")
+			if inner is Dictionary:
+				var cs := _cmd_text(inner as Dictionary)
+				if cs != "":
+					line = "%s → %s" % [line, cs] if line != "" else cs
+			var dv: Variant = pd.get("done")
+			if dv is bool and (dv as bool):
+				line = "%s（任务结束）" % line if line != "" else "任务结束"
+	if line == "":
+		line = "已收到 AI 输出"
+	_chat("AI", line)
+
+func _cmd_text(cmd: Dictionary) -> String:
+	var t: String = str(cmd.get("type", ""))
+	var p: Variant = cmd.get("params")
+	var parts := PackedStringArray()
+	if p is Dictionary:
+		for k: Variant in (p as Dictionary).keys():
+			parts.append("%s=%s" % [str(k), str((p as Dictionary).get(k))])
+	return "%s (%s)" % [t, ", ".join(parts)] if parts.size() > 0 else t
 
 # ============================== 聊天 / 指令 ==============================
 
 func _on_send_pressed() -> void:
-	var text: String = _message_input.text.strip_edges()
-	if text.is_empty():
+	_reconcile_attachments()
+	if _message_input.text.strip_edges().is_empty() and _attachments.is_empty():
 		return
+	if not _attachments.is_empty():
+		var plain: String = _strip_tokens(_message_input.text)
+		var batch: Array = _attachments
+		_message_input.text = ""
+		_attachments = []
+		_update_attach_hint()
+		_send_image_goal(batch, plain)
+		return
+	var text: String = _message_input.text.strip_edges()
 	_message_input.text = ""
 	if text.begins_with("/"):
 		_handle_slash(text)
@@ -223,15 +325,22 @@ func _on_send_pressed() -> void:
 
 func _send_ai_goal(text: String) -> void:
 	_chat("我", text)
-	var cmd: Dictionary
-	if _region.is_empty():
-		cmd = CP.ai_goal(text)
-	else:
-		cmd = CP.ai_goal(text, _region)
-		_region = {}
-		_box_hint.text = "无框选"
+	var cmd: Dictionary = CP.ai_goal(text)
 	if not AppState.send_command(cmd):
 		_chat("提示", "目标未发送：AI 目标走 WiFi（当前离线）")
+
+func _send_image_goal(items: Array, message: String) -> void:
+	_chat("我", ("发图·%s" % message) if message.strip_edges() != "" else "发图")
+	# 先逐张上行编辑图（WS 二进制），再发文本 ai_goal{use_image:true}——板侧以最后一张为意图锚点。
+	for it in items:
+		var img: Image = (it as Dictionary).get("image", null)
+		if img == null or not AppState.send_image(img):
+			_chat("提示", "编辑图未发送：需先连上 WS 图传")
+			return
+	var ann: Dictionary = (items[0] as Dictionary).get("annotation", {})
+	var cmd: Dictionary = CP.ai_goal(message, ann, true)
+	if not AppState.send_command(cmd):
+		_chat("提示", "AI 目标未发送（WS 掉线？）")
 
 func _handle_slash(text: String) -> void:
 	var pieces := text.split(" ", true, 1)  # 最多拆一次，保住剩余文本原样
@@ -240,6 +349,9 @@ func _handle_slash(text: String) -> void:
 	match verb:
 		"/ping":
 			cmd = CP.ping()
+		"/help", "/h", "?":
+			_show_help()
+			return
 		"/snapshot", "/snap":
 			cmd = CP.snapshot()
 		"/stream":
@@ -267,26 +379,64 @@ func _handle_slash(text: String) -> void:
 			if msg.is_empty():
 				_chat("提示", "用法: /goal <目标文本>")
 				return
-			var ann: Dictionary = _region.duplicate()
-			_region = {}
-			_box_hint.text = "无框选"
-			cmd = CP.ai_goal(msg, ann)
+			cmd = CP.ai_goal(msg)
+		"/cancel", "/stopai":
+			cmd = CP.ai_cancel()
 		_:
-			_chat("提示", "未知指令: %s（支持 /ping /snapshot /stream [on|off] /stop [wheels|arm] /config /goal）" % verb)
+			_chat("提示", "未知指令: %s（/help 查看可用指令）" % verb)
 			return
 	_chat("我", text)
 	if not AppState.send_command(cmd):
 		_chat("提示", "指令未发送（当前离线）")
+
+func _show_help() -> void:
+	var lines := CP.help_lines()
+	_chat("提示", "可用指令：\n" + "\n".join(lines))
 
 func _chat(who: String, msg: String) -> void:
 	if who == "我":
 		_chat_log.append_text("[b]我[/b]: %s\n" % msg)
 	elif who == "板":
 		_chat_log.append_text("[color=#6fc3ff]小车[/color]: %s\n" % msg)
+	elif who == "AI":
+		_chat_log.append_text("[color=#c9f7a8]AI[/color]: %s\n" % msg)
 	elif who == "提示":
 		_chat_log.append_text("[color=#ffd75e]系统[/color]: %s\n" % msg)
 	else:
 		_chat_log.append_text(msg + "\n")
+
+# ============================== 附件标记整段删除 ==============================
+# 输入框聚焦时，按 Backspace / Delete 若光标落在 [Image N] 上，整段删除该标记
+# （_input 先于 LineEdit 处理，拦截后置为已处理，避免只删一个字符）。
+
+func _input(event: InputEvent) -> void:
+	if not (event is InputEventKey):
+		return
+	var k := event as InputEventKey
+	if not k.pressed or k.echo or (k.keycode != KEY_BACKSPACE and k.keycode != KEY_DELETE):
+		return
+	if not _message_input.has_focus():
+		return
+	if _delete_input_token(k.keycode == KEY_BACKSPACE):
+		get_viewport().set_input_as_handled()
+
+func _delete_input_token(is_backspace: bool) -> bool:
+	var txt: String = _message_input.text
+	if txt.is_empty():
+		return false
+	var pos: int = (_message_input.caret_column - 1) if is_backspace else _message_input.caret_column
+	if pos < 0:
+		return false
+	var re := RegEx.new()
+	re.compile("\\[Image \\d+\\]")
+	for m in re.search_all(txt):
+		var s: int = m.get_start()
+		var e: int = m.get_end()
+		if pos >= s and pos < e:
+			_message_input.text = txt.erase(s, e - s)
+			_message_input.caret_column = s
+			return true
+	return false
 
 # ============================== 手动控制 ==============================
 

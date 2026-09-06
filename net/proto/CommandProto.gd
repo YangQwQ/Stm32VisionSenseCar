@@ -26,12 +26,32 @@ static func config_wifi(ssid: String, password: String) -> Dictionary:
 static func ping() -> Dictionary:
 	return {"type": "ping", "params": {}, "id": _new_id()}
 
-static func ai_goal(message: String, annotation: Dictionary = {}) -> Dictionary:
+static func ai_goal(message: String, annotation: Dictionary = {}, use_image: bool = false) -> Dictionary:
 	# DIRECT 链路目标下发：手机 → 板子。annotation 为可选圈选区域 {x,y,w,h,label}（坐标相对手机画面）。
+	# use_image=true 表示"已先上行编辑图（WS 二进制），板侧以其为意图锚点"。
 	var params: Dictionary = {"message": message}
 	if not annotation.is_empty():
 		params["annotation"] = annotation
+	if use_image:
+		params["use_image"] = true
 	return {"type": "ai_goal", "params": params, "id": _new_id()}
+
+static func ai_cancel() -> Dictionary:
+	# 取消当前 AI 任务（板侧须手动/新目标也能中止；此指令离线经 BLE 兜底也可用）。
+	return {"type": "ai_cancel", "params": {}, "id": _new_id()}
+
+## /help 文案：可用指令说明（仅供本地展示，不下发板子）。
+static func help_lines() -> PackedStringArray:
+	return PackedStringArray([
+		"/ping  连通性测试",
+		"/snapshot  截图",
+		"/stream [on|off]  图传开关",
+		"/stop [wheels|arm]  停车",
+		"/config <WiFi名> <密码>  配网",
+		"/goal <目标>  下发 AI 目标（DIRECT）",
+		"/cancel  取消当前 AI 任务",
+		"直接输入文字 = 以下发 AI 目标；框选后发文字 = 带区域目标",
+	])
 
 static func raw(type: String, params: Dictionary = {}) -> Dictionary:
 	# 通用出口：给聊天 / 解析到未预置 builder 的词表指令透传用
