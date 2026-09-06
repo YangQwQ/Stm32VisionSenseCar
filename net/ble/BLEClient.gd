@@ -100,6 +100,12 @@ func _start_real_scan() -> void:
 	_set_state("scanning")
 	_mgr.call("start_scan", SCAN_DURATION)
 
+## 提前结束扫描（不重扫）。扫描中由 UI 松开刷新按钮调用。
+func stop_scan() -> void:
+	_restart_scan = false   # 手动停，不重扫
+	if _state == "scanning" and _mgr != null:
+		_mgr.call("stop_scan")
+
 func _on_scan_started() -> void:
 	_set_state("scanning")
 
