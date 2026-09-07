@@ -4,6 +4,13 @@ extends Node
 
 const BP := preload("res://net/ble/BleProfile.gd")
 
+# 连接生命周期模式：决定 BLE 是否让出射频、WS 何时恢复
+enum ConnMode { IDLE, BLE_ONLY, WS_ONLY, RECOVERY }
+
+var _mode := ConnMode.IDLE
+## WS 连续重连失败达该次数 → 停止自旋、转 BLE 恢复（WSCarClient 每 3s 重试一次，≈9s）
+const _WS_FAIL_LIMIT := 3
+
 # 连接对象（BLEClient / WSCarClient 节点，由 Main._ready 赋值）。无类型以便动态调用子类方法。
 var ble
 var ws
@@ -45,11 +52,55 @@ func best_transport_name() -> String:
 func is_online() -> bool:
 	return _ws_ready() or _ble_ready()
 
-## 挂 BLE status 自动闭环：板子上报 ip 且 WS 未连时，自动连 WS。
+## 挂 BLE status 自动闭环 + WS 连接策略：板子上报 ip 且 WS 未连时自动连 WS。
 ## 由 Main._ready 在赋值 ble/ws 后调用一次。
 func hook_auto_ws() -> void:
 	if ble != null and not ble.status_received.is_connected(_on_ble_status):
 		ble.status_received.connect(_on_ble_status)
+	if ws != null and not ws.reconnect_failed.is_connected(_on_ws_reconnect_failed):
+		ws.reconnect_failed.connect(_on_ws_reconnect_failed)
+
+# ============================== 连接生命周期（WS_ONLY 让出 BLE / RECOVERY 重连 BLE） ==============================
+
+func get_conn_mode() -> int:
+	return _mode
+
+func is_ws_only() -> bool:
+	return _mode == ConnMode.WS_ONLY
+
+## WS 已连接：进入 WS_ONLY，让出 BLE 射频。由 Main._on_ws_connected 调用。
+func on_ws_ready() -> void:
+	_mode = ConnMode.WS_ONLY
+	if ble != null and ble.has_method("is_device_connected") and ble.is_device_connected():
+		ble.disconnect_device()
+		print("[Conn] WS_ONLY：断开 BLE 让出射频")
+
+## WS 连续重连失败达阈值：停止 WS 自旋，改走 BLE 恢复。
+func _on_ws_reconnect_failed(fails: int) -> void:
+	if fails < _WS_FAIL_LIMIT:
+		return
+	_mode = ConnMode.RECOVERY
+	if ws != null:
+		ws.disconnect_car()  # 关自动重连，停在当前状态，转 BLE 恢复
+	print("[Conn] RECOVERY：WS 连续失败 %d 次，转 BLE 恢复" % fails)
+	_try_ble_recovery()
+
+## RECOVERY：优先按最近设备地址重连 BLE（MAC 稳定，无需扫描）；
+## 没有最近设备则留待用户手动扫描连接。BLE 重连后 status 报 IP → 自动连 WS（_on_ble_status）。
+func _try_ble_recovery() -> void:
+	if ble == null:
+		return
+	var last: Dictionary = Store.get_last_device()
+	var addr: String = str(last.get("address", ""))
+	var name: String = str(last.get("name", ""))
+	if addr.is_empty():
+		print("[Conn] RECOVERY：无最近设备，需手动扫描连接")
+		return
+	print("[Conn] RECOVERY：按地址重连 BLE %s" % addr)
+	if ble.has_method("connect_saved"):
+		ble.connect_saved(addr, name)
+	else:
+		ble.connect_device(addr, name)
 
 func _on_ble_status(data: Dictionary) -> void:
 	var ip: Variant = data.get("ip")

@@ -6,7 +6,7 @@
 
 - **Godot 4.7.1 mono（mobile，竖屏** **`window/handheld/orientation=1` = Portrait）+ GDScript**，目标平台 Android。（旧文档误写“横向”；project.godot 与 AndroidManifest 均为 portrait。）
 
-- 一条 **STM32（电机控制）+ 独立 ESP32（摄像头 / WiFi / BLE / 云端 AI 客户端）** 的小车，经 UART 串接。
+- 一条 **STM32（电机控制）** + 独立 **ESP32-S3-CAM（控制/视觉大脑，`Stm32-Vision`）** 的小车，经 UART 串接。
 
 - 完整架构设计见 `.trae/documents/ctrl-app-architecture-and-ui-plan.md`。
 
@@ -21,6 +21,8 @@
 - **统一命令词表** `CommandProto`：摇杆 / 聊天 / 图传三入口共用（DIRECT），固件只解析这一份。词表：`move / stop / arm / snapshot / stream / config / ping / ai_goal`。
 
 - AI 链路：**DIRECT**（手机下发 ai_goal 文字/区域目标 → 板子执行并回 status）。手机中转（RELAY/审批卡）已移除。云端调用两侧均为桩。
+
+- **BLE 生命周期（射频共存，见架构文档 §5.7）**：WS 一连上（WS_ONLY）就 `ble.disconnect_device()` 让出 2.4G 射频；WS 连续重连失败超阈值（约 9s / 3 次）转 RECOVERY，按 `Store` 最近地址 `ble.connect_saved()` 直连（MAC 稳定、无需重扫）→ 读 status 拿 IP → `ws.connect_car_ip()` 重连 WS。互斥点：`Main._on_device_disconnected` 在 WS_ONLY 下**不**随之断开 WS（否则主动让出射频会崩掉刚建好的 WS）。实现：`AppState.ConnMode`。
 
 ## 目录结构
 
@@ -88,5 +90,5 @@ res://
 
 - BLE（已解决，2026-09-05）：真机“刷新恒 0 设备”根因不是 gdble 扫描——btleplug Java `onScanResult` 正常大量回调、gdble 返回 25+ 周边设备，是 `BLEClient.gd:_labels` 对 `"name": null` 的设备字典做 `var name: String = d.get("name","")` 赋值，取到 Nil 触发运行时错误中断函数，`address` 兜底永远走不到、结果恒 `[]`。已改为显式判 null（name 为 null 时回退 address）。配网 GATT 两侧代码已接（见下）。
 
-联调遗留：① BLE 配网后板重启，手机需**重连一次 BLE** 收 ip 才能自动连 WS；② arm 词表 `duration_ms` 板侧 uart 按 `dist_cm` 判定（UI 现均发 0，语义一致，非 0 定时版未实现）。
+联调遗留：① BLE 配网后板重启，**首次配网**仍需手动重连一次 BLE 收 ip 才能自动连 WS（RECOVERY 只覆盖"已连过板子后 WS 断线"的恢复，不含首次配网）；② arm 词表 `duration_ms` 板侧 uart 按 `dist_cm` 判定（UI 现均发 0，语义一致，非 0 定时版未实现）。
 

@@ -113,7 +113,6 @@ func _on_scan_started() -> void:
 	_set_state("scanning")
 
 func _on_scan_stopped() -> void:
-	_set_state("idle")
 	var devs: Array = _mgr.call("get_discovered_devices")
 	var named := _named_devices(devs)
 	print("[BLE] 扫描结束，发现设备: ", str(named))
@@ -121,9 +120,19 @@ func _on_scan_stopped() -> void:
 	if _restart_scan:
 		_restart_scan = false
 		_start_real_scan()
+		return
+	# 设备连接生命周期优先：扫描收尾不回写 idle，避免把已建立的链接状态"降级"成 idle
+	#（此前扫到设备连上后，残留扫描结束会把状态打回 idle，而板与链接其实都还活着）。
+	if _state in ["connecting", "connected"]:
+		return
+	_set_state("idle")
 
 func _on_error(message: String) -> void:
 	push_warning("蓝牙错误: %s" % message)
+	# 已连设备生命周期优先：瞬时/非致命错误（如某次特征写超时）不把活链路打回 idle，
+	# 真实掉线会走 device.disconnected 信号（_on_device_disconnected）再规范收尾。
+	if _state in ["connecting", "connected"]:
+		return
 	var was_scanning := _state == "scanning"
 	_set_state("idle")
 	if was_scanning:
@@ -214,6 +223,13 @@ func connect_device(address: String, display_name: String = "") -> bool:
 
 func disconnect_device() -> void:
 	_teardown_device()
+
+## 恢复路径专用：按已记录地址直接重连（MAC 稳定，无需先扫描）。本质同 connect_device，
+## 供 AppState 在 WS 恢复/兜底时把 BLE 重新拉起来。
+func connect_saved(address: String, display_name: String = "") -> bool:
+	if address.is_empty():
+		return false
+	return connect_device(address, display_name)
 
 func _on_device_connected() -> void:
 	if _dev_name.is_empty() and _dev != null:

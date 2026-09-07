@@ -24,6 +24,7 @@ static func config_wifi(ssid: String, password: String) -> Dictionary:
 	return {"type": "config", "params": {"ssid": ssid, "password": password}, "id": _new_id()}
 
 static func ping() -> Dictionary:
+	# 手动连通性测试（/ping）。无周期心跳。
 	return {"type": "ping", "params": {}, "id": _new_id()}
 
 static func ai_goal(message: String, annotation: Dictionary = {}, use_image: bool = false) -> Dictionary:
@@ -50,6 +51,7 @@ static func help_lines() -> PackedStringArray:
 		"/config <WiFi名> <密码>  配网",
 		"/goal <目标>  下发 AI 目标(DIRECT)",
 		"/cancel  取消当前 AI 任务",
+		"/ws connect|disconnect|status  WS 手动连接/断开/状态",
 		"直接输入文字 = 以下发 AI 目标; 框选后发文字 = 带区域目标",
 	])
 
@@ -62,6 +64,7 @@ const COMMAND_HINTS := {
 	"/config <WiFi名> <密码>": "配网",
 	"/goal <目标>": "下发 AI 目标(DIRECT)",
 	"/cancel": "取消当前 AI 任务",
+	"/ws [connect|disconnect|status]": "WS 手动连接/断开/状态",
 }
 
 ## 按已敲的 / 指令片段过滤可匹配项，返回"指令 - 说明"行。text 以 / 开头才匹配；删到空则返回空。

@@ -32,7 +32,13 @@ const BT_ITEM := preload("res://ui/bluetooth/BTDeviceListItem.tscn")
 @onready var _nav_about: TextureButton = $NaviBar/HBox/About
 
 var _joy_held := false
-var _last_joy := Vector2.ZERO
+var _last_joy_cmd := Vector2.ZERO  # 上一次真正下发的摇杆指令（模拟值量化后对比用）
+# 摇杆量化档：死区内不动作；速度分 低速/高速 两档；转向固定档。仅档位变化才发 move，松手发 stop。
+const _JOY_DEADZONE := 0.15
+const _JOY_SLOW := 0.5
+const _JOY_FAST := 1.0
+const _JOY_FAST_THRESH := 0.7
+const _JOY_STEER := 0.8
 ## 最近一次成功连接的设备名，用于顶栏「已连接: xxx」。
 var _device_name := ""
 var _page_tween: Tween = null
@@ -67,8 +73,8 @@ func _ready() -> void:
 
 	AppState.hook_auto_ws()
 	_request_ble_permissions()
-	# 启动即尝试连接小车（默认软 AP 地址；离线只显示未连接，不阻塞 UI）
-	$Net/WS.connect_car()
+	# WS 由 BLE 会话驱动：不在启动时自连/心跳（避免"未连接设备也在连 WS"），
+	# 等 _on_device_connected / 板子上报 IP（AppState._on_ble_status）再连。
 	_update_status()
 	_update_attach_hint()
 	set_process_input(true)
@@ -192,6 +198,9 @@ func _on_device_item_selected(name: String, address: String) -> void:
 func _on_device_connected(_address: String, name: String) -> void:
 	_device_name = name
 	_update_status()
+	# BLE 已连接（会话开始）：发起 WS（默认软 AP 地址；板子上报 IP 时 AppState 会用 ws://ip 覆盖）。
+	if AppState.ws != null and not AppState.ws.is_connected_car():
+		AppState.ws.connect_car()
 	_chat("提示", "已连接设备 %s" % name)
 	# 携带配网/AI 请求（设备卡片 → 连接窗口 → 确认），连上且 GATT 就绪后下发。
 	var wifi: Dictionary = _pending_provision
@@ -214,6 +223,10 @@ func _on_device_connected(_address: String, name: String) -> void:
 
 func _on_device_disconnected(reason: String) -> void:
 	_update_status()
+	# BLE 会话结束 → 结束 WS 会话（关掉自动重连/心跳），避免"无设备也在连 WS"。
+	# 例外：WS_ONLY 模式下断开 BLE 是"让出射频"（on_ws_ready 主动断开），此时 WS 仍要继续，不随之断开。
+	if AppState.ws != null and not AppState.is_ws_only():
+		AppState.ws.disconnect_car()
 	_chat("提示", "设备已断开: %s" % reason)
 
 func _on_ble_status(data: Dictionary) -> void:
@@ -295,10 +308,13 @@ func _wait_gatt_ready() -> void:
 func _on_ws_connected() -> void:
 	_chat("板", "WS 已连接")
 	_update_status()
+	# WS 建立：进入 WS_ONLY，让出 BLE 射频（若 BLE 仍在连接则断开）
+	AppState.on_ws_ready()
 
-func _on_ws_disconnected(_reason: String) -> void:
+func _on_ws_disconnected(reason: String) -> void:
 	_video.call("show_no_signal", true)
 	_update_status()
+	_chat("板", "WS 已断开:%s" % reason)
 
 func _on_frame(img: Image) -> void:
 	_video.call("set_frame", img)
@@ -567,6 +583,9 @@ func _handle_slash(text: String) -> void:
 			cmd = CP.ai_goal(msg)
 		"/cancel", "/stopai":
 			cmd = CP.ai_cancel()
+		"/ws":
+			_handle_ws_slash(pieces[1].strip_edges().to_lower() if pieces.size() > 1 else "status")
+			return
 		_:
 			_chat("提示", "未知指令: %s(/help 查看可用指令)" % verb)
 			return
@@ -577,6 +596,20 @@ func _handle_slash(text: String) -> void:
 func _show_help() -> void:
 	var lines := CP.help_lines()
 	_chat("提示", "可用指令:\n" + "\n".join(lines))
+
+## /ws 手动控制：connect 开启自动重连并重连；disconnect 暂停自动重连并断开；status 查状态。
+func _handle_ws_slash(arg: String) -> void:
+	var ws := $Net/WS
+	match arg:
+		"connect":
+			AppState.ws.connect_car()
+			_chat("提示", "已发起 WS 连接（自动重连已开启）")
+		"disconnect":
+			AppState.ws.disconnect_car()
+			_chat("提示", "已手动断开 WS（暂停自动重连）")
+		_:
+			var auto := "自动重连" if ws.is_auto_reconnect() else "无自动重连"
+			_chat("提示", "WS:%s（%s）" % [ws.get_state(), auto])
 
 func _chat(who: String, msg: String) -> void:
 	if who == "我":
@@ -640,20 +673,30 @@ func _update_joystick() -> void:
 	var x: float = Input.get_action_strength("vjoy_right") - Input.get_action_strength("vjoy_left")
 	var y: float = Input.get_action_strength("vjoy_down") - Input.get_action_strength("vjoy_up")
 	var v: Vector2 = Vector2(x, y)
-	# 上=前进：推进取 -y；左右取 x
-	var throttle: float = clampf(-v.y, -1.0, 1.0)
-	var steering: float = clampf(v.x, -1.0, 1.0)
-	if v.distance_to(_last_joy) < 0.001:
+	# 上=前进：推进取 -y；左右取 x。量化成：速度 低速/高速 两档 + 固定转向，死区内归零
+	var throttle := 0.0
+	if absf(v.y) >= _JOY_DEADZONE:
+		var sp: float = _JOY_FAST if absf(v.y) > _JOY_FAST_THRESH else _JOY_SLOW
+		throttle = signf(v.y) * -sp
+	var steering := 0.0
+	if absf(v.x) >= _JOY_DEADZONE:
+		steering = signf(v.x) * _JOY_STEER
+	var cmd := Vector2(throttle, steering)
+	if cmd == _last_joy_cmd:
 		return
-	_last_joy = v
+	_last_joy_cmd = cmd
+	if cmd == Vector2.ZERO:
+		AppState.send_command(CP.stop("wheels"))
+		return
 	AppState.send_command(CP.move(throttle, steering))
 
 func _on_joystick_pressed(_v: Variant = null) -> void:
 	_joy_held = true
+	_last_joy_cmd = Vector2.ZERO
 
 func _on_joystick_release(_v: Variant = null) -> void:
 	_joy_held = false
-	_last_joy = Vector2.ZERO
+	_last_joy_cmd = Vector2.ZERO
 	AppState.send_command(CP.stop("wheels"))
 
 # ============================== 状态 ==============================
