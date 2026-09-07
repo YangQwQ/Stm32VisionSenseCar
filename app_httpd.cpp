@@ -140,6 +140,7 @@ static void ws_handle_text(const char *json, int fd)
             cam::return_frame(fb);
         }
     } else if (!strcmp(type, "ping")) {
+        // 连通性测试：回 pong（手动 /ping 触发，无周期心跳）。
         ws_send_text(fd, "{\"type\":\"pong\"}");
     } else {
         // 统一词表：move/stop/arm/config/stream/ai_goal/ai_cancel 等交给 command

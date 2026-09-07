@@ -41,6 +41,16 @@ static void reply_pong(JsonDocument& src, cmd::ReplyFn reply, void* ctx) {
   reply(ctx, s.c_str());
 }
 
+// 手动指令串口日志：只有指令类型切换时才打一行当作"确认收到"；
+// 同一类型连续重复（摇杆高频帧）完全不输出，避免刷屏、也避免拖慢后续指令处理。
+static void log_manual_throttled(const char* type) {
+  static String s_last;
+  if (s_last != type) {
+    s_last = type;
+    Serial.printf("[cmd] 收到手动指令 %s\n", type);
+  }
+}
+
 void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_ctx) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) {
@@ -51,23 +61,16 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   JsonObject params = doc["params"].as<JsonObject>();
   bool manual = !strcmp(type, "move") || !strcmp(type, "stop") || !strcmp(type, "arm");
   if (manual) {
-    // 手动高频指令：WS 与 BLE 都汇到此处。同类型连续重复只记首条，确认收到而不刷屏。
-    static String s_last_manual;
-    if (s_last_manual != type) {
-      Serial.printf("[cmd] 收到手动指令 %s\n", type);
-      s_last_manual = type;
-    }
-  } else {
-    Serial.printf("[cmd] type=%s has_frames=%u\n", type, has_frames);
-  }
-
-  if (manual) {
-    // 手动/词表动作：优先打断 AI 闭环，再立即译帧下发执行板（不文本应答）。
+    // 手动高频指令：先立即打断 AI 闭环并译帧下发执行板（电机控制优先），
+    // 串口日志只在类型切换时打一行，绝不让日志阻塞控制时序。
     // arm 打断只停轮子（机械臂指令即接管）；move/stop 由用户指令覆盖，不补停。
     ai::cancel(!strcmp(type, "arm") ? ai::StopMode::Wheels : ai::StopMode::None);
     uart::act(type, params);
+    log_manual_throttled(type);
     return;
   }
+
+  Serial.printf("[cmd] type=%s has_frames=%u\n", type, has_frames);
 
   if (!strcmp(type, "config")) {
     // 配网（BLE 或 WS 同结构）：落 NVS → 重启连 WiFi → 上线后 BLE 上报 IP

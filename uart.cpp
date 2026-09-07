@@ -1,6 +1,9 @@
 #include "uart.h"
 #include "config.h"
 
+// 置 1 时状态帧打印逐字节 payload hex（调试报文用）；默认单行短摘要，避免抢串口。
+#define UART_STATE_HEX_DUMP 0
+
 // UART 口：Serial2（实例）。引脚因板而异——若与执行板接线不符，在此 setPins 覆盖：
 //   #define UART_TX_PIN 17
 //   #define UART_RX_PIN 18
@@ -192,9 +195,15 @@ void uart::update() {
         if (got == calc) {
           uint8_t dev = buf[3], cmd = buf[4];
           if (cmd == 0x0A) {
+#if UART_STATE_HEX_DUMP
             Serial.printf("[uart] 状态帧 dev=%02X payload=", dev);
             for (size_t i = 5; i < 3 + 1 + len; i++) Serial.printf("%02X ", buf[i]);
             Serial.println();
+#else
+            // 单行短摘要：状态帧周期性上报，逐字节 hex 会占满串口缓冲、阻塞并发的手动 ack 打印。
+            // 需看 payload 时临时把 UART_STATE_HEX_DUMP 置 1。
+            Serial.printf("[uart] 状态帧 dev=%02X state=%u\n", dev, (unsigned)buf[5]);
+#endif
           } else {
             Serial.printf("[uart] 收到帧 dev=%02X cmd=%02X（非状态帧，忽略）\n", dev, cmd);
           }

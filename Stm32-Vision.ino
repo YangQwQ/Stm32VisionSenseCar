@@ -1,4 +1,5 @@
 #include "esp_camera.h"
+#include "esp_log.h"
 #include "config.h"
 #include "wifi_net.h"
 #include "camera.h"
@@ -26,6 +27,10 @@ void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
+
+  // 系统日志(log_i/log_w)默认也走 UART0，与 Arduino Serial 抢口会阻塞手动指令 ack 打印。
+  // 静到 WARN 以上，只留错误；需排查置 INFO。
+  esp_log_level_set("*", ESP_LOG_WARN);
 
   cfg::init();
 

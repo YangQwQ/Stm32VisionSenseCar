@@ -9,7 +9,7 @@
 ### 工作模式
 
 1. **WiFi 直连 AI 模式**：板子经 WiFi 直调多模态 AI 接口，上传画面 → 解析返回控制指令 → UART 转发执行板。⚠️ 板载 AI 客户端（`ai_client`）尚未实现。
-2. **蓝牙配置模式**：BLE（GATT Server，广播名 VisionS3）接收配置（WiFi 账号密码 / AI 接口等）→ 存 NVS → 重启生效。✅ 已实现。
+2. **蓝牙配置模式**：BLE（GATT Server，广播名 VisionS3）接收配置（WiFi 账号密码 / AI 接口等）→ 存 NVS → 重启生效。✅ 已实现。**生命周期**：手机在 WS 连上后断开本机 BLE 让出射频（WS_ONLY）；WS 断线恢复时按最近地址重连本机 GATT（`onDisconnect` 自动恢复广播）。
 3. **手机中转模式（已弃用）**：App 中转调 AI 的 RELAY 已在手机端移除（2026-09）。现行 **DIRECT**：手机只下发 `ai_goal` 目标文本/区域 → 板子执行并回 status；云端 AI 两侧现均为桩。
 
 ### 执行板
@@ -36,7 +36,7 @@
 
 ## 构建要点
 
-- 框架：Arduino（`esp32` 板支持包）。芯片为经典 **ESP32-CAM**（AI-Thinker，带 PSRAM），IDE / 命令行目标一律 `esp32:esp32:esp32cam`（⚠️ 曾误标为 ESP32-S3：`esp32s3` 目标编出的固件无法用于本板，勿用）。
+- 框架：Arduino（`esp32` 板支持包）。当前板为 **ESP32-S3-CAM（N16R8，带 PSRAM）**，摄像头选型在 `camera.h` 顶部 `CAMERA_MODEL_ESP32S3_EYE`；IDE / 命令行目标一律 `esp32:esp32s3:esp32s3`+`16M flash / opi psram / huge_app`。⚠️ 曾误用经典 `esp32:esp32:esp32cam`（AI-Thinker）目标，编出固件无法用于本板，勿回退。
 - 当前在 **esp32 core 3.3.11** 下全量编译链接通过。核心 API 已按 3.x 适配，**勿回退 2.x**：
   - LEDC 引脚式：`ledcAttach(pin, freq, res)` / `ledcWrite(pin, duty)`（`ledcSetup/ledcAttachPin` 及 channel 式调用已移除）
   - BLE：`getValue()` 返回 Arduino `String`；无 `getNotifyProperty`；发射功率枚举为 `ESP_PWR_LVL_P9`
@@ -75,4 +75,5 @@ BLE UUID / 广播名与手机 `Ctrl-App/net/ble/BleProfile.gd` **逐字 mirror**
 - 与用户交流使用中文。
 - 编译验证：用户未明确要求时，**不主动跑 arduino-cli 编译验证**（esp32 单次 ~80s+ 起步、IDE↔命令行互切会各自全量重编，耗时无谓）；日常编译/烧录验证默认交给用户在 IDE 里做。确需命令行核对时，用「构建要点」里与 IDE 逐字一致的同一 fqbn。
 - 指令协议、注释保持简洁；避免在注释里写死具体数值（参数调整时容易忘改）。
+- **串口日志卫生（防吞吐尖峰 / 与手动 ack 抢口）**：执行板状态帧只打单行短摘要，逐字节 hex 转储用 `UART_STATE_HEX_DUMP` 宏（默认 0）临时开启；IDF 系统日志 `esp_log_level_set("*", ESP_LOG_WARN)` 默认静到 WARN，避免 verbose 时与手动指令 ack 打印争用同一 UART0。
 - 大模型返回的指令必须严格校验后再转发，防止异常 JSON 导致执行板误动作。
