@@ -1,12 +1,3 @@
-# 原始示例工程与资料（保留在工作区但不入库）
-例程 p1
-外设及相关资料
-
-# ---- 顶层残留的空白 Keil 工程（无应用源码，仅含 RTE/构建产物）----
-car.uvprojx
-car.uvoptx
-car.uvguix*
-/car_firmware/car.uvprojx.dep
 
 # ---- Keil 编译输出（工程级）----
 DebugConfig/
@@ -15,39 +6,10 @@ Objects/
 RTE/
 *.uvoptx
 *.uvguix*
-*.scvd
-EventRecorderStub.scvd
-
-# ---- 构建中间产物（兜底，避免误入库）----
-*.o
-*.d
-*.crf
-*.axf
-*.htm
-*.map
-*.dep
-*.lnp
-*.sct
-*.elf
-*.build_log.htm
-*.pyc
-__pycache__/
-
-# ---- 宿主单测生成的可执行文件 ----
-*.exe
 
 # ---- IDE / 系统临时文件 ----
+/.trae
+/.claude
 .vscode/
-.idea/
 *.swp
 *.tmp
-.DS_Store
-Thumbs.db
-
-# ---- 第三方烧录工具（整包保留在工作区但不入库）----
-/car_firmware/stlink-1.8.0-win32/
-
-# ---- 压缩包与构建/烧录日志 ----
-*.zip
-/car_firmware/*.log
-/car_firmware/*.txt
