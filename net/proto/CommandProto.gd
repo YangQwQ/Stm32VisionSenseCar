@@ -20,6 +20,10 @@ static func snapshot(quality: int = 82) -> Dictionary:
 static func stream(on: bool) -> Dictionary:
 	return {"type": "stream", "params": {"on": on}, "id": _new_id()}
 
+static func exec_forward(on: bool) -> Dictionary:
+	# 执行板日志镜像开关：开启后板子把执行板经 UART 上行的帧转发给本 app（调试看执行板串口）。
+	return {"type": "exec_forward", "params": {"on": on}, "id": _new_id()}
+
 static func config_wifi(ssid: String, password: String) -> Dictionary:
 	return {"type": "config", "params": {"ssid": ssid, "password": password}, "id": _new_id()}
 
@@ -47,6 +51,7 @@ static func help_lines() -> PackedStringArray:
 		"/ping  连通性测试",
 		"/snapshot  截图",
 		"/stream [on|off]  图传开关",
+		"/exec_log [on|off]  执行板日志(转发给手机)",
 		"/stop [wheels|arm]  停车",
 		"/config <WiFi名> <密码>  配网",
 		"/goal <目标>  下发 AI 目标(DIRECT)",
@@ -60,6 +65,7 @@ const COMMAND_HINTS := {
 	"/ping": "连通性测试",
 	"/snapshot": "截图",
 	"/stream [on|off]": "图传开关",
+	"/exec_log [on|off]": "执行板日志(转发给手机)",
 	"/stop [wheels|arm]": "停车",
 	"/config <WiFi名> <密码>": "配网",
 	"/goal <目标>": "下发 AI 目标(DIRECT)",

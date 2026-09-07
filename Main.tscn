@@ -449,6 +449,7 @@ theme_override_constants/icon_max_width = 120
 theme_override_styles/normal = SubResource("StyleBoxFlat_3y6u5")
 theme_override_styles/pressed = SubResource("StyleBoxFlat_fpfj3")
 theme_override_styles/hover = SubResource("StyleBoxFlat_3y6u5")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_fpfj3")
 toggle_mode = true
 icon = ExtResource("5_j4qnp")
 icon_alignment = 1

@@ -387,6 +387,21 @@ func _on_ws_text(data: Dictionary) -> void:
 	if t == "ai_result":
 		_show_ai_result(data)
 		return
+	if t == "exec_status":
+		# 执行板日志镜像：板子把执行板上行帧转发过来，逐帧代偿执行板串口显示。
+		var p: Variant = data.get("params")
+		var hex := ""
+		if p is Dictionary:
+			var pm := p as Dictionary
+			hex = "%02X" % int(pm.get("cmd", 0))
+			var hx: Variant = pm.get("hex")
+			if hx is Array:
+				var parts := PackedStringArray()
+				for b in hx:
+					parts.append("%02X" % int(b))
+				hex += " " + " ".join(parts)
+		_chat("执行板", hex)
+		return
 	if t != "status":
 		return
 	# status：尽量展示人类可读字段（reason / reply），纯机器状态略
@@ -611,6 +626,12 @@ func _handle_slash(text: String) -> void:
 				on = arg != "off" and arg != "0" and arg != "false"
 			cmd = CP.stream(on)
 			_stream_toggle.set_pressed_no_signal(on)
+		"/exec_log":
+			var ela_on := true
+			if pieces.size() > 1:
+				var el_arg: String = pieces[1].strip_edges().to_lower()
+				ela_on = el_arg != "off" and el_arg != "0" and el_arg != "false"
+			cmd = CP.exec_forward(ela_on)
 		"/stop":
 			var scope := "all"
 			if pieces.size() > 1 and pieces[1].strip_edges().to_lower() in ["wheels", "arm"]:
@@ -669,6 +690,8 @@ func _chat(who: String, msg: String) -> void:
 		_chat_log.append_text("[color=#c9f7a8]AI[/color]: %s\n" % msg)
 	elif who == "提示":
 		_chat_log.append_text("[color=#ffd75e]系统[/color]: %s\n" % msg)
+	elif who == "执行板":
+		_chat_log.append_text("[color=#b39ddb]执行板[/color]: %s\n" % msg)
 	else:
 		_chat_log.append_text(msg + "\n")
 
