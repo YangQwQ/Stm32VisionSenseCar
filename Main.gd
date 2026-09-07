@@ -456,7 +456,7 @@ func _cmd_text(cmd: Dictionary) -> String:
 
 # ============================== 聊天 / 指令 ==============================
 
-func _on_send_pressed() -> void:
+func _on_send_pressed(_new_text: String = "") -> void:
 	_reconcile_attachments()
 	_clear_command_hint()  # 发送清掉可能的 / 指令提示（输入清空不一定触发 text_changed）
 	if _message_input.text.strip_edges().is_empty() and _attachments.is_empty():

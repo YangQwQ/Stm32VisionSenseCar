@@ -72,13 +72,27 @@ func _process(_delta: float) -> void:
 	for i in _peer.get_available_packet_count():
 		var pkt = _peer.get_packet()
 		if pkt is String:
-			var data: Dictionary = CP.decode(pkt)
-			if not data.is_empty():
-				text_received.emit(data)
+			_handle_text(pkt as String)
 		else:
-			var img := Image.new()
-			if img.load_jpg_from_buffer(pkt) == OK:
-				frame_received.emit(img)
+			# Godot WebSocketPeer 可能按二进制交付文本帧：先试按 JSON 文本解析，非文本再当 JPEG 图传。
+			var bytes := pkt as PackedByteArray
+			var text := bytes.get_string_from_utf8()
+			var data: Dictionary = CP.decode(text)
+			if not data.is_empty():
+				_handle_text(text)
+			else:
+				var img := Image.new()
+				if img.load_jpg_from_buffer(bytes) == OK:
+					frame_received.emit(img)
+
+## 统一处理一条 WS 文本指令/应答：解码后派发；pong 打印便于调试。
+func _handle_text(text: String) -> void:
+	var data: Dictionary = CP.decode(text)
+	if data.is_empty():
+		return
+	if data.get("type", "") == "pong":
+		print("[WS] recv text: %s" % text)
+	text_received.emit(data)
 
 func _teardown() -> void:
 	if _peer != null:

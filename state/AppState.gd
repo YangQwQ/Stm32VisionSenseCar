@@ -16,9 +16,11 @@ var current_image: Image = null  # 最新一帧，供编辑/框选用
 func send_command(cmd: Dictionary) -> bool:
 	var t: String = str(cmd.get("type", ""))
 	if _ws_ready():
+		print("[SEND] %s via WS" % t)
 		ws.send_command(cmd)
 		return true
 	if t in BP.FALLBACK_TYPES and _ble_ready():
+		print("[SEND] %s via BLE" % t)
 		ble.write_cmd(cmd)
 		return true
 	push_warning("指令未发送（WS/BLE 均不可用）: %s" % t)
