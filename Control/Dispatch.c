@@ -28,7 +28,7 @@
 
 typedef enum { CAR_IDLE, CAR_MOVE, CAR_TURN } CarMove;
 static CarMove car_move;
-static uint8_t car_dir, car_speed;
+static uint8_t car_speed;
 
 /* P1-3：机械臂最近下发的待完成动作类型（用于区分"定距完成"与"夹爪完成"） */
 static uint8_t arm_pending;   /* 0=无 1=定距(升降/移爪) 2=夹爪 */
@@ -41,7 +41,7 @@ static uint16_t CarPwm(uint8_t sp) { return ((uint16_t)sp * 1000u) / 255u; }
 void Dispatch_Init(void)
 {
 	car_move = CAR_IDLE;
-	car_dir = 0; car_speed = 0;
+	car_speed = 0;
 	arm_pending = 0;
 	Relay_Stop();
 	g_status.car_state = CAR_STATE_STOP;
@@ -57,7 +57,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 	{
 	case CAR_CMD_MOVE_CONT:                       /* 持续移动 dir speed */
 		dir = f->b[2]; sp = f->b[3];
-		car_dir = dir; car_speed = sp;
+		car_speed = sp;
 		AckermannDrive_Straight(dir, CarPwm(sp));
 		Relay_Stop();
 		car_move = CAR_MOVE;
@@ -67,7 +67,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 		dir = f->b[2];
 		dist = PayloadU16(&f->b[3]);
 		sp = f->b[5];
-		car_dir = dir; car_speed = sp;
+		car_speed = sp;
 		g_status.car_done = 0;                    /* 进入执行：清除上次完成标志 */
 		AckermannDrive_Straight(dir, CarPwm(sp));
 		Relay_Start(RLY_DIST, (int32_t)dist * 10);   /* 0.1cm */
@@ -76,7 +76,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 
 	case CAR_CMD_TURN_CONT:                       /* dir speed */
 		dir = f->b[2]; sp = f->b[3];
-		car_dir = dir; car_speed = sp;
+		car_speed = sp;
 		AckermannDrive_Turn(dir, CarPwm(sp));
 		Relay_Stop();
 		car_move = CAR_TURN;
@@ -86,7 +86,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 		dir = f->b[2];
 		ang = PayloadU16(&f->b[3]);
 		sp = f->b[5];
-		car_dir = dir; car_speed = sp;
+		car_speed = sp;
 		g_status.car_done = 0;                    /* 进入执行：清除上次完成标志 */
 		AckermannDrive_TurnAngle(dir, (uint8_t)ang, CarPwm(sp));
 		Relay_Start(RLY_YAW, (int32_t)ang * 10);     /* 0.1° */

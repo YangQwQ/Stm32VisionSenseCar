@@ -31,7 +31,7 @@ static void ApplyChassis(DriveMode m, uint16_t pwm)
  * 起步，保证响应）；相同运动重复调用（自测每拍、UART 续发）不重置，避免打断闭环。 */
 static void AckermannDrive_Go(DriveMode m, uint16_t sp)
 {
-	uint16_t s = (uint16_t)CLAMP(sp, 0, 1000);
+	uint16_t s = sp > 1000u ? 1000u : sp;   /* sp 无符号，只需上限钳位 */
 
 	if (m == drive_mode && s == drive_target) return;
 
