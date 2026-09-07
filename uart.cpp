@@ -4,9 +4,10 @@
 // 置 1 时状态帧打印逐字节 payload hex（调试报文用）；默认单行短摘要，避免抢串口。
 #define UART_STATE_HEX_DUMP 0
 
-// UART 口：Serial2（实例）。引脚因板而异——若与执行板接线不符，在此 setPins 覆盖：
-//   #define UART_TX_PIN 17
-//   #define UART_RX_PIN 18
+// UART 口：Serial2（实例）。板上 TXD/RXD 走 CH340→UART0 调试串口，勿复用；
+// 执行板串口接本板的 IO19(TX) / IO20(RX)（板上未引出的默认 Serial2 引脚 GPIO17/18 不用）。
+#define UART_TX_PIN 19
+#define UART_RX_PIN 20
 static HardwareSerial& u = Serial2;
 
 // 速度/距离为执行板标定项（架构 §5.5「通用约定」）。词表不带 speed 的 arm 动作用此默认档。
@@ -29,6 +30,10 @@ static uint16_t crc16(const uint8_t* data, size_t len) {
 struct ExecState { uint8_t dev, state, speed, grip; uint16_t param; uint8_t flag; bool valid; };
 static ExecState g_exec = {};
 static SemaphoreHandle_t g_exec_mtx = nullptr;
+
+// 执行板上行帧镜像：转发开关 + 广播回调（app_httpd 注册，向全部 WS 客户端发文本）。
+static bool g_forward = false;
+static uart::ForwardCb g_forward_cb = nullptr;
 
 void uart::send_raw(uint8_t dev, uint8_t cmd, const uint8_t* payload, size_t len) {
   uint8_t frame[2 + 1 + 1 + 1 + 64 + 2];  // 头2 + LEN + DEV + CMD + PAYLOAD(≤64) + CRC2
@@ -164,6 +169,27 @@ bool uart::is_continuous(const char* type, const JsonObjectConst& p) {
 
 // ---------------- 初始化 / RX（状态帧解析骨架） ----------------
 
+void uart::set_forward(bool on) { g_forward = on; }
+void uart::set_forward_cb(uart::ForwardCb cb) { g_forward_cb = cb; }
+
+// ---------------- 执行板上行帧镜像 ----------------
+// 把校验通过的一帧拼成「执行板日志」JSON，经广播回调发给手机（开启镜像时）：
+//   { type:"exec_status", params:{ dev, cmd, hex:[payload原始字节] } }
+// 内容即执行板原始上行数据，代偿执行板上没有的串口查看手段。
+static void forward_frame(const uint8_t* buf, uint8_t dev, uint8_t cmd, uint8_t len) {
+  if (!g_forward || !g_forward_cb) return;
+  JsonDocument doc;
+  doc["type"] = "exec_status";
+  JsonObject p = doc["params"].to<JsonObject>();
+  p["dev"] = dev;
+  p["cmd"] = cmd;
+  JsonArray hex = p["hex"].to<JsonArray>();
+  for (size_t i = 5; i < 3 + (size_t)len; i++) hex.add(buf[i]);  // payload 原始字节（DEV 前到 PAYLOAD 尾）
+  String s;
+  serializeJson(doc, s);
+  g_forward_cb(s.c_str());
+}
+
 void uart::init() {
   g_exec_mtx = xSemaphoreCreateMutex();
   uint32_t baud = cfg::uart_baud();
@@ -207,6 +233,8 @@ void uart::update() {
           } else {
             Serial.printf("[uart] 收到帧 dev=%02X cmd=%02X（非状态帧，忽略）\n", dev, cmd);
           }
+          // 镜像：开关开启时把此帧原样广播给手机（不分状态/非状态，代偿执行板串口）。
+          forward_frame(buf, dev, cmd, len);
         } else {
           Serial.printf("[uart] CRC 校验失败\n");
         }

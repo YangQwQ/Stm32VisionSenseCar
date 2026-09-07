@@ -102,6 +102,14 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
+  if (!strcmp(type, "exec_forward")) {
+    // 执行板日志镜像：开启后把执行板经 UART 上行的帧转发给手机（调试看执行板串口）。
+    bool on = params["on"] | false;
+    uart::set_forward(on);
+    reply_status(doc, reply, reply_ctx, on ? "执行板日志已开启，转发给手机" : "执行板日志已关闭");
+    return;
+  }
+
   if (!strcmp(type, "snapshot")) {
     // 抓帧需 WS 通道（带帧/权限）；BLE 无此能力，如实引导。
     if (has_frames) {

@@ -26,4 +26,9 @@ bool is_continuous(const char* type, const JsonObjectConst& params);
 // 无状态数据（执行板未接入/未上报）返回 false，buf 不变。
 bool read_state(char* buf, size_t cap);
 
+// 执行板上行帧镜像：开发调试用，把收到的执行板帧广播给手机 App（app_httpd 注册 ForwardCb）。
+typedef void (*ForwardCb)(const char* json);
+void set_forward(bool on);                    // 开关：收到执行板帧时是否转发给手机
+void set_forward_cb(ForwardCb cb);            // 注册广播回调（向全部 WS 客户端发文本）
+
 }  // namespace uart

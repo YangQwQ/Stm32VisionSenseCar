@@ -94,6 +94,7 @@ httpd_handle_t camera_httpd = NULL;
 #include "command.h"
 #include "ble.h"
 #include "ai_client.h"
+#include "uart.h"
 
 #define WS_STREAM_FPS 10
 #define WS_EDIT_IMG_MAX (128 * 1024)  // 编辑图（二进制上行）上限，与 ai_client 一致
@@ -220,6 +221,18 @@ static bool ws_send_jpeg_to_ws_clients(camera_fb_t *fb, bool *has_client)
         if (fb) ws_send_jpeg(fds[i], fb);
     }
     return any;
+}
+
+// 执行板日志镜像回调：把一帧文本广播给全部 WS 客户端（uart::update 主循环上下文，async 安全）。
+static void ws_send_text_to_ws_clients(const char *text)
+{
+    int fds[WS_MAX_CLIENTS];
+    size_t n = WS_MAX_CLIENTS;
+    if (httpd_get_client_list(stream_httpd, &n, fds) != ESP_OK) return;
+    for (size_t i = 0; i < n; i++) {
+        if (httpd_ws_get_fd_info(stream_httpd, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) continue;
+        ws_send_text(fds[i], text);
+    }
 }
 
 // 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧；
@@ -1541,6 +1554,7 @@ void startCameraServer()
 #ifdef CONFIG_HTTPD_WS_SUPPORT
         httpd_register_uri_handler(stream_httpd, &ws_uri);
         xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 4096, NULL, 5, NULL, 1);
+        uart::set_forward_cb(ws_send_text_to_ws_clients);  // 执行板日志镜像 → 广播给手机
 #endif
     }
 }
