@@ -14,6 +14,8 @@
 [ext_resource type="Texture2D" uid="uid://216chvs4p2dt" path="res://res/control.png" id="8_5vvyt"]
 [ext_resource type="PackedScene" uid="uid://b3nn00g0v4o37" path="res://ui/editor/ImageEditor.tscn" id="8_editor"]
 [ext_resource type="Texture2D" uid="uid://bg3hhwm1rvnco" path="res://res/control_a.png" id="9_j4qnp"]
+[ext_resource type="Texture2D" uid="uid://b23cof1akfklg" path="res://res/YP.jpg" id="9_kjvhd"]
+[ext_resource type="Texture2D" uid="uid://dni0iuv07coxu" path="res://res/SYF.jpg" id="10_5tuhn"]
 [ext_resource type="Texture2D" uid="uid://ck1coptjcgrlb" path="res://res/settings_a.png" id="11_fpfj3"]
 [ext_resource type="Texture2D" uid="uid://1uxvy1j5nvue" path="res://res/settings.png" id="12_sc1dx"]
 
@@ -54,17 +56,17 @@ corner_detail = 5
 [sub_resource type="DPITexture" id="DPITexture_lgr22"]
 _source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"16\"><rect width=\"30\" height=\"14\" x=\"1\" y=\"1\" fill=\"#fff\" fill-opacity=\".75\" rx=\"7\"/><circle cx=\"24\" cy=\"8\" r=\"5\" fill=\"#1a1a1a\"/></svg>
 "
-base_scale = 3.0
+base_scale = 4.0
 
 [sub_resource type="DPITexture" id="DPITexture_trn2v"]
 _source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"16\"><rect width=\"30\" height=\"14\" x=\"1\" y=\"1\" fill=\"#fff\" fill-opacity=\".37\" rx=\"7\"/><circle cx=\"24\" cy=\"8\" r=\"5\" fill=\"#1a1a1a\" fill-opacity=\".5\"/></svg>
 "
-base_scale = 3.0
+base_scale = 4.0
 
 [sub_resource type="DPITexture" id="DPITexture_03owx"]
 _source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"16\"><g fill-opacity=\".5\"><rect width=\"30\" height=\"14\" x=\"1\" y=\"1\" fill=\"#1a1a1a\" rx=\"7\"/><circle cx=\"8\" cy=\"8\" r=\"5\" fill=\"#fff\"/></g></svg>
 "
-base_scale = 3.0
+base_scale = 4.0
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_5vvyt"]
 content_margin_left = 20.0
@@ -154,6 +156,7 @@ shadow_size = 10
 default_font_size = 32
 Button/font_sizes/font_size = 42
 Button/styles/hover = SubResource("StyleBoxFlat_03owx")
+Button/styles/hover_pressed = SubResource("StyleBoxFlat_20pc6")
 Button/styles/normal = SubResource("StyleBoxFlat_03owx")
 Button/styles/pressed = SubResource("StyleBoxFlat_20pc6")
 CheckButton/font_sizes/font_size = 40
@@ -252,6 +255,43 @@ bg_color = Color(0, 0, 0, 0.54901963)
 
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3y6u5"]
 
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_sc1dx"]
+content_margin_left = 0.0
+content_margin_top = 0.0
+content_margin_right = 0.0
+content_margin_bottom = 0.0
+bg_color = Color(0.1, 0.1, 0.1, 0.6)
+corner_radius_top_left = 15
+corner_radius_top_right = 15
+corner_radius_bottom_right = 15
+corner_radius_bottom_left = 15
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_iygje"]
+draw_center = false
+border_width_left = 10
+border_width_top = 10
+border_width_right = 10
+border_width_bottom = 10
+border_color = Color(1, 1, 1, 1)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_i6pqd"]
+draw_center = false
+border_width_left = 10
+border_width_top = 10
+border_width_right = 10
+border_width_bottom = 10
+border_color = Color(1, 1, 1, 1)
+border_blend = true
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_q2x1n"]
 bg_color = Color(0, 0, 0, 0.16862746)
 
@@ -261,7 +301,6 @@ bg_color = Color(0, 0, 0, 0.16862746)
 content_margin_left = 20.0
 content_margin_top = 10.0
 content_margin_right = 20.0
-content_margin_bottom = 10.0
 bg_color = Color(0.059, 0.09, 0.165, 0.98)
 border_width_left = 2
 border_width_top = 2
@@ -476,25 +515,17 @@ layout_mode = 2
 theme_override_constants/separation = 12
 
 [node name="StreamToggle" type="CheckButton" parent="BodyControl/VidControls" unique_id=1274197512]
-custom_minimum_size = Vector2(250, 100)
+custom_minimum_size = Vector2(300, 100)
 layout_mode = 2
 focus_mode = 0
 text = "图传"
 
 [node name="AnnotateBtn" type="Button" parent="BodyControl/VidControls" unique_id=506274721]
-custom_minimum_size = Vector2(220, 80)
+custom_minimum_size = Vector2(220, 100)
 layout_mode = 2
 size_flags_horizontal = 10
 size_flags_vertical = 4
 text = "框选目标"
-
-[node name="BoxHint" type="Label" parent="BodyControl/VidControls" unique_id=2012061877]
-custom_minimum_size = Vector2(150, 60)
-layout_mode = 2
-size_flags_horizontal = 8
-text = "无框选"
-horizontal_alignment = 1
-vertical_alignment = 1
 
 [node name="ChatPanel" type="VBoxContainer" parent="BodyControl" unique_id=745781195]
 custom_minimum_size = Vector2(0, 200)
@@ -631,6 +662,126 @@ offset_transform_position_ratio = Vector2(2, 0)
 offset_transform_visual_only = false
 theme_override_constants/separation = 16
 
+[node name="Options" type="VBoxContainer" parent="BodyAbout" unique_id=342699437]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="AutoConnOnStart" type="CheckButton" parent="BodyAbout/Options" unique_id=1668483588]
+custom_minimum_size = Vector2(0, 120)
+layout_mode = 2
+theme_override_font_sizes/font_size = 52
+text = "启动时自动连接设备"
+flat = true
+
+[node name="DisableAutoConnWS" type="CheckButton" parent="BodyAbout/Options" unique_id=356664563]
+custom_minimum_size = Vector2(0, 120)
+layout_mode = 2
+theme_override_font_sizes/font_size = 52
+text = "关闭自动建立WS连接"
+flat = true
+
+[node name="About" type="Panel" parent="BodyAbout" unique_id=1950890272]
+custom_minimum_size = Vector2(0, 500)
+layout_mode = 2
+theme_override_styles/panel = SubResource("StyleBoxFlat_sc1dx")
+
+[node name="Title" type="Label" parent="BodyAbout/About" unique_id=1871410363]
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+offset_left = 20.0
+offset_top = 10.0
+offset_bottom = 45.0
+grow_horizontal = 2
+theme_override_font_sizes/font_size = 52
+text = "关于本程序"
+
+[node name="Desc" type="Label" parent="BodyAbout/About" unique_id=87278860]
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 20.0
+offset_top = 90.0
+offset_right = -20.0
+grow_horizontal = 2
+grow_vertical = 0
+text = "本程序基于godot开发，使用到了gdble蓝牙库
+"
+
+[node name="Contributor" type="HBoxContainer" parent="BodyAbout/About" unique_id=1588144261]
+layout_mode = 1
+anchors_preset = -1
+anchor_top = 0.3
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 50.0
+offset_right = -50.0
+offset_bottom = -50.0
+grow_horizontal = 2
+grow_vertical = 0
+theme_override_constants/separation = 40
+
+[node name="Member" type="PanelContainer" parent="BodyAbout/About/Contributor" unique_id=586633628]
+custom_minimum_size = Vector2(230, 230)
+propagate_maximum_size = false
+layout_mode = 2
+size_flags_vertical = 4
+mouse_filter = 1
+theme_override_styles/panel = SubResource("StyleBoxFlat_iygje")
+
+[node name="Avatar" type="TextureRect" parent="BodyAbout/About/Contributor/Member" unique_id=743228883]
+layout_mode = 2
+texture = ExtResource("9_kjvhd")
+expand_mode = 1
+stretch_mode = 5
+
+[node name="Job" type="Label" parent="BodyAbout/About/Contributor/Member/Avatar" unique_id=1172771317]
+layout_mode = 1
+anchors_preset = -1
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = 10.0
+grow_horizontal = 2
+text = "YP (程序员)"
+horizontal_alignment = 1
+
+[node name="Member2" type="PanelContainer" parent="BodyAbout/About/Contributor" unique_id=1350444305]
+custom_minimum_size = Vector2(230, 230)
+propagate_maximum_size = false
+layout_mode = 2
+size_flags_vertical = 4
+mouse_filter = 1
+theme_override_styles/panel = SubResource("StyleBoxFlat_iygje")
+
+[node name="Avatar" type="TextureRect" parent="BodyAbout/About/Contributor/Member2" unique_id=2046883052]
+layout_mode = 2
+texture = ExtResource("10_5tuhn")
+expand_mode = 1
+stretch_mode = 6
+
+[node name="Job" type="Label" parent="BodyAbout/About/Contributor/Member2/Avatar" unique_id=1016111571]
+layout_mode = 1
+anchors_preset = -1
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = 10.0
+grow_horizontal = 2
+text = "SYF (创意总监)"
+horizontal_alignment = 1
+
+[node name="Label" type="Label" parent="BodyAbout/About/Contributor" unique_id=1804382498]
+custom_minimum_size = Vector2(0, 230)
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_styles/normal = SubResource("StyleBoxFlat_i6pqd")
+text = "其他未参与此部分开发的成员暂不列出
+（这里站不下那么多人）"
+horizontal_alignment = 1
+vertical_alignment = 1
+
 [node name="NaviBar" type="PanelContainer" parent="." unique_id=1836349016]
 custom_minimum_size = Vector2(0, 250)
 layout_mode = 1
@@ -758,7 +909,7 @@ theme_override_font_sizes/font_size = 42
 placeholder_text = "模型名"
 
 [node name="Btns" type="HBoxContainer" parent="WifiPopup/VBox" unique_id=1387880900]
-custom_minimum_size = Vector2(0, 72)
+custom_minimum_size = Vector2(0, 90)
 layout_mode = 2
 size_flags_vertical = 10
 theme_override_constants/separation = 16
@@ -801,6 +952,8 @@ layout_mode = 1
 [connection signal="pressed" from="BodyControl/ChatPanel/InputRow/SendBtn" to="." method="_on_send_pressed"]
 [connection signal="pressed" from="BodyControl/CtrlArea/Joystick" to="." method="_on_joystick_pressed"]
 [connection signal="released" from="BodyControl/CtrlArea/Joystick" to="." method="_on_joystick_release"]
+[connection signal="toggled" from="BodyAbout/Options/AutoConnOnStart" to="." method="_on_auto_conn_toggled"]
+[connection signal="toggled" from="BodyAbout/Options/DisableAutoConnWS" to="." method="_on_disable_ws_toggled"]
 [connection signal="confirmed" from="WifiPopup" to="." method="_on_wifi_confirmed"]
 [connection signal="pressed" from="WifiPopup/VBox/Btns/Cancel" to="WifiPopup" method="_on_cancel_pressed"]
 [connection signal="pressed" from="WifiPopup/VBox/Btns/Confirm" to="WifiPopup" method="_on_confirm_pressed"]

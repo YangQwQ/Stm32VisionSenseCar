@@ -22,11 +22,12 @@ const BT_ITEM := preload("res://ui/bluetooth/BTDeviceListItem.tscn")
 @onready var _chat_log: RichTextLabel = $BodyControl/ChatPanel/ChatLog
 @onready var _message_input: LineEdit = $BodyControl/ChatPanel/InputRow/MessageInput
 @onready var _stream_toggle: CheckButton = $BodyControl/VidControls/StreamToggle
-@onready var _box_hint: Label = $BodyControl/VidControls/BoxHint
 
 @onready var _body_bt: Control = $BodyBTScan
 @onready var _body_ctrl: Control = $BodyControl
 @onready var _body_about: Control = $BodyAbout
+@onready var _auto_conn_btn: CheckButton = $BodyAbout/Options/AutoConnOnStart
+@onready var _disable_ws_btn: CheckButton = $BodyAbout/Options/DisableAutoConnWS
 @onready var _nav_bt: TextureButton = $NaviBar/HBox/BTScan
 @onready var _nav_ctrl: TextureButton = $NaviBar/HBox/Control
 @onready var _nav_about: TextureButton = $NaviBar/HBox/About
@@ -49,6 +50,8 @@ var _pending_addr := ""
 var _pending_name := ""
 var _pending_provision := {}
 var _pending_ai := {}
+## 启动自连的待匹配地址（小写）。扫描中发现该地址即自动连接；轮结束仍未出现则提示手动连。
+var _startup_connect_addr := ""
 ## 编辑器「采用」后暂存的编辑图与区域，随发送以 [Image N] 标记上行给 AI。
 var _attachments: Array = []
 ## 边扫边显示用：本趟已展示的 address 去重表 + "未发现设备"占位 Label。
@@ -76,8 +79,12 @@ func _ready() -> void:
 	# WS 由 BLE 会话驱动：不在启动时自连/心跳（避免"未连接设备也在连 WS"），
 	# 等 _on_device_connected / 板子上报 IP（AppState._on_ble_status）再连。
 	_update_status()
-	_update_attach_hint()
 	set_process_input(true)
+	# 设置项：读取本地配置并同步两个开关状态；开启启动自连时按最近设备重连。
+	_auto_conn_btn.set_pressed_no_signal(Store.get_auto_conn())
+	_disable_ws_btn.set_pressed_no_signal(Store.get_disable_auto_ws())
+	if Store.get_auto_conn():
+		_try_startup_connect()
 
 # Android 运行时权限：BLE 扫描/连接 + 定位。声明在 export_presets（BLUETOOTH_* 等），
 # 这里启动即申请，新装手机首次打开会弹窗，无需 adb pm grant。
@@ -118,6 +125,45 @@ func _switch_page(page: int) -> void:
 
 # ============================== BLE ==============================
 
+## 设置项：启动时自动连接上次设备。持久化开关；开启时立即尝试自连（含等待蓝牙就绪）。
+func _on_auto_conn_toggled(on: bool) -> void:
+	Store.set_auto_conn(on)
+	if on:
+		_try_startup_connect()
+
+## 设置项：关闭自动建立 WS 连接（纯蓝牙控制）。仅持久化，连连接态下一次设备连接生效。
+func _on_disable_ws_toggled(on: bool) -> void:
+	Store.set_disable_auto_ws(on)
+
+## 启动（或开启自连开关）时重连上次设备。Android 栈要求设备必须先被扫描到才能连接，
+## 故这里先扫描、等 `_on_device_found` 中目标地址出现再连（不能像 RECOVERY 那样按地址直连）。
+func _try_startup_connect() -> void:
+	if AppState.ble == null:
+		return
+	if not await _await_ble_ready():
+		_chat("提示", "蓝牙不可用，未自动连接设备")
+		return
+	var last: Dictionary = Store.get_last_device()
+	var addr: String = str(last.get("address", ""))
+	if addr.is_empty():
+		return
+	_startup_connect_addr = addr.to_lower()
+	_pending_addr = addr
+	_pending_name = str(last.get("name", addr))
+	_chat("提示", "启动自连：扫描并连接 %s …" % _pending_name)
+	AppState.ble.scan()
+
+## 轮询等待蓝牙适配器进入可用状态（Android 含运行时授权弹窗）。超时或不可用则放弃。
+func _await_ble_ready() -> bool:
+	for i in 600:  # 至多约 10s
+		var s: String = AppState.ble.get_ble_state()
+		if s in ["idle", "scanning", "connecting", "connected"]:
+			return true
+		if s == "unavailable":
+			return false
+		await get_tree().process_frame
+	return false
+
 func _on_ble_state(_s: String) -> void:
 	_update_status()
 
@@ -144,6 +190,10 @@ func _on_scan_finished(devices: Array) -> void:
 		_add_device_card(nm, addr)
 	if _device_seen.is_empty():
 		_show_empty_hint()
+	# 启动自连兜底：整轮扫描没出现目标地址则提示，等待用户手动连接。
+	if _startup_connect_addr != "":
+		_startup_connect_addr = ""
+		_chat("提示", "未扫描到上次设备 %s，请手动连接" % _pending_name)
 
 ## 扫描中逐台发现（device_found）：去重后立刻补一张卡片，实现"边扫边显示"。
 func _on_device_found(device: Dictionary) -> void:
@@ -158,6 +208,11 @@ func _on_device_found(device: Dictionary) -> void:
 		nm = addr
 	_device_seen[addr] = nm
 	_add_device_card(nm, addr)
+	# 启动自连：发现目标地址即在卡片弹出同时自动连接（清空待匹配防重复）。
+	if _startup_connect_addr != "" and addr.to_lower() == _startup_connect_addr:
+		_startup_connect_addr = ""
+		_chat("提示", "启动自连：发现 %s，正在连接…" % nm)
+		AppState.ble.connect_device(addr, nm)
 
 func _add_device_card(name: String, address: String) -> void:
 	if _empty_hint != null:
@@ -199,7 +254,8 @@ func _on_device_connected(_address: String, name: String) -> void:
 	_device_name = name
 	_update_status()
 	# BLE 已连接（会话开始）：发起 WS（默认软 AP 地址；板子上报 IP 时 AppState 会用 ws://ip 覆盖）。
-	if AppState.ws != null and not AppState.ws.is_connected_car():
+	# 设置了「关闭自动建立WS连接」= 纯蓝牙控制，则跳过自动连 WS（仍可用 /ws connect 手动连）。
+	if AppState.ws != null and not AppState.ws.is_connected_car() and not Store.get_disable_auto_ws():
 		AppState.ws.connect_car()
 	_chat("提示", "已连接设备 %s" % name)
 	# 携带配网/AI 请求（设备卡片 → 连接窗口 → 确认），连上且 GATT 就绪后下发。
@@ -373,7 +429,6 @@ func _on_image_sent(img: Image, annotation: Dictionary) -> void:
 	_message_input.text += (_token_text(_attachments.size()) if _message_input.text.is_empty() else " " + _token_text(_attachments.size()))
 	_message_input.caret_column = _message_input.text.length()
 	_message_input.grab_focus()
-	_update_attach_hint()
 
 ## 文本每次变化都重建附件与标记的对应：删除某段 [Image N] 时同步移除对应图并重编号，不会错位。
 func _on_input_text_changed(new_text: String) -> void:
@@ -430,14 +485,6 @@ func _reconcile_attachments() -> void:
 	_message_input.text = final
 	_message_input.caret_column = final.length()
 	_attachments = kept
-	_update_attach_hint()
-
-func _update_attach_hint() -> void:
-	var n := _attachments.size()
-	if n == 0:
-		_box_hint.text = "无附图"
-	else:
-		_box_hint.text = "已附图 %d 张" % n
 
 func _show_ai_result(data: Dictionary) -> void:
 	# ai_result：{type:"ai_result", id, params:{error?, reason?, done?, command:{type,params,reason}}}
@@ -485,7 +532,6 @@ func _on_send_pressed(_new_text: String = "") -> void:
 		var batch: Array = _attachments
 		_message_input.text = ""
 		_attachments = []
-		_update_attach_hint()
 		_send_image_goal(batch, plain)
 		return
 	var text: String = _message_input.text.strip_edges()

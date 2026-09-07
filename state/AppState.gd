@@ -105,6 +105,8 @@ func _try_ble_recovery() -> void:
 func _on_ble_status(data: Dictionary) -> void:
 	var ip: Variant = data.get("ip")
 	if ip is String and not (ip as String).is_empty() and ws != null and not _ws_ready():
+		if Store.get_disable_auto_ws():
+			return  # 「关闭自动建立WS连接」开启 = 纯蓝牙控制，不自动连 WS
 		print("[AppState] 板子上线 ip=%s，自动连 WS" % ip)
 		ws.connect_car_ip(ip as String)
 

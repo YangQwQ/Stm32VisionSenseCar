@@ -10,6 +10,7 @@ var _data: Dictionary = {
 	"last_device": {"address": "", "name": ""},
 	"wifi": {"ssid": "", "password": ""},
 	"ai": {"url": "", "key": "", "model": ""},
+	"settings": {"auto_conn": false, "disable_auto_ws": false},
 }
 
 func _ready() -> void:
@@ -25,6 +26,12 @@ func get_wifi() -> Dictionary:
 
 func get_ai() -> Dictionary:
 	return _data.get("ai", {})
+
+func get_auto_conn() -> bool:
+	return bool(_data.get("settings", {}).get("auto_conn", false))
+
+func get_disable_auto_ws() -> bool:
+	return bool(_data.get("settings", {}).get("disable_auto_ws", false))
 
 # ============================== 写入 ==============================
 
@@ -58,6 +65,18 @@ func set_ai(url: String, key: String, model: String) -> void:
 	_data["ai"] = a
 	_save()
 
+func set_auto_conn(v: bool) -> void:
+	var s: Dictionary = _data.get("settings", {})
+	s["auto_conn"] = v
+	_data["settings"] = s
+	_save()
+
+func set_disable_auto_ws(v: bool) -> void:
+	var s: Dictionary = _data.get("settings", {})
+	s["disable_auto_ws"] = v
+	_data["settings"] = s
+	_save()
+
 # ============================== 文件 ==============================
 
 func _load() -> void:
@@ -74,10 +93,23 @@ func _load() -> void:
 
 ## 保证每个分组至少带默认键，避免旧存档缺字段。
 func _merge_defaults() -> void:
-	for grp: String in ["last_device", "wifi", "ai"]:
+	for grp: String in ["last_device", "wifi", "ai", "settings"]:
 		if not (_data.get(grp) is Dictionary):
-			_data[grp] = {"address": "", "name": ""} if grp == "last_device" \
-				else ({"ssid": "", "password": ""} if grp == "wifi" else {"url": "", "key": "", "model": ""})
+			_data[grp] = _default_group(grp)
+
+## 各分组的默认结构（旧存档缺字段时补）。
+func _default_group(grp: String) -> Dictionary:
+	match grp:
+		"last_device":
+			return {"address": "", "name": ""}
+		"wifi":
+			return {"ssid": "", "password": ""}
+		"ai":
+			return {"url": "", "key": "", "model": ""}
+		"settings":
+			return {"auto_conn": false, "disable_auto_ws": false}
+		_:
+			return {}
 
 func _merge_into(base: Dictionary, over: Dictionary) -> void:
 	for k: Variant in over.keys():
