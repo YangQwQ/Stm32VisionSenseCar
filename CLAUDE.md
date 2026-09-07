@@ -8,15 +8,13 @@
 
 - 一条 **STM32（电机控制）+ 独立 ESP32（摄像头 / WiFi / BLE / 云端 AI 客户端）** 的小车，经 UART 串接。
 
-- 阶段：**UI + WiFi WebSocket 真实 + BLE 全链路代码就绪（GDBLE 扫描/连接/GATT 读写 + 配网下发，真机扫描验证过）+ 板侧 GATT/指令/UART 模块已写（固件未编译）+ 云端 AI 仍为桩（DIRECT）**。真机联调未做（设备未到）。进度见文末「双侧进度」。
-
 - 完整架构设计见 `.trae/documents/ctrl-app-architecture-and-ui-plan.md`。
 
 ## 通信架构（三通道）
 
 | 通道             | 用途                     | 实现状态                 |
 | -------------- | ---------------------- | -------------------- |
-| BLE            | 一次性配网 + 兜底控制           | GDBLE 接通（`BLEClient.gd` → `addons/gdble` + 协议表 `BleProfile.gd`）；扫描→发现→列表真机验证过；连接→GATT 读写→配网（SSID/PASS/CMD 特征）已实现；板侧 GATT Server VisionS3 已写（固件未编译联调） |
+| BLE            | 一次性配网 + 兜底控制           | GDBLE 接通（`BLEClient.gd` → `addons/gdble` + 协议表 `BleProfile.gd`）；扫描→发现→列表真机验证过；连接→GATT 读写→配网（SSID/PASS/CMD 特征）已实现；板侧 GATT Server VisionS3 已写（固件已烧录，联调中） |
 | WiFi WebSocket | 图传 JPEG 帧 / 指令 / AI 消息 | 真实（`WSCarClient.gd`） |
 | 云端多模态 AI       | 中转 / 小车直连              | 桩（`AIClient.gd`）     |
 
@@ -89,22 +87,6 @@ res://
 ## 后续待办（不在当前阶段）
 
 - BLE（已解决，2026-09-05）：真机“刷新恒 0 设备”根因不是 gdble 扫描——btleplug Java `onScanResult` 正常大量回调、gdble 返回 25+ 周边设备，是 `BLEClient.gd:_labels` 对 `"name": null` 的设备字典做 `var name: String = d.get("name","")` 赋值，取到 Nil 触发运行时错误中断函数，`address` 兜底永远走不到、结果恒 `[]`。已改为显式判 null（name 为 null 时回退 address）。配网 GATT 两侧代码已接（见下）。
-
-- 接入真实云端多模态 API（配置 Key）。
-
-- 小车固件侧：ESP32（摄像头 + WS 服务器 + AI 直连 + UART）与 STM32（词表解析 + 电机控制）联调。
-
-## 双侧进度（Phase B，2026-09-06；代码就绪、未编译/真机验证）
-
-手机侧（本工程，改动已从 worktree 同步回主目录 `D:\Downloads\Git\Ctrl-App`）：
-- BLE 配网闭环：`BLEClient.provision()` 写 SSID/PASS 特征 → 板落 NVS 重启 → BLE status 报 `ip` → `AppState` 自动 `ws.connect_car_ip()`。代码全就绪。
-- 统一聊天入口（`Main._handle_slash`）：`/` 前缀=指令（`/ping /snapshot /stream [on|off] /stop [wheels|arm] /config /goal`），纯文本=AI 目标（DIRECT `ai_goal`，可带框选区域）；发送统一 `AppState.send_command`（WS 优先，BLE 兜底走 `BleProfile.FALLBACK_TYPES` 白名单）。
-- RELAY / 独立 AILog / 审批卡已删；摇杆 / `DirectControl` 爪控 / 图传开关均走 `send_command`。
-- 校验：Godot headless 项目级编译零脚本错误 + 主场景实例化通过（2026-09-05）。
-
-板子侧 `D:\Downloads\Git\Stm32-Vision`（同 Phase B 改，未 commit/未编译）：
-- `uart` / `command` / `ble` 三组模块已写：UART 帧+CRC16+词表→帧（uart.cpp）；统一词表分发、传输无关回调应答（command.cpp）；BLE GATT Server VisionS3——cmd 写队列、wifi/ai 配置写特征、status 读+通知（ble.cpp）。`app_httpd.cpp` WS 文本→command + `set_ws_connected`；`.ino` setup/loop 已接线。
-- UUID/广播名与 `net/ble/BleProfile.gd` 逐字 mirror；词表 type 与 `CommandProto` 一致。ai_goal 板侧为桩回复；执行板 UART 联调待做。
 
 联调遗留：① BLE 配网后板重启，手机需**重连一次 BLE** 收 ip 才能自动连 WS；② arm 词表 `duration_ms` 板侧 uart 按 `dist_cm` 判定（UI 现均发 0，语义一致，非 0 定时版未实现）。
 

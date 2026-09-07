@@ -363,10 +363,16 @@ func _on_input_text_changed(new_text: String) -> void:
 	if _cmd_hint != null:
 		var lines := CP.command_hints(new_text)
 		if lines.is_empty():
-			_cmd_hint.visible = false
+			_clear_command_hint()
 		else:
 			_cmd_hint.text = "\n".join(lines)
 			_cmd_hint.visible = true
+
+## 清除 / 指令提示。发送、输入清空/不以 / 开头时统一走这里。
+func _clear_command_hint() -> void:
+	if _cmd_hint != null:
+		_cmd_hint.text = ""
+		_cmd_hint.visible = false
 
 func _token_text(i: int) -> String:
 	return "[Image %d]" % i
@@ -452,6 +458,7 @@ func _cmd_text(cmd: Dictionary) -> String:
 
 func _on_send_pressed() -> void:
 	_reconcile_attachments()
+	_clear_command_hint()  # 发送清掉可能的 / 指令提示（输入清空不一定触发 text_changed）
 	if _message_input.text.strip_edges().is_empty() and _attachments.is_empty():
 		return
 	if not _attachments.is_empty():
@@ -471,13 +478,13 @@ func _on_send_pressed() -> void:
 		_send_ai_goal(text)
 
 ## 记录一条纯文本输入到历史（去重相邻重复），供上/下键回填。
+## 发送后无论是否去重，都回到草稿位，保证下次上翻总是从最近一条开始。
 func _push_to_history(text: String) -> void:
 	if text.is_empty():
 		return
-	if not _input_history.is_empty() and _input_history[-1] == text:
-		return
-	_input_history.append(text)
-	_history_idx = _input_history.size()  # 指向"末尾之后"=草稿位，上翻从最近一条开始
+	if _input_history.is_empty() or _input_history[-1] != text:
+		_input_history.append(text)
+	_history_idx = _input_history.size()  # 指向"末尾之后"=草稿位
 	_draft = ""                            # 发送后重置待恢复的草稿
 
 ## 上/下键回退输入历史：dir=-1 上翻、+1 下翻。下键翻过最旧一条后回到"草稿位"，恢复上翻前的编辑内容。

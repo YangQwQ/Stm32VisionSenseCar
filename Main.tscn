@@ -245,6 +245,11 @@ corner_radius_bottom_left = 14
 shadow_color = Color(0, 0, 0, 0.3)
 shadow_size = 6
 
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_o6qdn"]
+content_margin_left = 10.0
+content_margin_top = 10.0
+bg_color = Color(0, 0, 0, 0.54901963)
+
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3y6u5"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_q2x1n"]
@@ -511,13 +516,12 @@ anchors_preset = -1
 anchor_top = 1.0
 anchor_right = 1.0
 anchor_bottom = 1.0
-offset_left = 10.0
-offset_top = -39.0
 grow_horizontal = 2
 grow_vertical = 0
 theme_override_colors/font_color = Color(0.6, 0.76, 0.94, 1)
 theme_override_fonts/font = ExtResource("7_fpfj3")
 theme_override_font_sizes/font_size = 32
+theme_override_styles/normal = SubResource("StyleBoxFlat_o6qdn")
 
 [node name="InputRow" type="HBoxContainer" parent="BodyControl/ChatPanel" unique_id=1129907710]
 layout_mode = 2
