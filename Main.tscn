@@ -500,6 +500,7 @@ layout_mode = 2
 size_flags_vertical = 3
 theme_override_styles/normal = SubResource("StyleBox_panel")
 bbcode_enabled = true
+scroll_following = true
 
 [node name="InputRow" type="HBoxContainer" parent="BodyControl/ChatPanel" unique_id=1129907710]
 layout_mode = 2
@@ -510,6 +511,7 @@ custom_minimum_size = Vector2(0, 120)
 layout_mode = 2
 size_flags_horizontal = 3
 placeholder_text = "输入消息 / 指令…"
+backspace_deletes_composite_character_enabled = true
 
 [node name="SendBtn" type="Button" parent="BodyControl/ChatPanel/InputRow" unique_id=1447337239]
 custom_minimum_size = Vector2(180, 0)
@@ -667,10 +669,10 @@ anchor_left = 0.5
 anchor_top = 0.5
 anchor_right = 0.5
 anchor_bottom = 0.5
-offset_left = -400.0
-offset_top = -225.0
-offset_right = 400.0
-offset_bottom = 225.0
+offset_left = -500.0
+offset_top = -480.0
+offset_right = 500.0
+offset_bottom = 480.0
 grow_horizontal = 2
 grow_vertical = 2
 theme_override_styles/panel = SubResource("StyleBoxFlat_trn2v")
@@ -678,38 +680,74 @@ script = ExtResource("7_trn2v")
 
 [node name="VBox" type="VBoxContainer" parent="WifiPopup" unique_id=556224896]
 layout_mode = 2
-theme_override_constants/separation = 16
+theme_override_constants/separation = 12
 
 [node name="Title" type="Label" parent="WifiPopup/VBox" unique_id=718162131]
 layout_mode = 2
-theme_override_font_sizes/font_size = 32
-text = "WiFi 配网 (用于图传等功能)"
+theme_override_font_sizes/font_size = 52
+text = "连接设备配置确认"
+
+[node name="DeviceLabel" type="Label" parent="WifiPopup/VBox" unique_id=1010403230]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.6, 0.64, 0.72, 1)
+theme_override_font_sizes/font_size = 42
+
+[node name="WifiHeader" type="Label" parent="WifiPopup/VBox" unique_id=927278012]
+layout_mode = 2
+theme_override_font_sizes/font_size = 42
+text = "WiFi (图传/云端需要)"
 
 [node name="Ssid" type="LineEdit" parent="WifiPopup/VBox" unique_id=531159831]
-custom_minimum_size = Vector2(0, 64)
+custom_minimum_size = Vector2(0, 80)
 layout_mode = 2
+theme_override_font_sizes/font_size = 42
 placeholder_text = "WiFi 名称 (SSID)"
 
 [node name="Password" type="LineEdit" parent="WifiPopup/VBox" unique_id=1995450679]
-custom_minimum_size = Vector2(0, 64)
+custom_minimum_size = Vector2(0, 80)
 layout_mode = 2
+theme_override_font_sizes/font_size = 42
 placeholder_text = "WiFi 密码"
 secret = true
 
-[node name="Btns" type="HBoxContainer" parent="WifiPopup/VBox" unique_id=1387880900]
+[node name="AiHeader" type="Label" parent="WifiPopup/VBox" unique_id=1174731793]
+layout_mode = 2
+theme_override_font_sizes/font_size = 42
+text = "云端 AI"
+
+[node name="Url" type="LineEdit" parent="WifiPopup/VBox" unique_id=1495630410]
 custom_minimum_size = Vector2(0, 80)
+layout_mode = 2
+theme_override_font_sizes/font_size = 42
+placeholder_text = "AI 接口 URL (如 https://api.xxx.com/v1)"
+
+[node name="Key" type="LineEdit" parent="WifiPopup/VBox" unique_id=326396131]
+custom_minimum_size = Vector2(0, 80)
+layout_mode = 2
+theme_override_font_sizes/font_size = 42
+placeholder_text = "API Key"
+secret = true
+
+[node name="Model" type="LineEdit" parent="WifiPopup/VBox" unique_id=12210662]
+custom_minimum_size = Vector2(0, 80)
+layout_mode = 2
+theme_override_font_sizes/font_size = 42
+placeholder_text = "模型名"
+
+[node name="Btns" type="HBoxContainer" parent="WifiPopup/VBox" unique_id=1387880900]
+custom_minimum_size = Vector2(0, 72)
 layout_mode = 2
 size_flags_vertical = 10
 theme_override_constants/separation = 16
 
 [node name="Cancel" type="Button" parent="WifiPopup/VBox/Btns" unique_id=1894054236]
-custom_minimum_size = Vector2(180, 64)
+custom_minimum_size = Vector2(180, 58)
 layout_mode = 2
 size_flags_horizontal = 3
 text = "取消"
 
 [node name="Confirm" type="Button" parent="WifiPopup/VBox/Btns" unique_id=1796869398]
-custom_minimum_size = Vector2(180, 64)
+custom_minimum_size = Vector2(180, 58)
 layout_mode = 2
 size_flags_horizontal = 3
 text = "连接"
@@ -725,6 +763,7 @@ layout_mode = 1
 [connection signal="ble_state_changed" from="Net/BLE" to="." method="_on_ble_state"]
 [connection signal="device_connected" from="Net/BLE" to="." method="_on_device_connected"]
 [connection signal="device_disconnected" from="Net/BLE" to="." method="_on_device_disconnected"]
+[connection signal="device_found" from="Net/BLE" to="." method="_on_device_found"]
 [connection signal="scan_finished" from="Net/BLE" to="." method="_on_scan_finished"]
 [connection signal="status_received" from="Net/BLE" to="." method="_on_ble_status"]
 [connection signal="connected" from="Net/WS" to="." method="_on_ws_connected"]

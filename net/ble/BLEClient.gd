@@ -13,6 +13,8 @@ extends Node
 ##     / services_discovered / characteristic_written(char) / characteristic_notified(char, data)
 
 signal scan_finished(devices: Array)
+## 扫描期间逐台上报（发现了就立刻弹，不必等整轮结束）。与 scan_finished 的差异：单台、实时。
+signal device_found(device: Dictionary)
 signal ble_state_changed(state: String)
 signal device_connected(address: String, name: String)
 signal device_disconnected(reason: String)
@@ -58,6 +60,7 @@ func _ready() -> void:
 	_mgr.scan_started.connect(_on_scan_started)
 	_mgr.scan_stopped.connect(_on_scan_stopped)
 	_mgr.error_occurred.connect(_on_error)
+	_mgr.device_discovered.connect(_on_device_discovered)
 	# Android 12+：附近设备扫描/连接需要 BLUETOOTH_SCAN/CONNECT 运行时权限
 	if OS.get_name() == "Android":
 		OS.request_permissions()
@@ -129,18 +132,54 @@ func _on_error(message: String) -> void:
 		_scan_finish_empty()
 
 func _named_devices(devs: Array) -> Array:
-	# 只收广播了名字的设备，丢弃匿名（name=null/空）——那是周边耳机/手环噪音。
+	# 收「广播了名字」的设备，并额外收「广播了我们服务 c0de」的目标设备（VisionS3 常只广播
+	# UUID、把名字留在连接后才能拿到，name 为 null 时不能丢）。其余匿名设备（耳机/手环噪音）丢弃。
 	# 返回仍带 address 的字典，供 DeviceList 选中后按地址连接。
-	# gdble 字典 "name" 键可能为 null，先判型再取值（typed 直接赋 String 会在 Nil 时中断函数）。
 	var out: Array = []
 	for d: Variant in devs:
 		if not (d is Dictionary):
 			continue
-		var raw_name: Variant = (d as Dictionary).get("name")
-		var raw_addr: Variant = (d as Dictionary).get("address")
-		if raw_name is String and not (raw_name as String).is_empty() and raw_addr is String:
-			out.append({"name": raw_name, "address": raw_addr})
+		var kept: Dictionary = _filter_device(d as Dictionary)
+		if not kept.is_empty():
+			out.append(kept)
 	return out
+
+## 单台设备筛选：名字非空 或 广播了我们的服务 c0de 才保留。返回 {name,address}，丢弃返回 {}。
+## gdble 字典 "name" 键可能为 null，先判型再取值（typed 直接赋 String 会在 Nil 时中断函数）。
+func _filter_device(d: Dictionary) -> Dictionary:
+	var raw_name: Variant = d.get("name")
+	var raw_addr: Variant = d.get("address")
+	if not (raw_addr is String) or (raw_addr as String).is_empty():
+		return {}
+	var keep := false
+	if raw_name is String and not (raw_name as String).is_empty():
+		keep = true
+	elif _advertises_ours(d):
+		keep = true
+		# 名字拿到前先占位，连接成功后 BLEClient 会用 get_name() 补齐。
+		raw_name = ""
+	if not keep:
+		return {}
+	return {"name": raw_name, "address": raw_addr}
+
+## gdble 扫描中逐台上报 device_discovered：过滤后只转发目标设备给 UI，实现"边扫边显示"。
+func _on_device_discovered(info: Variant) -> void:
+	if _state != "scanning" or not (info is Dictionary):
+		return
+	var kept: Dictionary = _filter_device(info as Dictionary)
+	if not kept.is_empty():
+		device_found.emit(kept)
+
+## 广播记录里是否声明了我们的服务（SVC SHORT c0de，gdble 统一转小写）。
+func _advertises_ours(dict: Dictionary) -> bool:
+	var services: Variant = dict.get("services")
+	if not (services is Array):
+		return false
+	var svc := BP.SVC_UUID.to_lower()
+	for s: Variant in services:
+		if s is String and (s as String).to_lower() == svc:
+			return true
+	return false
 
 func _scan_finish_empty() -> void:
 	scan_finished.emit([])
@@ -163,15 +202,12 @@ func connect_device(address: String, display_name: String = "") -> bool:
 		_set_state("idle")
 		return false
 	_dev = dev
+	# gdble 按地址缓存同一 BleDevice，复用时旧 handler 可能仍挂着。BleDevice 覆盖了 Object 的
+	# is_connected/disconnect（都是 0 参 GATT 方法），信号不能按 Object 语义断开；改为幂等连接：
+	# handler 已在 get_signal_connection_list 里则跳过、不再重复挂，绕开 shadow 也避免重复回调。
+	for sig: String in _DEV_SIGNALS:
+		_connect_if_absent(sig, Callable(self, _DEV_SIGNALS[sig]))
 	# RefCounted 动态连接信号：用字符串 connect 规避对 Variant 的静态成员访问
-	_dev.connect("connected", Callable(self, "_on_device_connected"))
-	_dev.connect("disconnected", Callable(self, "_on_device_disconnected"))
-	_dev.connect("connection_failed", Callable(self, "_on_device_connection_failed"))
-	_dev.connect("services_discovered", Callable(self, "_on_services_discovered"))
-	_dev.connect("characteristic_written", Callable(self, "_on_characteristic_written"))
-	_dev.connect("characteristic_notified", Callable(self, "_on_characteristic_notified"))
-	_dev.connect("characteristic_read", Callable(self, "_on_characteristic_read"))
-	_dev.connect("operation_failed", Callable(self, "_on_operation_failed"))
 	_set_state("connecting")
 	_dev.call("connect_async")
 	return true
@@ -288,18 +324,33 @@ func _handle_status_bytes(data: PackedByteArray) -> void:
 
 # ============================== 清理 ==============================
 
+## 连接失败等路径会在信号已被拆除后再次 teardown，只需 GATT 断开、不再动信号（信号幂等挂，无需断）。
+const _DEV_SIGNALS := {
+	"connected": "_on_device_connected",
+	"disconnected": "_on_device_disconnected",
+	"connection_failed": "_on_device_connection_failed",
+	"services_discovered": "_on_services_discovered",
+	"characteristic_written": "_on_characteristic_written",
+	"characteristic_notified": "_on_characteristic_notified",
+	"characteristic_read": "_on_characteristic_read",
+	"operation_failed": "_on_operation_failed",
+}
+
+## 幂等连信号：handler 已挂则跳过。BleDevice 覆盖了 Object 的 is_connected/disconnect（0 参 GATT 方法），
+## 信号不能按 Object 语义断开；改在连接前查 get_signal_connection_list 判重，避免 1337 与重复回调。
+func _connect_if_absent(sig: String, handler: Callable) -> void:
+	if _dev == null or not is_instance_valid(_dev):
+		return
+	for c: Variant in _dev.get_signal_connection_list(sig):
+		var cd := c as Dictionary
+		if cd.get("callable") == handler:
+			return
+	_dev.connect(sig, handler)
+
 func _teardown_device() -> void:
-	if _dev != null:
-		_dev.disconnect("connected", Callable(self, "_on_device_connected"))
-		_dev.disconnect("disconnected", Callable(self, "_on_device_disconnected"))
-		_dev.disconnect("connection_failed", Callable(self, "_on_device_connection_failed"))
-		_dev.disconnect("services_discovered", Callable(self, "_on_services_discovered"))
-		_dev.disconnect("characteristic_written", Callable(self, "_on_characteristic_written"))
-		_dev.disconnect("characteristic_notified", Callable(self, "_on_characteristic_notified"))
-		_dev.disconnect("characteristic_read", Callable(self, "_on_characteristic_read"))
-		_dev.disconnect("operation_failed", Callable(self, "_on_operation_failed"))
+	if _dev != null and is_instance_valid(_dev):
 		_dev.call("disconnect")
-		_dev = null
+	_dev = null
 	_dev_addr = ""
 	_dev_name = ""
 	_gatt_ready = false

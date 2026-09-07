@@ -42,8 +42,12 @@ var _refresh_tween: Tween = null
 var _pending_addr := ""
 var _pending_name := ""
 var _pending_provision := {}
+var _pending_ai := {}
 ## 编辑器「采用」后暂存的编辑图与区域，随发送以 [Image N] 标记上行给 AI。
 var _attachments: Array = []
+## 边扫边显示用：本趟已展示的 address 去重表 + "未发现设备"占位 Label。
+var _device_seen: Dictionary = {}
+var _empty_hint: Label = null
 
 func _ready() -> void:
 	AppState.ble = $Net/BLE
@@ -109,54 +113,97 @@ func _on_scan_finished(devices: Array) -> void:
 	if _refresh_btn.button_pressed:
 		_refresh_btn.set_pressed_no_signal(false)
 	_stop_scan_animation()
-	# 清空旧设备列表，重建为 BTDeviceListItem 卡片
-	for child: Node in _device_vbox.get_children():
-		child.queue_free()
-	if devices.is_empty():
-		var hint := Label.new()
-		hint.text = "未发现设备，点击刷新"
-		hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		hint.add_theme_font_size_override("font_size", 36)
-		hint.add_theme_color_override("font_color", Color(0.6, 0.64, 0.72, 1))
-		hint.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-		_device_vbox.add_child(hint)
-		if OS.get_name() == "Android" and not OS.get_granted_permissions().has("android.permission.BLUETOOTH_SCAN"):
-			_chat("提示", "未授予蓝牙/附近设备权限，扫描不到设备——请到系统设置允许本 App 权限后刷新")
-		return
+	# 设备在扫描中已逐台加进列表（边扫边显示），这里兜底补漏（按地址去重），并处理"整轮一个都没发现"。
 	for d: Variant in devices:
 		if not (d is Dictionary):
 			continue
 		var dd: Dictionary = d as Dictionary
-		var raw_name: Variant = dd.get("name")
 		var raw_addr: Variant = dd.get("address")
 		if not (raw_addr is String) or (raw_addr as String).is_empty():
 			continue
-		var name: String = str(raw_name) if (raw_name is String) else (raw_addr as String)
-		var item: Node = BT_ITEM.instantiate()
-		item.call("setup", name, (raw_addr as String))
-		# 脚本自定义信号对基类不可静态访问，用字符串 connect
-		item.connect("selected", Callable(self, "_on_device_item_selected"))
-		_device_vbox.add_child(item)
+		var addr: String = raw_addr as String
+		if _device_seen.has(addr):
+			continue
+		var nm: String = str(dd.get("name", addr))
+		if nm.is_empty():
+			nm = addr
+		_device_seen[addr] = nm
+		_add_device_card(nm, addr)
+	if _device_seen.is_empty():
+		_show_empty_hint()
+
+## 扫描中逐台发现（device_found）：去重后立刻补一张卡片，实现"边扫边显示"。
+func _on_device_found(device: Dictionary) -> void:
+	var raw_addr: Variant = device.get("address")
+	if not (raw_addr is String) or (raw_addr as String).is_empty():
+		return
+	var addr: String = raw_addr as String
+	if _device_seen.has(addr):
+		return
+	var nm: String = str(device.get("name", addr))
+	if nm.is_empty():
+		nm = addr
+	_device_seen[addr] = nm
+	_add_device_card(nm, addr)
+
+func _add_device_card(name: String, address: String) -> void:
+	if _empty_hint != null:
+		_empty_hint.queue_free()
+		_empty_hint = null
+	var item: Node = BT_ITEM.instantiate()
+	item.call("setup", name, address)
+	item.connect("selected", Callable(self, "_on_device_item_selected"))
+	_device_vbox.add_child(item)
+
+func _show_empty_hint() -> void:
+	if _empty_hint != null:
+		return
+	var hint := Label.new()
+	hint.text = "未发现设备，点击刷新"
+	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hint.add_theme_font_size_override("font_size", 36)
+	hint.add_theme_color_override("font_color", Color(0.6, 0.64, 0.72, 1))
+	hint.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_device_vbox.add_child(hint)
+	_empty_hint = hint
+	if OS.get_name() == "Android" and not OS.get_granted_permissions().has("android.permission.BLUETOOTH_SCAN"):
+		_chat("提示", "未授予蓝牙/附近设备权限，扫描不到设备——请到系统设置允许本 App 权限后刷新")
+
+func _clear_device_list() -> void:
+	for child: Node in _device_vbox.get_children():
+		child.queue_free()
+	_empty_hint = null
+	_device_seen.clear()
 
 func _on_device_item_selected(name: String, address: String) -> void:
-	# 点击设备卡片：暂存目标，弹出配网窗口（确认 = 连接 + 下发 WiFi）
+	# 点击设备卡片：暂存目标，弹出配网/连接窗口（连接 + 可选下发 WiFi/AI，推荐用已存配置）
 	_pending_addr = address
 	_pending_name = name
+	_wifi_popup.call("set_device", name)
 	_wifi_popup.call("popup")
 
 func _on_device_connected(_address: String, name: String) -> void:
 	_device_name = name
 	_update_status()
 	_chat("提示", "已连接设备 %s" % name)
-	# 若携带配网请求（BTL 卡片 → 配网窗口 → 确认），连上后下发 WiFi
-	if not _pending_provision.is_empty():
-		await _wait_gatt_ready()
-		var prov := _pending_provision
-		_pending_provision = {}
-		if AppState.ble.provision(str(prov.get("ssid", "")), str(prov.get("password", ""))):
-			_chat("提示", "已下发 WiFi: %s；板子重启连网，稍后自动重连并显示 IP" % str(prov.get("ssid", "")))
+	# 携带配网/AI 请求（设备卡片 → 连接窗口 → 确认），连上且 GATT 就绪后下发。
+	var wifi: Dictionary = _pending_provision
+	var ai: Dictionary = _pending_ai
+	_pending_provision = {}
+	_pending_ai = {}
+	if wifi.is_empty() and ai.is_empty():
+		return
+	await _wait_gatt_ready()
+	if not wifi.is_empty():
+		if AppState.ble.provision(str(wifi.get("ssid", "")), str(wifi.get("password", ""))):
+			_chat("提示", "已下发 WiFi: %s | 板子可能重启，稍后会自动重连" % str(wifi.get("ssid", "")))
 		else:
 			_chat("提示", "配网下发失败")
+	if not ai.is_empty():
+		if AppState.ble.write_ai_config(str(ai.get("url", "")), str(ai.get("key", "")), str(ai.get("model", ""))):
+			_chat("提示", "已下发 AI 配置")
+		else:
+			_chat("提示", "AI 配置下发失败")
 
 func _on_device_disconnected(reason: String) -> void:
 	_update_status()
@@ -181,8 +228,9 @@ func _on_ble_status(data: Dictionary) -> void:
 	_update_status()
 
 func _on_refresh_toggled(pressed_on: bool) -> void:
-	# toggle 按下 → 开始扫描并播放旋转动画；松开 → 停止扫描并复位。
+	# toggle 按下 → 清空旧列表、开始扫描并播放旋转动画；松开 → 停止扫描并复位。
 	if pressed_on:
+		_clear_device_list()
 		_start_scan_animation()
 		$Net/BLE.scan()
 	else:
@@ -210,13 +258,22 @@ func _stop_scan_animation() -> void:
 func _on_provision_pressed() -> void:
 	_wifi_popup.call("popup")
 
-func _on_wifi_confirmed(ssid: String, password: String) -> void:
-	# 配网窗口「连接」确认：连接暂存的 BTL 设备，连上后下发 WiFi。
+func _on_wifi_confirmed(ssid: String, password: String, url: String, key: String, model: String) -> void:
+	# 连接窗口「连接」确认：连接暂存设备；WiFi/AI 留空则仅连接不下发。
 	if _pending_addr.is_empty():
 		_chat("提示", "请先在列表中选中一个蓝牙设备")
 		return
-	_pending_provision = {"ssid": ssid, "password": password}
-	_chat("提示", "连接 %s 并下发 WiFi …" % _pending_name)
+	_pending_provision = {}
+	if not ssid.is_empty():
+		_pending_provision = {"ssid": ssid, "password": password}
+	_pending_ai = {}
+	if not url.is_empty():
+		_pending_ai = {"url": url, "key": key, "model": model}
+	# 持久化本次配置（留空保留旧值），下次打开弹窗自动预填；并记录最近设备供启动自连。
+	Store.set_wifi(ssid, password)
+	Store.set_ai(url, key, model)
+	Store.set_last_device(_pending_addr, _pending_name)
+	_chat("提示", "连接 %s …" % _pending_name)
 	$Net/BLE.connect_device(_pending_addr, _pending_name)
 
 ## 轮询等待 BLE 服务发现完成（_gatt_ready），之后才能写 GATT 特征。
@@ -550,6 +607,11 @@ func _update_status() -> void:
 	_ws_dot.modulate = Color.GREEN if online else Color(1, 1, 1, 0.3)
 	_ble_stat.text = "BLE:%s" % ble
 	_ws_stat.text = "WS:%s" % ("已连接" if online else "未连接")
-	# 顶栏大字：默认未连接；BLE 连接成功后显示设备名。
+	# 顶栏大字：连接中 / 已连接 / 未连接 三态反馈。
 	var ble_ok: bool = $Net/BLE.is_device_connected()
-	_conn_stat.text = ("已连接: %s" % _device_name) if (ble_ok and _device_name != "") else "设备未连接"
+	if ble_ok and _device_name != "":
+		_conn_stat.text = "已连接: %s" % _device_name
+	elif ble == "connecting":
+		_conn_stat.text = ("连接中: %s" % _pending_name) if _pending_name != "" else "连接中…"
+	else:
+		_conn_stat.text = "设备未连接"

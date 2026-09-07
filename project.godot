@@ -20,6 +20,7 @@ config/icon="uid://doggpirofqfh8"
 
 AppState="*res://state/AppState.gd"
 AnimationManager="*res://animation/AnimationManager.gd"
+Store="*res://state/LocalStore.gd"
 
 [display]
 
