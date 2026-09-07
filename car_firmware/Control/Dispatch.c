@@ -35,6 +35,9 @@ static uint8_t arm_pending;   /* 0=无 1=定距(升降/移爪) 2=夹爪 */
 
 static uint16_t PayloadU16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
+/* 协议 speed 是单字节(0~255)，而驱动层按 0~1000 吃 PWM：输入边界缩放成档位 */
+static uint16_t CarPwm(uint8_t sp) { return ((uint16_t)sp * 1000u) / 255u; }
+
 void Dispatch_Init(void)
 {
 	car_move = CAR_IDLE;
@@ -55,7 +58,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 	case CAR_CMD_MOVE_CONT:                       /* 持续移动 dir speed */
 		dir = f->b[2]; sp = f->b[3];
 		car_dir = dir; car_speed = sp;
-		AckermannDrive_Straight(dir, sp);
+		AckermannDrive_Straight(dir, CarPwm(sp));
 		Relay_Stop();
 		car_move = CAR_MOVE;
 		break;
@@ -66,7 +69,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 		sp = f->b[5];
 		car_dir = dir; car_speed = sp;
 		g_status.car_done = 0;                    /* 进入执行：清除上次完成标志 */
-		AckermannDrive_Straight(dir, sp);
+		AckermannDrive_Straight(dir, CarPwm(sp));
 		Relay_Start(RLY_DIST, (int32_t)dist * 10);   /* 0.1cm */
 		car_move = CAR_MOVE;
 		break;
@@ -74,7 +77,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 	case CAR_CMD_TURN_CONT:                       /* dir speed */
 		dir = f->b[2]; sp = f->b[3];
 		car_dir = dir; car_speed = sp;
-		AckermannDrive_Turn(dir, sp);
+		AckermannDrive_Turn(dir, CarPwm(sp));
 		Relay_Stop();
 		car_move = CAR_TURN;
 		break;
@@ -85,7 +88,7 @@ static void HandleCarCmd(const UartFrame_t *f)
 		sp = f->b[5];
 		car_dir = dir; car_speed = sp;
 		g_status.car_done = 0;                    /* 进入执行：清除上次完成标志 */
-		AckermannDrive_TurnAngle(dir, (uint8_t)ang, sp);
+		AckermannDrive_TurnAngle(dir, (uint8_t)ang, CarPwm(sp));
 		Relay_Start(RLY_YAW, (int32_t)ang * 10);     /* 0.1° */
 		car_move = CAR_TURN;
 		break;
