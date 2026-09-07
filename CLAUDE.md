@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-本文件为当前项目（经典 ESP32-CAM / OV2640 摄像头板）的 AI 助手工作指南。
+本文件为当前项目（ESP32-S3-CAM / OV2640 摄像头板）的 AI 助手工作指南。
 
 ## 项目概述
 
@@ -42,7 +42,7 @@
   - BLE：`getValue()` 返回 Arduino `String`；无 `getNotifyProperty`；发射功率枚举为 `ESP_PWR_LVL_P9`
   - WS 无 `httpd_ws_client_iterate` → 用 `httpd_get_client_list` + `httpd_ws_get_fd_info` 过滤 `HTTPD_WS_CLIENT_WEBSOCKET`
 - 命令行验证（**须与 IDE 板子菜单选项逐字一致**，不同则缓存不共享、来回全量重编）：
-  `arduino-cli compile --fqbn "esp32:esp32:esp32cam:CPUFreq=240,FlashFreq=80,FlashMode=qio,PartitionScheme=huge_app,DebugLevel=none,EraseFlash=none" .`
+  `arduino-cli compile --fqbn "esp32:esp32s3:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=huge_app,DebugLevel=none,EraseFlash=none" .`
   （arduino-cli 位于 `D:\Program Files\Arduino IDE\resources\app\lib\backend\resources`，即 IDE 内置同版、缓存目录同源。）
 - ⚠️ 实测：即使 fqbn 完全一致，**IDE 验证 ↔ 命令行切换仍常各自全量重编**（esp32 core 整包重编，5–10 分钟）；想省时间就让「主编译入口」固定在一侧，别频繁来回。**改/增/删源文件后首次编译若报多定义或「多个文件 -o」错，删 `C:\Users\Yang\AppData\Local\arduino\sketches\` 下本 sketch 缓存目录再编**。
 - 依赖库：**ArduinoJson v7（Benoit Blanchon）**，装在用户 sketchbook `D:\Documents\Arduino\libraries\ArduinoJson`。⚠️ sketch 内 `libraries/ArduinoJson` 子目录 **Arduino 不会自动扫描**，属冗余副本，勿依赖（可删）。
@@ -50,7 +50,7 @@
 
 ## 实现进度（2026-09-06）
 
-各模块已接线并在核心 3.3.11 **编译通过**（此前 Phase B「仅代码复核、未编译」的历史问题已全部解决）。目标板为经典 **ESP32-CAM**（esp32cam+huge_app，实测固件 1837844 B / 58%）；此前曾误用 esp32s3 目标验证——代码语义等价，但**真机固件以 esp32cam+huge_app 为准**）：
+各模块已接线并在核心 3.3.11 **编译通过**（此前 Phase B「仅代码复核、未编译」的历史问题已全部解决）。目标板为 **ESP32-S3-CAM**（esp32:esp32s3:esp32s3 + 16M flash / opi psram + huge_app；此前误用的 esp32cam 固件已弃用，勿烧）：
 
 - `camera` / `config` / `wifi_net` ✅ 编译通过
 - `uart` / `command` / `ble` / `app_httpd`（web_server）✅ 编译通过（帧/词表语义以架构文档为准）

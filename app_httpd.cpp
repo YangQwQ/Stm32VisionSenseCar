@@ -439,7 +439,7 @@ static esp_err_t bmp_handler(httpd_req_t *req)
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
     uint64_t fr_start = esp_timer_get_time();
 #endif
-    fb = esp_camera_fb_get();
+    fb = cam::grab();
     if (!fb)
     {
         log_e("Camera capture failed");
@@ -500,10 +500,10 @@ static esp_err_t capture_handler(httpd_req_t *req)
 #if CONFIG_LED_ILLUMINATOR_ENABLED
     enable_led(true);
     vTaskDelay(150 / portTICK_PERIOD_MS); // The LED needs to be turned on ~150ms before the call to esp_camera_fb_get()
-    fb = esp_camera_fb_get();             // or it won't be visible in the frame. A better way to do this is needed.
+    fb = cam::grab();             // or it won't be visible in the frame. A better way to do this is needed.
     enable_led(false);
 #else
-    fb = esp_camera_fb_get();
+    fb = cam::grab();
 #endif
 
     if (!fb)
@@ -714,7 +714,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         face_id = 0;
 #endif
 
-        fb = esp_camera_fb_get();
+        fb = cam::grab();
         if (!fb)
         {
             log_e("Camera capture failed");
