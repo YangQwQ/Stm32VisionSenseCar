@@ -77,6 +77,8 @@ camera_fb_t* grab() {
   return esp_camera_fb_get();
 }
 
+bool available() { return s_ready; }
+
 void return_frame(camera_fb_t* fb) {
   if (fb) esp_camera_fb_return(fb);
 }

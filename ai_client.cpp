@@ -6,6 +6,7 @@
 
 #include <WiFiClientSecure.h>
 #include <esp_timer.h>
+#include <stdlib.h>  // strtol：chunked 块大小解码
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -204,15 +205,23 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   esc_append(b, cfg::ai_model().c_str());
   b.put(",\"messages\":[{\"role\":\"system\",\"content\":");
   esc_append(b, sys.p ? sys.p : "");
-
-  b.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+  // 结束 system 对象后接下一消息
+  b.put("},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
   PsaBuf ut;  // user 文本：执行板状态 + 画面引导（整体转义一次）
   if (exec_state && exec_state[0]) { ut.put(exec_state); ut.put("；"); }
-  ut.put("当前画面如下。");
+  if (frame) {
+    ut.put("当前画面如下。");
+  } else {
+    // 无摄像头降级：不让 AI 编造画面，只凭目标与状态规划保守指令
+    ut.put("注意：摄像头不可用，当前无实时画面可分析，请勿假设或编造画面内容。只依据上述目标与执行板状态，稳妥地规划一步指令（优先短距离 move 或直接 stop）。");
+  }
   esc_append(b, ut.p ? ut.p : "");
-  b.put("},");
-  if (use_edited && edited) img_block(b, edited, edited_len);
-  img_block(b, frame, frame_len);
+  b.put("}");
+  if (frame) {
+    b.put(",");
+    if (use_edited && edited) img_block(b, edited, edited_len);
+    img_block(b, frame, frame_len);
+  }
   b.put("]}],\"max_tokens\":256,\"temperature\":0.2,\"response_format\":{\"type\":\"json_object\"}}");
 }
 
@@ -298,7 +307,8 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
 // ---------------- HTTPS POST ----------------
 // 直接走 TLS socket 裸写 HTTP/1.1，绕开 HTTPClient 库——其 cookie/Date 解析
 // 会引入 libc time/gmtime/mktime/strptime 等函数（被链接脚本强制放 IRAM，
-// 实测导致 iram0 溢出）。DeepSeek 返回固定 JSON，Content-Length 定长可可靠读完。
+// 实测导致 iram0 溢出）。DeepSeek 边缘响应为 chunked（无 Content-Length），
+// 见下方按 CL / chunked 两种分支读取。
 
 static bool http_post(const char* url, const char* key, const char* body, String& resp) {
   // 解析 [scheme://]host[:port]/path
@@ -338,37 +348,87 @@ static bool http_post(const char* url, const char* key, const char* body, String
     if (hdr.endsWith("\r\n\r\n")) break;
     delay(5);
   }
-  if (!hdr.endsWith("\r\n\r\n")) { g_client.stop(); return false; }
-  if (!hdr.startsWith("HTTP/1.1 200") && !hdr.startsWith("HTTP/1.0 200")) {
-    g_client.stop();
-    Serial.printf("[ai] HTTP %s", hdr.c_str());
-    return false;
-  }
-
-  // 按 Content-Length 读 body（上限 64KB 防呆）
+  if (!hdr.endsWith("\r\n\r\n")) { Serial.println("[ai] HTTP 响应头超时/不完整"); g_client.stop(); return false; }
+  // 提前解析 Content-Length，供错误路径读 body 用
   int cl = 0;
   int idx = hdr.indexOf("Content-Length:");
   if (idx >= 0) { String v = hdr.substring(idx + 15); v.trim(); cl = v.toInt(); }
-  if (cl <= 0 || cl > 65536) { g_client.stop(); return false; }
+  if (!hdr.startsWith("HTTP/1.1 200") && !hdr.startsWith("HTTP/1.0 200")) {
+    // 非 2xx：把错误响应体（前 512B）也打出来，便于定位 400 的具体 message
+    String errbody;
+    int want = cl > 0 ? (cl < 512 ? cl : 512) : 0;
+    long te = millis();
+    while (want > 0 && (int)errbody.length() < want && millis() - te < 2000) {
+      while (want > 0 && g_client.available() && (int)errbody.length() < want) errbody += (char)g_client.read();
+      delay(3);
+    }
+    Serial.printf("[ai] HTTP %s body=%s", hdr.c_str(), errbody.c_str());
+    g_client.stop();
+    return false;
+  }
+  // 环视 HTTP keep-alive chunked 响应：DeepSeek 边缘当前对非流式返回也走 chunked
+  // （无 Content-Length）。先按 CL 读；无 CL 则按 chunked 解码。
+  if (cl > 0 && cl <= 65536) {
+    resp = "";
+    resp.reserve(cl + 1);
+    unsigned long tr = millis();
+    while ((int)resp.length() < cl && millis() - tr < AI_HTTP_TIMEOUT_MS) {
+      while (g_client.available() && (int)resp.length() < cl) {
+        int c = g_client.read();
+        if (c < 0) break;
+        resp += (char)c;
+      }
+      delay(5);
+    }
+    if ((int)resp.length() < cl) { Serial.printf("[ai] HTTP body 未读完 got=%d cl=%d\n", (int)resp.length(), cl); g_client.stop(); return false; }
+    g_client.stop();
+    return true;
+  }
+
+  // chunked 解码（已发 Connection: close，服务端发完会断连）
   resp = "";
-  resp.reserve(cl + 1);
-  t0 = millis();
-  while ((int)resp.length() < cl && millis() - t0 < AI_HTTP_TIMEOUT_MS) {
-    while (g_client.available() && (int)resp.length() < cl) {
-      int c = g_client.read();
-      if (c < 0) break;
+  unsigned long tk = millis();
+  auto read_byte = [&]() -> int {   // 读一个字节，带总体超时
+    while (millis() - tk < AI_HTTP_TIMEOUT_MS) {
+      if (g_client.available() > 0) { int c = g_client.read(); if (c >= 0) return c; }
+      delay(2);
+    }
+    return -1;
+  };
+  for (;;) {                        // 循环解析各块
+    String line;                    // 读 chunk-size 行（忽略 \r，遇到 \n 停）
+    unsigned long tl = millis();
+    while (line.length() < 64 && millis() - tl < 5000) {
+      int c = read_byte();
+      if (c < 0) return false;
+      if (c == '\r') continue;
+      if (c == '\n') break;
+      line += (char)c;
+    }
+    int sz = (int)strtol(line.c_str(), nullptr, 16);
+    if (sz <= 0 || sz > 262144) break;   // 0=结束；巨型块防呆
+    for (int i = 0; i < sz; i++) {
+      int c = read_byte();
+      if (c < 0) { g_client.stop(); Serial.printf("[ai] HTTP chunked 中断 got=%d\n", (int)resp.length()); return false; }
       resp += (char)c;
     }
-    delay(5);
+    read_byte(); read_byte();            // 吃掉块尾的 \r\n
   }
   g_client.stop();
-  return (int)resp.length() >= cl;
+  Serial.printf("[ai] HTTP chunked 解码 %d B\n", (int)resp.length());
+  return resp.length() > 0;
 }
 
-// 从响应提取 choices[0].message.content。
+// 从响应提取 choices[0].message.content；同时打印 reasoning_content（思考过程，截断防刷屏）。
 static bool extract_content(const String& resp, String& content) {
   JsonDocument doc;
   if (deserializeJson(doc, resp)) return false;
+  const char* rc = doc["choices"][0]["message"]["reasoning_content"] | "";
+  if (rc[0]) {
+    String r = rc;
+    if (r.length() > 200) r = "..." + r.substring(r.length() - 200);
+    Serial.printf("[ai] 思考: %s\n", r.c_str());
+  }
   const char* c = doc["choices"][0]["message"]["content"] | "";
   content = c;
   return content.length() > 0;
@@ -415,7 +475,12 @@ static void ai_worker(void*) {
     g_last_continuous = false;  // 本任务尚未下发过持续指令（防上一任务残留标志误判）
     g_last_cont_type = 0;
     m_busy = true;
-    Serial.printf("[ai] 任务开始 gen=%lu text=%s\n", t.generation, t.text);
+    // 摄像头可用性在任务起点判定（init 后即定）：不可用则整轮走无画面降级
+    bool cam_ok = cam::available();
+    Serial.printf("[ai] 任务开始 gen=%lu text=%s%s\n", t.generation, t.text, cam_ok ? "" : "（无摄像头→无画面模式）");
+    // 打印实际端点/模型，便于排查 404/401 等云端拒绝（配错路径是常见原因）
+    Serial.printf("[ai] 端点=%s 模型=%s key=%s\n", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
+                  cfg::ai_key().isEmpty() ? "空" : "已配置");
 
     unsigned long steps = 0;
     bool done = false;
@@ -454,14 +519,17 @@ static void ai_worker(void*) {
       if (!net::is_connected()) { snprintf(err_buf, sizeof(err_buf), "WiFi 掉线"); fail = err_buf; break; }
       if (cfg::ai_key().isEmpty()) { snprintf(err_buf, sizeof(err_buf), "未配置 AI Key"); fail = err_buf; break; }
 
-      // 取当前帧（失败重试，避免推流占缓冲时一次失败即判死）
+      // 取当前帧（失败重试，避免推流占缓冲时一次失败即判死）；无摄像头则跳过，走无画面降级
       camera_fb_t* fb = nullptr;
-      for (int fr = 0; fr < 3 && !fb; fr++) {
-        fb = cam::grab();
-        if (!fb && fr < 2) vTaskDelay(pdMS_TO_TICKS(50));
+      if (cam_ok) {
+        for (int fr = 0; fr < 3 && !fb; fr++) {
+          fb = cam::grab();
+          if (!fb && fr < 2) vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (!fb) { snprintf(err_buf, sizeof(err_buf), "取帧失败"); fail = err_buf; break; }
       }
-      if (!fb) { snprintf(err_buf, sizeof(err_buf), "取帧失败"); fail = err_buf; break; }
-      const uint8_t* frame = fb->buf; size_t frame_len = fb->len;
+      const uint8_t* frame = fb ? fb->buf : nullptr;
+      size_t frame_len = fb ? fb->len : 0;
 
       bool got = false;
       for (int attempt = 0; attempt < 2 && !done; attempt++) {

@@ -34,6 +34,9 @@ bool init();
 // 取一帧（同步接口），使用后必须调用 return_frame() 归还缓冲
 camera_fb_t* grab();
 
+// 摄像头是否可用（init 后即定），供调用方做"无画面降级"判断
+bool available();
+
 // 归还帧缓冲
 void return_frame(camera_fb_t* fb);
 
