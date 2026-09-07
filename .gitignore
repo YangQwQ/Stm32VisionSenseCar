@@ -43,3 +43,11 @@ __pycache__/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# ---- 第三方烧录工具（整包保留在工作区但不入库）----
+/car_firmware/stlink-1.8.0-win32/
+
+# ---- 压缩包与构建/烧录日志 ----
+*.zip
+/car_firmware/*.log
+/car_firmware/*.txt
