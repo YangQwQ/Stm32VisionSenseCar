@@ -85,11 +85,15 @@ class CharCB : public BLECharacteristicCallbacks {
       if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ssid))) s_ssid = v;
       else s_pass = v;
       if (!s_ssid.isEmpty() && !s_pass.isEmpty()) {
-        cfg::set_wifi(s_ssid, s_pass);
+        bool changed = cfg::set_wifi(s_ssid, s_pass);
         s_ssid = "";
         s_pass = "";
-        cmd::schedule_restart();  // ~1s 后重启，新 WiFi 生效
-        Serial.println("[ble] wifi 已写，准备重启");
+        if (changed) {
+          cmd::schedule_restart();  // ~1s 后重启，新 WiFi 生效
+          Serial.println("[ble] wifi 已更新，准备重启");
+        } else {
+          Serial.println("[ble] wifi 未变化，跳过重启");
+        }
       }
     } else if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ai_url)) ||
                BLEUUID(c->getUUID()).equals(BLEUUID(k_ai_key)) ||

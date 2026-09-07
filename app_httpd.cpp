@@ -144,7 +144,12 @@ static void ws_handle_text(const char *json, int fd)
     } else {
         // 统一词表：move/stop/arm/config/stream/ai_goal/ai_cancel 等交给 command
         // （stream 由 command 更新全局图传开关；ai_goal 异步结果回传）。
-        log_i("[ws] forward to cmd: %s", type);
+        // 摇杆高频帧同指令连续重复时只记首条，避免刷屏；换指令再记。
+        static String s_last_cmd;
+        if (s_last_cmd != type) {
+          log_i("[ws] forward to cmd: %s", type);
+          s_last_cmd = type;
+        }
         cmd::handle(json, true, ws_cmd_reply, &fd);
     }
 }

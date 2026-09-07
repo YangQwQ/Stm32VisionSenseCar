@@ -13,7 +13,8 @@ const String& ai_key();
 const String& ai_model();
 uint32_t uart_baud();
 
-void set_wifi(const String& ssid, const String& pass);
-void set_ai(const String& url, const String& key, const String& model);
+// 返回 true 表示配置发生变化（已落 NVS 生效）；false 表示与现值相同（跳过写入）
+bool set_wifi(const String& ssid, const String& pass);
+bool set_ai(const String& url, const String& key, const String& model);
 
 }  // namespace cfg

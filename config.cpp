@@ -33,7 +33,8 @@ const String& cfg::ai_key() { return g_cfg.ai_key; }
 const String& cfg::ai_model() { return g_cfg.ai_model; }
 uint32_t cfg::uart_baud() { return g_cfg.uart_baud; }
 
-void cfg::set_wifi(const String& ssid, const String& pass) {
+bool cfg::set_wifi(const String& ssid, const String& pass) {
+  if (g_cfg.wifi_ssid == ssid && g_cfg.wifi_pass == pass) return false;  // 未变化，跳过写入
   g_cfg.wifi_ssid = ssid;
   g_cfg.wifi_pass = pass;
   Preferences prefs;
@@ -41,9 +42,12 @@ void cfg::set_wifi(const String& ssid, const String& pass) {
   prefs.putString("wifi_ssid", ssid);
   prefs.putString("wifi_pass", pass);
   prefs.end();
+  return true;
 }
 
-void cfg::set_ai(const String& url, const String& key, const String& model) {
+bool cfg::set_ai(const String& url, const String& key, const String& model) {
+  if (g_cfg.ai_url == url && g_cfg.ai_key == key && g_cfg.ai_model == model)
+    return false;  // 未变化，跳过写入
   g_cfg.ai_url = url;
   g_cfg.ai_key = key;
   g_cfg.ai_model = model;
@@ -53,4 +57,5 @@ void cfg::set_ai(const String& url, const String& key, const String& model) {
   prefs.putString("ai_key", key);
   prefs.putString("ai_model", model);
   prefs.end();
+  return true;
 }

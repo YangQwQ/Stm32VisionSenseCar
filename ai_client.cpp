@@ -575,6 +575,7 @@ void ai::set_goal(const char* text, bool use_image, const char* annotation, long
 
 void ai::cancel(StopMode m) {
   xSemaphoreTake(g_mtx, portMAX_DELAY);
+  bool was_active = g_slot.active;  // 仅当确有任务在跑才上报，避免手动指令刷屏
   ++m_generation;         // 使在途结果作废
   if (g_slot.text) { free(g_slot.text); g_slot.text = nullptr; }
   if (g_slot.ann) { free(g_slot.ann); g_slot.ann = nullptr; }
@@ -583,7 +584,7 @@ void ai::cancel(StopMode m) {
   xSemaphoreGive(g_mtx);
   g_client.stop();
   g_stop_mode = (int)m;   // 手动 move/stop 接管=None（不补停）；arm=Wheels；ai_cancel=All
-  Serial.println("[ai] cancel");
+  if (was_active) Serial.println("[ai] cancel");
 }
 
 bool ai::busy() { return m_busy; }

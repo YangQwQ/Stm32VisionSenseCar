@@ -50,8 +50,16 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   const char* type = doc["type"] | "";
   JsonObject params = doc["params"].as<JsonObject>();
   bool manual = !strcmp(type, "move") || !strcmp(type, "stop") || !strcmp(type, "arm");
-  if (!manual)  // 手动指令高频，不逐条打印
+  if (manual) {
+    // 手动高频指令：WS 与 BLE 都汇到此处。同类型连续重复只记首条，确认收到而不刷屏。
+    static String s_last_manual;
+    if (s_last_manual != type) {
+      Serial.printf("[cmd] 收到手动指令 %s\n", type);
+      s_last_manual = type;
+    }
+  } else {
     Serial.printf("[cmd] type=%s has_frames=%u\n", type, has_frames);
+  }
 
   if (manual) {
     // 手动/词表动作：优先打断 AI 闭环，再立即译帧下发执行板（不文本应答）。
@@ -69,7 +77,10 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
       reply_status(doc, reply, reply_ctx, "config: SSID 为空");
       return;
     }
-    cfg::set_wifi(ssid, pass);
+    if (!cfg::set_wifi(ssid, pass)) {
+      reply_status(doc, reply, reply_ctx, "WiFi 配置未变化，跳过重启");
+      return;
+    }
     if (g_restart_at == 0) g_restart_at = millis() + 1000;
     reply_status(doc, reply, reply_ctx, "WiFi 配置已保存，重启连接…");
     return;
