@@ -1,7 +1,9 @@
 extends Node
 ## WebSocket 客户端：连接小车 ESP32，收发图传帧 / 控制指令 / AI 消息。
-## 连接检测仅依赖 get_ready_state：真正关闭（对端断开 / 握手失败 / 系统发现链路断开）
-## 会触发断开并自动重连；不发任何心跳/探测流量，避免挤占板子带宽与误判超时。
+## 断线感知 = 连接事件的 get_ready_state() 关闭 + 应用层"疑似断线确认"。
+## 不是周期心跳：仅在连续 3s 没有任何下行数据（含图传帧）——即"本要判定断开"的时刻——
+## 发一次 ping 探测做单次确认；3s 内收到板子 pong 说明仍在线（仅临时无数据），不响应才真正判定断开。
+## 探测 pong 由本类内部拦截，不会像 /ping 那样转发到消息区。避免长时间空闲时依赖系统 TCP 超时（可达 ~10s）。
 
 const CP := preload("res://net/proto/CommandProto.gd")
 
@@ -22,6 +24,14 @@ var _auto := false
 var _retry_left := 0.0          # 剩余自动重试时间
 const _RETRY_SEC := 3.0         # 重试间隔
 var _consecutive_fail := 0      # 连续重连失败次数，成功连接即清零
+
+# 断线确认（非周期心跳，见文件头注释）：空闲/响应阈值均 3s。
+const _PROBE_INTERVAL_MS := 3000  # 连续无下行数据时长，达到即"本要判定断开"，触发一次探测确认
+const _PROBE_TIMEOUT_MS := 3000   # 探测发出后等待 pong 的时长，超时视为真正断开
+const PING_FRAME := {"type": "ping", "params": {}}  # 探测载荷，板子回 {type:pong}
+var _last_active_ms := 0        # 最近一次收到下行/握手完成的时间（毫秒）
+var _probe_pending := false     # 已发探测、等待 pong
+var _probe_sent_ms := 0
 
 func get_state() -> String:
 	return _state
@@ -93,6 +103,8 @@ func _process(delta: float) -> void:
 		if _state != "connected":
 			_state = "connected"
 			_consecutive_fail = 0  # 连接成功，清零连续失败
+			_last_active_ms = Time.get_ticks_msec()  # 握手完成即视为有活动，作为探测计时基准
+			_probe_pending = false
 			connected.emit()
 	elif rs in [WebSocketPeer.STATE_CLOSED, WebSocketPeer.STATE_CLOSING]:
 		var reason := ""
@@ -117,20 +129,45 @@ func _process(delta: float) -> void:
 			else:
 				var img := Image.new()
 				if img.load_jpg_from_buffer(bytes) == OK:
+					_last_active_ms = Time.get_ticks_msec()  # 图传帧也是"有活动"，续活防误探测
 					frame_received.emit(img)
+	# 读包完成后做断线确认（此时活跃时间已按本帧下行更新，判定更准）。
+	if _state == "connected":
+		_check_keepalive()
+
+## 断线确认（非周期心跳，见文件头注释）：连续 _PROBE_INTERVAL_MS 无下行则发一次 ping 探测；
+## 再 _PROBE_TIMEOUT_MS 无 pong 即判定断开触发重连。探测 pong 由 _handle_text 拦截，不进消息区。
+func _check_keepalive() -> void:
+	var now := Time.get_ticks_msec()
+	if _probe_pending:
+		if now - _probe_sent_ms >= _PROBE_TIMEOUT_MS:
+			_abnormal_disconnect("连接中断")  # 探测无应答 → 真正断开
+		return
+	if now - _last_active_ms >= _PROBE_INTERVAL_MS:
+		_probe_pending = true
+		_probe_sent_ms = now
+		_peer.send_text(CP.encode(PING_FRAME))
 
 ## 统一处理一条 WS 文本指令/应答：解码后派发。
 func _handle_text(text: String) -> void:
 	var data: Dictionary = CP.decode(text)
 	if data.is_empty():
 		return
+	_last_active_ms = Time.get_ticks_msec()  # 任何下行文本都算有活动，续活防误探测
+	if _probe_pending and str(data.get("type", "")) == "pong":
+		# 探测应答：确认仍在线，撤销"疑似断开"，不转发给 UI（避免像 /ping 那样把 pong 刷进消息区）。
+		_probe_pending = false
+		return
 	text_received.emit(data)
 
-## 异常断线统一出口：断开并（若处于自动模式）调度重连。
+## 异常断线统一出口：断开并（若处于自动模式）调度重连。reason 为空时给个兜底文案，避免显示"已断开:"。
 func _abnormal_disconnect(reason: String) -> void:
+	var r := reason.strip_edges()
+	if r.is_empty():
+		r = "连接中断"
 	_teardown_peer()
 	_state = "disconnected"
-	disconnected.emit(reason)
+	disconnected.emit(r)
 	if _auto:
 		_consecutive_fail += 1
 		reconnect_failed.emit(_consecutive_fail)
@@ -141,6 +178,7 @@ func _schedule_retry() -> void:
 		_retry_left = _RETRY_SEC
 
 func _teardown_peer() -> void:
+	_probe_pending = false
 	if _peer != null:
 		_peer.close()
 		_peer = null

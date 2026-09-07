@@ -314,7 +314,10 @@ func _on_ws_connected() -> void:
 func _on_ws_disconnected(reason: String) -> void:
 	_video.call("show_no_signal", true)
 	_update_status()
-	_chat("板", "WS 已断开:%s" % reason)
+	var r := reason
+	if r.is_empty():
+		r = "连接中断"
+	_chat("板", "WS 已断开:%s" % r)
 
 func _on_frame(img: Image) -> void:
 	_video.call("set_frame", img)
@@ -525,13 +528,13 @@ func _recall_history(dir: int) -> bool:
 	return true
 
 func _send_ai_goal(text: String) -> void:
-	_chat("我", text)
+	_chat("本机", text)
 	var cmd: Dictionary = CP.ai_goal(text)
 	if not AppState.send_command(cmd):
 		_chat("提示", "目标未发送：AI 目标走 WiFi（当前离线）")
 
 func _send_image_goal(items: Array, message: String) -> void:
-	_chat("我", ("发图·%s" % message) if message.strip_edges() != "" else "发图")
+	_chat("本机", ("发图·%s" % message) if message.strip_edges() != "" else "发图")
 	# 先逐张上行编辑图（WS 二进制），再发文本 ai_goal{use_image:true}——板侧以最后一张为意图锚点。
 	for it in items:
 		var img: Image = (it as Dictionary).get("image", null)
@@ -589,7 +592,7 @@ func _handle_slash(text: String) -> void:
 		_:
 			_chat("提示", "未知指令: %s(/help 查看可用指令)" % verb)
 			return
-	_chat("我", text)
+	_chat("本机", text)
 	if not AppState.send_command(cmd):
 		_chat("提示", "指令未发送(当前离线)")
 
@@ -612,8 +615,8 @@ func _handle_ws_slash(arg: String) -> void:
 			_chat("提示", "WS:%s（%s）" % [ws.get_state(), auto])
 
 func _chat(who: String, msg: String) -> void:
-	if who == "我":
-		_chat_log.append_text("[b]我[/b]: %s\n" % msg)
+	if who == "本机":
+		_chat_log.append_text("[b]本机[/b]: %s\n" % msg)
 	elif who == "板":
 		_chat_log.append_text("[color=#6fc3ff]小车[/color]: %s\n" % msg)
 	elif who == "AI":
@@ -711,8 +714,12 @@ func _update_status() -> void:
 	_ble_stat.text = "BLE:%s" % ble
 	_ws_stat.text = "WS:%s" % ("已连接" if online else "未连接")
 	# 顶栏大字：连接中 / 已连接 / 未连接 三态反馈。
+	# 连接判定：WS 在线优先（WS_ONLY 模式下 BLE 已让出射频、主动断开），故只要 WS 连着就算已连接，
+	# 即使 BLE 断开也不显示"未连接"；BLE 断开会先看 WS——WS 也没连才落到"设备未连接"。
 	var ble_ok: bool = $Net/BLE.is_device_connected()
-	if ble_ok and _device_name != "":
+	if online:
+		_conn_stat.text = ("已连接: %s" % _device_name) if _device_name != "" else "已连接(WS)"
+	elif ble_ok and _device_name != "":
 		_conn_stat.text = "已连接: %s" % _device_name
 	elif ble == "connecting":
 		_conn_stat.text = ("连接中: %s" % _pending_name) if _pending_name != "" else "连接中…"
