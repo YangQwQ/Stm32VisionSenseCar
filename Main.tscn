@@ -9,6 +9,7 @@
 [ext_resource type="Script" uid="uid://dmgue5hwo2dt3" path="res://ui/control/DirectControl.gd" id="6_03owx"]
 [ext_resource type="Texture2D" uid="uid://btk412diyh6ht" path="res://res/device.png" id="7_20pc6"]
 [ext_resource type="Texture2D" uid="uid://bvs2gus24nc05" path="res://res/device_a.png" id="7_c2ibq"]
+[ext_resource type="FontFile" uid="uid://cj1s2ldyof8o4" path="res://res/MapleMono-NF-CN-Regular.ttf" id="7_fpfj3"]
 [ext_resource type="Script" uid="uid://cnuwqenuysr1h" path="res://ui/provision/WifiConfigPopup.gd" id="7_trn2v"]
 [ext_resource type="Texture2D" uid="uid://216chvs4p2dt" path="res://res/control.png" id="8_5vvyt"]
 [ext_resource type="PackedScene" uid="uid://b3nn00g0v4o37" path="res://ui/editor/ImageEditor.tscn" id="8_editor"]
@@ -498,9 +499,25 @@ theme_override_constants/separation = 8
 [node name="ChatLog" type="RichTextLabel" parent="BodyControl/ChatPanel" unique_id=590147692]
 layout_mode = 2
 size_flags_vertical = 3
+theme_override_fonts/normal_font = ExtResource("7_fpfj3")
 theme_override_styles/normal = SubResource("StyleBox_panel")
 bbcode_enabled = true
 scroll_following = true
+
+[node name="CommandHint" type="Label" parent="BodyControl/ChatPanel/ChatLog" unique_id=1043703248]
+visible = false
+layout_mode = 1
+anchors_preset = -1
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 10.0
+offset_top = -39.0
+grow_horizontal = 2
+grow_vertical = 0
+theme_override_colors/font_color = Color(0.6, 0.76, 0.94, 1)
+theme_override_fonts/font = ExtResource("7_fpfj3")
+theme_override_font_sizes/font_size = 32
 
 [node name="InputRow" type="HBoxContainer" parent="BodyControl/ChatPanel" unique_id=1129907710]
 layout_mode = 2
@@ -510,6 +527,7 @@ theme_override_constants/separation = 10
 custom_minimum_size = Vector2(0, 120)
 layout_mode = 2
 size_flags_horizontal = 3
+theme_override_fonts/font = ExtResource("7_fpfj3")
 placeholder_text = "输入消息 / 指令…"
 backspace_deletes_composite_character_enabled = true
 
@@ -519,7 +537,7 @@ layout_mode = 2
 text = "发送"
 
 [node name="CtrlArea" type="Panel" parent="BodyControl" unique_id=242386826]
-custom_minimum_size = Vector2(0, 730)
+custom_minimum_size = Vector2(0, 740)
 layout_mode = 2
 size_flags_stretch_ratio = 1.22
 theme_override_styles/panel = SubResource("StyleBoxEmpty_3y6u5")

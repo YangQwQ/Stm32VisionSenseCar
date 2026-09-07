@@ -48,10 +48,34 @@ static func help_lines() -> PackedStringArray:
 		"/stream [on|off]  图传开关",
 		"/stop [wheels|arm]  停车",
 		"/config <WiFi名> <密码>  配网",
-		"/goal <目标>  下发 AI 目标（DIRECT）",
+		"/goal <目标>  下发 AI 目标(DIRECT)",
 		"/cancel  取消当前 AI 任务",
-		"直接输入文字 = 以下发 AI 目标；框选后发文字 = 带区域目标",
+		"直接输入文字 = 以下发 AI 目标; 框选后发文字 = 带区域目标",
 	])
+
+## 指令提示表：完整指令（语法） → 说明。/help 与输入 / 时的匹配提示共用。
+const COMMAND_HINTS := {
+	"/ping": "连通性测试",
+	"/snapshot": "截图",
+	"/stream [on|off]": "图传开关",
+	"/stop [wheels|arm]": "停车",
+	"/config <WiFi名> <密码>": "配网",
+	"/goal <目标>": "下发 AI 目标(DIRECT)",
+	"/cancel": "取消当前 AI 任务",
+}
+
+## 按已敲的 / 指令片段过滤可匹配项，返回"指令 - 说明"行。text 以 / 开头才匹配；删到空则返回空。
+static func command_hints(text: String) -> PackedStringArray:
+	var t := text.strip_edges()
+	if not t.begins_with("/"):
+		return PackedStringArray()
+	var tok := t.trim_prefix("/").strip_edges().to_lower()
+	var out := PackedStringArray()
+	for cmd: String in COMMAND_HINTS.keys():
+		var verb := cmd.to_lower().split(" ", true, 1)[0].lstrip("/")
+		if tok.is_empty() or verb.begins_with(tok):
+			out.append("%s - %s" % [cmd, COMMAND_HINTS[cmd]])
+	return out
 
 static func raw(type: String, params: Dictionary = {}) -> Dictionary:
 	# 通用出口：给聊天 / 解析到未预置 builder 的词表指令透传用

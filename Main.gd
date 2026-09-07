@@ -48,6 +48,13 @@ var _attachments: Array = []
 ## 边扫边显示用：本趟已展示的 address 去重表 + "未发现设备"占位 Label。
 var _device_seen: Dictionary = {}
 var _empty_hint: Label = null
+## 输入历史（仅纯文本，不含图片附件）：上/下键翻阅，_history_idx 指向当前展示项。
+## _history_idx == size() 表示停在"当前草稿位"；_draft 存首次上翻前未发送的输入，供下键恢复。
+var _input_history: PackedStringArray = []
+var _history_idx: int = -1
+var _draft: String = ""
+
+@onready var _cmd_hint: Label = $BodyControl/ChatPanel/ChatLog/CommandHint
 
 func _ready() -> void:
 	AppState.ble = $Net/BLE
@@ -207,7 +214,7 @@ func _on_device_connected(_address: String, name: String) -> void:
 
 func _on_device_disconnected(reason: String) -> void:
 	_update_status()
-	_chat("提示", "设备已断开：%s" % reason)
+	_chat("提示", "设备已断开: %s" % reason)
 
 func _on_ble_status(data: Dictionary) -> void:
 	# 板子 BLE status：含 reply 时展示（如配网/指令应答）；自动连 WS 由 AppState 处理。
@@ -350,8 +357,16 @@ func _on_image_sent(img: Image, annotation: Dictionary) -> void:
 	_update_attach_hint()
 
 ## 文本每次变化都重建附件与标记的对应：删除某段 [Image N] 时同步移除对应图并重编号，不会错位。
-func _on_input_text_changed(_new_text: String) -> void:
+func _on_input_text_changed(new_text: String) -> void:
 	_reconcile_attachments()
+	# 打 / 时在聊天区列出可匹配指令及语法；删到不以 / 开头即隐藏。
+	if _cmd_hint != null:
+		var lines := CP.command_hints(new_text)
+		if lines.is_empty():
+			_cmd_hint.visible = false
+		else:
+			_cmd_hint.text = "\n".join(lines)
+			_cmd_hint.visible = true
 
 func _token_text(i: int) -> String:
 	return "[Image %d]" % i
@@ -419,7 +434,7 @@ func _show_ai_result(data: Dictionary) -> void:
 					line = "%s → %s" % [line, cs] if line != "" else cs
 			var dv: Variant = pd.get("done")
 			if dv is bool and (dv as bool):
-				line = "%s（任务结束）" % line if line != "" else "任务结束"
+				line = "%s(任务结束)" % line if line != "" else "任务结束"
 	if line == "":
 		line = "已收到 AI 输出"
 	_chat("AI", line)
@@ -449,10 +464,42 @@ func _on_send_pressed() -> void:
 		return
 	var text: String = _message_input.text.strip_edges()
 	_message_input.text = ""
+	_push_to_history(text)
 	if text.begins_with("/"):
 		_handle_slash(text)
 	else:
 		_send_ai_goal(text)
+
+## 记录一条纯文本输入到历史（去重相邻重复），供上/下键回填。
+func _push_to_history(text: String) -> void:
+	if text.is_empty():
+		return
+	if not _input_history.is_empty() and _input_history[-1] == text:
+		return
+	_input_history.append(text)
+	_history_idx = _input_history.size()  # 指向"末尾之后"=草稿位，上翻从最近一条开始
+	_draft = ""                            # 发送后重置待恢复的草稿
+
+## 上/下键回退输入历史：dir=-1 上翻、+1 下翻。下键翻过最旧一条后回到"草稿位"，恢复上翻前的编辑内容。
+## 只回填纯文本，不涉及图片附件。成功返回 true。
+func _recall_history(dir: int) -> bool:
+	if _input_history.is_empty():
+		return false
+	if _history_idx < 0 or _history_idx > _input_history.size():
+		_history_idx = _input_history.size()
+	var from_draft := _history_idx == _input_history.size()
+	var new_idx: int = _history_idx + dir
+	if from_draft and not _input_history.is_empty() and dir > 0:
+		return false  # 已在草稿位还往下翻：无更新内容
+	if from_draft and dir < 0:
+		_draft = _message_input.text  # 首次离开草稿位，先把未发送输入存下来
+	if new_idx < 0 or new_idx > _input_history.size():
+		return false
+	_history_idx = new_idx
+	_message_input.text = _draft if new_idx == _input_history.size() else _input_history[new_idx]
+	_message_input.caret_column = _message_input.text.length()
+	_message_input.grab_focus()
+	return true
 
 func _send_ai_goal(text: String) -> void:
 	_chat("我", text)
@@ -466,7 +513,7 @@ func _send_image_goal(items: Array, message: String) -> void:
 	for it in items:
 		var img: Image = (it as Dictionary).get("image", null)
 		if img == null or not AppState.send_image(img):
-			_chat("提示", "编辑图未发送：需先连上 WS 图传")
+			_chat("提示", "编辑图未发送: 需先连上 WS 图传")
 			return
 	var ann: Dictionary = (items[0] as Dictionary).get("annotation", {})
 	var cmd: Dictionary = CP.ai_goal(message, ann, true)
@@ -514,15 +561,15 @@ func _handle_slash(text: String) -> void:
 		"/cancel", "/stopai":
 			cmd = CP.ai_cancel()
 		_:
-			_chat("提示", "未知指令: %s（/help 查看可用指令）" % verb)
+			_chat("提示", "未知指令: %s(/help 查看可用指令)" % verb)
 			return
 	_chat("我", text)
 	if not AppState.send_command(cmd):
-		_chat("提示", "指令未发送（当前离线）")
+		_chat("提示", "指令未发送(当前离线)")
 
 func _show_help() -> void:
 	var lines := CP.help_lines()
-	_chat("提示", "可用指令：\n" + "\n".join(lines))
+	_chat("提示", "可用指令:\n" + "\n".join(lines))
 
 func _chat(who: String, msg: String) -> void:
 	if who == "我":
@@ -544,12 +591,18 @@ func _input(event: InputEvent) -> void:
 	if not (event is InputEventKey):
 		return
 	var k := event as InputEventKey
-	if not k.pressed or k.echo or (k.keycode != KEY_BACKSPACE and k.keycode != KEY_DELETE):
+	if not k.pressed or k.echo or not _message_input.has_focus():
 		return
-	if not _message_input.has_focus():
-		return
-	if _delete_input_token(k.keycode == KEY_BACKSPACE):
-		get_viewport().set_input_as_handled()
+	match k.keycode:
+		KEY_BACKSPACE, KEY_DELETE:
+			if _delete_input_token(k.keycode == KEY_BACKSPACE):
+				get_viewport().set_input_as_handled()
+		KEY_UP:
+			if _recall_history(-1):
+				get_viewport().set_input_as_handled()
+		KEY_DOWN:
+			if _recall_history(1):
+				get_viewport().set_input_as_handled()
 
 func _delete_input_token(is_backspace: bool) -> bool:
 	var txt: String = _message_input.text
