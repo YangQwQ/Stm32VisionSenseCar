@@ -126,10 +126,12 @@ int main(void)
 			if (Time % 10 == 0) Ps2SelfTest_Drive();
 #endif
 
-			/* 20ms：里程计采样 + 到位判定 */
+			/* 20ms：里程计采样 + 速度闭环 + 到位判定（闭环两种模式都跑，
+			 * 让自测开环先标 ENC_CNT_PER_CM/SPD_FULLSCALE_ENC 再用） */
 			if (Time % 4 == 0)
 			{
 				Odom_Sample();
+				AckermannDrive_Regulate();
 #if !PS2_SELFTEST
 				Dispatch_Periodic();
 #endif

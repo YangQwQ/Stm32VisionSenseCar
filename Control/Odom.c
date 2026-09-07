@@ -53,6 +53,17 @@ int32_t Odom_GetDistMm(void)      { return o.dist_mm; }
 int32_t Odom_GetYawDegX10(void)   { return o.yaw_deg_x10; }
 int16_t Odom_GetSpeed(void)       { return o.speed; }
 
+/* 实测轮速 → 0~1000 指令域（取幅值，反向为负也按幅值参与控制） */
+int16_t Odom_SpeedUnits(void)
+{
+	int32_t s = o.speed;
+
+	if (s < 0) s = -s;
+	s = s * 1000L / SPD_FULLSCALE_ENC;
+	if (s > 1000) s = 1000;
+	return (int16_t)s;
+}
+
 /* 打滑/堵转检测：与目标速度比对（占位，联调标定） */
 uint16_t Odom_ErrFlag(void)
 {

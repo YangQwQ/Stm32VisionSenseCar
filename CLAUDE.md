@@ -41,7 +41,7 @@ main(5ms 节拍)
 |---|---|
 | `UartFrame` | §5.4 帧状态机 + CRC-16/MODBUS 校验（错帧丢弃 + 计数）；`UartFrame_Send` 编码发送。`UART_FRAME_MAX_LEN=32` |
 | `Dispatch` | 按 DEV+CMD 分发；新指令**覆盖**旧的持续指令（无需显式 stop 即抢占）；stop(scope) 分 wheels/arm/all |
-| `AckermannDrive` | 直行=舵机回中+四轮驱动；持续转向=打满角（左 120/右 190 PWM）；`SteerTo` 按角度线性映射舵机 PWM |
+| `AckermannDrive` | 直行=舵机回中+四轮驱动；持续转向=打满角（左 120/右 190 PWM）；`SteerTo` 按角度线性映射舵机 PWM；**内嵌速度闭环**（运动状态机 + 增量 PID，见下） |
 | `Odom` | 20ms 采样 4 路编码器均值 → 累计距离(mm) 与 yaw(0.1°)；yaw 用阿克曼简化模型 `Δψ≈Δs/轴距·tan(舵角)` |
 | `Relay` | 定距/定角指令的目标判定：记录起点，达 `|Δ|≥目标` 即停用并回报完成 |
 | `RobotArmAct` | 机械臂步进状态机（持续/定距升降、移爪、夹爪）；每 25ms `_Step` 走一步，定距按步进计数判到位 |
@@ -54,7 +54,7 @@ main(5ms 节拍)
 | 周期 | 任务 |
 |---|---|
 | 5ms | `UartFrame_Feed` 收包 + `Dispatch_Process` 译码分发 |
-| 20ms | `Odom_Sample` 编码器采样 → 累计；`Dispatch_Periodic` 到位判定 + 状态刷新（到达即停并置完成标志） |
+| 20ms | `Odom_Sample` 编码器采样 → 累计；`AckermannDrive_Regulate` 速度闭环（实测轮速→PID→刷新 PWM）；`Dispatch_Periodic` 到位判定 + 状态刷新（到达即停并置完成标志） |
 | 25ms | `RobotArmAct_Step` 机械臂步进 |
 | 100ms | `Status_SendCar` / `Status_SendArm` 周期状态上报（数据无变化自动跳过） |
 | 1s | `LED1_Turn` 心跳指示灯（确认 5ms 调度活着） |
@@ -89,6 +89,7 @@ flag 位：`car_flag` bit0=打滑/堵转、bit1=定距/定角完成；`arm_flag`
 ## 值域与换算（易踩坑）
 
 - **速度两域不一致（d24cd33 已修）**：帧内 speed 是**单字节 0~255**，而驱动层（AckermannDrive / Vehicle_Chassis / NeZha 电机）按 **0~1000** 吃 PWM。`Dispatch::CarPwm(sp)=sp*1000/255` 负责归一到驱动域。机械臂速度在 `RobotArmAct::ArmStepPerTick` 里按 `speed/300+1` 折算每拍 1~5 步。**改任一处都要保持两域换算一致**。
+- **小车轮速已闭环**：`speed`(驱动域 0~1000) 现在是**目标轮速指令域**，不再直接是 PWM。命令入口（`AckermannDrive_Go`）先按目标 PWM 起步保证响应，此后每个 20ms `AckermannDrive_Regulate` 用增量 PID 修正实际 PWM。反馈把四轮均值编码器增量经 `Odom_SpeedUnits()` 按 `SPD_FULLSCALE_ENC` 换算回同一 0~1000 域比对。`SPD_LOOP_EN=0` 可整体退回开环直通做 A/B。PID 只正向驱动、**无主动刹车**（降到低速靠惯性滑行，正常）。
 - 距离：帧内 `dist_cm`(cm) → Relay 目标 `*10` 后按内部 mm 比对里程计；状态帧 param 用整厘米（`Odom_GetDistCm`）。
 - 角度：帧内 `angle_deg` 直接打舵机（舵机 PWM 相对中值 150 线性偏移）并按 `*10`(0.1°) 交给 Relay 判到位。
 - 转向舵机量程：中 150 / 左 120 / 右 190（PWM）；`AckermannDrive_SteerTo` 在量程内 CLAMP。
@@ -100,6 +101,8 @@ flag 位：`car_flag` bit0=打滑/堵转、bit1=定距/定角完成；`arm_flag`
 | 常量 | 位置 | 含义 |
 |---|---|---|
 | `ENC_CNT_PER_CM` | `Control/Odom.h` | 每厘米编码器计数（轮径/减速比/PPR 综合），当前 100 |
+| `SPD_FULLSCALE_ENC` | `Control/Odom.h` | 速度闭环反馈比例：指令 1000 对应的四轮均值编码器增量/20ms。标定 = `ENC_CNT_PER_CM` × 满 PWM 轮速(cm/s) × 0.02，当前 150 |
+| `SPD_LOOP_EN` / `SPD_KP` / `SPD_KI` / `SPD_KD` / `SPD_INTG_MAX` | `Control/AckermannDrive.h` | 速度闭环开关（0=开环直通）与增量 PID 增益/积分限幅。默认 KP=1.0 KI=0.05 KD=0，联调按实车调 |
 | `WHEELBASE_CM` | `Control/AckermannDrive.h` | 轴距，yaw 模型用，当前 15 |
 | `STEER_MAX_DEG` | `Control/AckermannDrive.h` | 满打对应最大转向角，当前 30 |
 | 转向角→PWM 线性映射 | `Control/AckermannDrive.c` `SteerTo` | 满量程 70 PWM ↔ 60° 的经验映射 |
@@ -125,9 +128,11 @@ flag 位：`car_flag` bit0=打滑/堵转、bit1=定距/定角完成；`arm_flag`
 
 - 小车：十字键 上/下=直行前/后，左/右=持续转向；全松开即停。
 - 机械臂：L1/L2=抬/落（Servo4），R1/R2=前伸/后缩移爪（Servo2），按住运行松开停；CROSS/SQUARE=夹/松（Servo3，按一次触发一次）。
-- 自测直驱速度 `PS2_CAR_PWM`（驱动域 0~1000）与臂速 `PS2_ARM_SPD`（0~255）就在该宏下方。
+- 自测直驱速度 `PS2_CAR_PWM`（驱动域 0~1000 目标轮速）与臂速 `PS2_ARM_SPD`（0~255）就在该宏下方。
 
 **标定参数用法**：自测时 PS2 每 50ms 轮询（`Time%10`），Odom 仍 20ms 采样、0x0A 状态帧仍 100ms 上报——接 USB-TTL 到 USART1 即可边摇手柄边读里程计帧（param=累计距离 cm），据此校准 `ENC_CNT_PER_CM` 等常量。注意 ps2 软时序较慢，轮询刻意放 50ms 级，别挪进 5ms。
+
+**速度闭环联调顺序建议**：① 先设 `AckermannDrive.h` 的 `SPD_LOOP_EN=0`（开环直通）确认电机方向/接线无误；② 满 PWM 跑一段，按 param=距离算轮速填 `SPD_FULLSCALE_ENC`；③ 再设 `SPD_LOOP_EN=1` 调 `SPD_KP/KI`（从 KP≈1.0、KI 很小起步，KP 过大/轮子悬空会震荡尖叫）。
 
 ## 约定与已知坑
 
