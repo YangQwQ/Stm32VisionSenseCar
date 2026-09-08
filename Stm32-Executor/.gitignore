@@ -1,0 +1,15 @@
+
+# ---- Keil 编译输出（工程级）----
+DebugConfig/
+Listings/
+Objects/
+RTE/
+*.uvoptx
+*.uvguix*
+
+# ---- IDE / 系统临时文件 ----
+/.trae
+/.claude
+.vscode/
+*.swp
+*.tmp
