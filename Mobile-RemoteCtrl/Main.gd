@@ -66,18 +66,27 @@ var _draft: String = ""
 @onready var _cmd_hint: Label = $BodyControl/ChatPanel/ChatLog/CommandHint
 
 func _ready() -> void:
-	AppState.ble = $Net/BLE
-	AppState.ws = $Net/WS
+	# 只对统一设备连接层 DeviceConn 说话：连接其统一信号（传输事件由 DeviceConn 收口）。
+	DeviceConn.scan_finished.connect(_on_scan_finished)
+	DeviceConn.device_found.connect(_on_device_found)
+	DeviceConn.scan_started.connect(_on_device_scan_started)
+	DeviceConn.device_connected.connect(_on_device_connected)
+	DeviceConn.device_disconnected.connect(_on_device_disconnected)
+	DeviceConn.ws_connected.connect(_on_ws_connected)
+	DeviceConn.ws_disconnected.connect(_on_ws_disconnected)
+	DeviceConn.status_received.connect(_on_ble_status)
+	DeviceConn.text_received.connect(_on_ws_text)
+	DeviceConn.frame_received.connect(_on_frame)
+	DeviceConn.state_changed.connect(_on_ble_state)
 
 	# 用 toggled + bind 页码；按钮同属一个 ButtonGroup，互斥单选。
 	_nav_bt.toggled.connect(_on_nav_toggled.bind(0))
 	_nav_ctrl.toggled.connect(_on_nav_toggled.bind(1))
 	_nav_about.toggled.connect(_on_nav_toggled.bind(2))
 
-	AppState.hook_auto_ws()
 	_request_ble_permissions()
-	# WS 由 BLE 会话驱动：不在启动时自连/心跳（避免"未连接设备也在连 WS"），
-	# 等 _on_device_connected / 板子上报 IP（AppState._on_ble_status）再连。
+	# WS 由 BLE 会话驱动（DeviceConn 已在连接态上收自动连 WS）：不在启动时自连/心跳，
+	# 等设备连接 / 板子上报 IP（DeviceConn._on_ble_status）再连。
 	_update_status()
 	set_process_input(true)
 	# 设置项：读取本地配置并同步两个开关状态；开启启动自连时按最近设备重连。
@@ -140,7 +149,7 @@ func _on_disable_ws_toggled(on: bool) -> void:
 ## 启动（或开启自连开关）时重连上次设备。Android 栈要求设备必须先被扫描到才能连接，
 ## 故这里先扫描、等 `_on_device_found` 中目标地址出现再连（不能像 RECOVERY 那样按地址直连）。
 func _try_startup_connect() -> void:
-	if AppState.ble == null:
+	if DeviceConn.get_ble_state() == "unavailable":
 		return
 	if not await _await_ble_ready():
 		_chat("提示", "蓝牙不可用，未自动连接设备")
@@ -153,12 +162,12 @@ func _try_startup_connect() -> void:
 	_pending_addr = addr
 	_pending_name = str(last.get("name", addr))
 	_chat("提示", "启动自连：扫描并连接 %s …" % _pending_name)
-	AppState.ble.scan()
+	DeviceConn.scan()
 
 ## 轮询等待蓝牙适配器进入可用状态（Android 含运行时授权弹窗）。超时或不可用则放弃。
 func _await_ble_ready() -> bool:
 	for i in 600:  # 至多约 10s
-		var s: String = AppState.ble.get_ble_state()
+		var s: String = DeviceConn.get_ble_state()
 		if s in ["idle", "scanning", "connecting", "connected"]:
 			return true
 		if s == "unavailable":
@@ -214,7 +223,7 @@ func _on_device_found(device: Dictionary) -> void:
 	if _startup_connect_addr != "" and addr.to_lower() == _startup_connect_addr:
 		_startup_connect_addr = ""
 		_chat("提示", "启动自连：发现 %s，正在连接…" % nm)
-		AppState.ble.connect_device(addr, nm)
+		DeviceConn.connect_device(addr, nm)
 
 func _add_device_card(name: String, address: String) -> void:
 	if _empty_hint != null:
@@ -255,10 +264,10 @@ func _on_device_item_selected(name: String, address: String) -> void:
 func _on_device_connected(_address: String, name: String) -> void:
 	_device_name = name
 	_update_status()
-	# BLE 已连接（会话开始）：发起 WS（默认软 AP 地址；板子上报 IP 时 AppState 会用 ws://ip 覆盖）。
+	# BLE 已连接（会话开始）：发起 WS（默认软 AP 地址；板子上报 IP 时 DeviceConn 会用 ws://ip 覆盖）。
 	# 设置了「关闭自动建立WS连接」= 纯蓝牙控制，则跳过自动连 WS（仍可用 /ws connect 手动连）。
-	if AppState.ws != null and not AppState.ws.is_connected_car() and not Store.get_disable_auto_ws():
-		AppState.ws.connect_car()
+	if not DeviceConn.get_ws_state() in ["connected", "connecting"] and not Store.get_disable_auto_ws():
+		DeviceConn.connect_ws()
 	_chat("提示", "已连接设备 %s" % name)
 	# 携带配网/AI 请求（设备卡片 → 连接窗口 → 确认），连上且 GATT 就绪后下发。
 	var wifi: Dictionary = _pending_provision
@@ -269,55 +278,57 @@ func _on_device_connected(_address: String, name: String) -> void:
 		return
 	await _wait_gatt_ready()
 	if not wifi.is_empty():
-		if AppState.ble.provision(str(wifi.get("ssid", "")), str(wifi.get("password", ""))):
+		if DeviceConn.provision(str(wifi.get("ssid", "")), str(wifi.get("password", ""))):
 			_chat("提示", "已下发 WiFi: %s | 板子可能重启，稍后会自动重连" % str(wifi.get("ssid", "")))
 		else:
 			_chat("提示", "配网下发失败")
 	if not ai.is_empty():
-		if AppState.ble.write_ai_config(str(ai.get("url", "")), str(ai.get("key", "")), str(ai.get("model", ""))):
+		if DeviceConn.write_ai_config(str(ai.get("url", "")), str(ai.get("key", "")), str(ai.get("model", ""))):
 			_chat("提示", "已下发 AI 配置")
 		else:
 			_chat("提示", "AI 配置下发失败")
 
 func _on_device_disconnected(reason: String) -> void:
 	_update_status()
-	# BLE 会话结束 → 结束 WS 会话（关掉自动重连/心跳），避免"无设备也在连 WS"。
-	# 例外：WS_ONLY 模式下断开 BLE 是"让出射频"（on_ws_ready 主动断开），此时 WS 仍要继续，不随之断开。
-	if AppState.ws != null and not AppState.is_ws_only():
-		AppState.ws.disconnect_car()
-	# WS_ONLY 下断 BLE 是主动让出射频（通信转到 WiFi WS），并非真掉线，故不报"设备已断开"。
-	if AppState.is_ws_only():
-		return
+	# 会话结束：WS 重连/双断恢复等策略由 DeviceConn 收口，这里仅提示 UI。
+	# 注意：WS_ONLY 让出 BLE 射频时的 BLE 断开不触发本信号（DeviceConn 在此场景不抛 device_disconnected）。
 	_chat("提示", "设备已断开: %s" % reason)
 
 func _on_ble_status(data: Dictionary) -> void:
 	# 板子 BLE status：含 reply 时展示（如配网/指令应答）；自动连 WS 由 AppState 处理。
 	# 板子 reply 可能是词表应答 JSON（{"type":status,pong,"params":{reason}}），解析出可读文本。
+	# 也可能是纯文本（如 "WiFi ..."）——用 JSON.new().parse() 拿错误码而不是 parse_string 打 C++ 错误。
 	var reply: Variant = data.get("reply")
 	if reply is String and not (reply as String).is_empty():
 		var txt: String = reply as String
-		var parsed: Variant = JSON.parse_string(txt)
-		if parsed is Dictionary:
-			var t: String = str((parsed as Dictionary).get("type", ""))
+		var json := JSON.new()
+		var parsed: Variant = {}
+		if json.parse(txt) == OK and json.data is Dictionary:
+			parsed = json.data
+			var t: String = str(parsed.get("type", ""))
 			if t == "pong":
 				txt = "pong"
-			elif (parsed as Dictionary).has("params"):
-				var pm: Variant = (parsed as Dictionary).get("params")
+			elif parsed.has("params"):
+				var pm: Variant = parsed.get("params")
 				if pm is Dictionary and (pm as Dictionary).has("reason"):
 					txt = str((pm as Dictionary).get("reason"))
 		_chat("板", txt)
 	_update_status()
 
 func _on_refresh_toggled(pressed_on: bool) -> void:
-	# toggle 按下 → 打断启动自连、清空旧列表、开始扫描并播放旋转动画；松开 → 停止扫描并复位。
+	# toggle 按下 → 打断启动自连、清空旧列表，交由 DeviceConn 统一开扫（scan_started 会按上按钮+动画）；
+	# 松开 → 统一停扫（恢复扫描也会一并打断）。
 	if pressed_on:
 		_cancel_startup_connect()
 		_clear_device_list()
-		_start_scan_animation()
-		$Net/BLE.scan()
+		DeviceConn.scan()
 	else:
-		_stop_scan_animation()
-		$Net/BLE.stop_scan()
+		DeviceConn.stop_scan()
+
+## 任何一次扫描（手动 / 双断恢复）都由 DeviceConn 的上报驱动同一套扫描按钮 + 动画，保证统一、可打断。
+func _on_device_scan_started() -> void:
+	_refresh_btn.set_pressed_no_signal(true)
+	_start_scan_animation()
 
 ## 手动按扫描按钮：打断启动自连（清掉待匹配地址与提示名），之后按普通手动扫描流程走，
 ## 不再对扫到的目标做自动连接、也不再在整轮没出现时弹"请手动连接"。
@@ -363,12 +374,12 @@ func _on_wifi_confirmed(ssid: String, password: String, url: String, key: String
 	Store.set_ai(url, key, model)
 	Store.set_last_device(_pending_addr, _pending_name)
 	_chat("提示", "连接 %s …" % _pending_name)
-	$Net/BLE.connect_device(_pending_addr, _pending_name)
+	DeviceConn.connect_device(_pending_addr, _pending_name)
 
 ## 轮询等待 BLE 服务发现完成（_gatt_ready），之后才能写 GATT 特征。
 func _wait_gatt_ready() -> void:
 	for i in 60:
-		if AppState.ble.is_device_connected():
+		if DeviceConn.is_device_connected():
 			return
 		await get_tree().process_frame
 
@@ -377,8 +388,7 @@ func _wait_gatt_ready() -> void:
 func _on_ws_connected() -> void:
 	_chat("板", "WS 已连接")
 	_update_status()
-	# WS 建立：进入 WS_ONLY，让出 BLE 射频（若 BLE 仍在连接则断开）
-	AppState.on_ws_ready()
+	# WS 建立即进入 WS_ONLY（让出 BLE 射频）由 DeviceConn 在内部处理。
 
 func _on_ws_disconnected(reason: String) -> void:
 	_video.call("show_no_signal", true)
@@ -691,17 +701,16 @@ func _show_help() -> void:
 
 ## /ws 手动控制：connect 开启自动重连并重连；disconnect 暂停自动重连并断开；status 查状态。
 func _handle_ws_slash(arg: String) -> void:
-	var ws := $Net/WS
 	match arg:
 		"connect":
-			AppState.ws.connect_car()
+			DeviceConn.connect_ws()
 			_chat("提示", "已发起 WS 连接（自动重连已开启）")
 		"disconnect":
-			AppState.ws.disconnect_car()
+			DeviceConn.disconnect_ws()
 			_chat("提示", "已手动断开 WS（暂停自动重连）")
 		_:
-			var auto := "自动重连" if ws.is_auto_reconnect() else "无自动重连"
-			_chat("提示", "WS:%s（%s）" % [ws.get_state(), auto])
+			var auto := "自动重连" if DeviceConn.ws_is_auto() else "无自动重连"
+			_chat("提示", "WS:%s（%s）" % [DeviceConn.get_ws_state(), auto])
 
 func _chat(who: String, msg: String) -> void:
 	if who == "本机":
@@ -796,8 +805,8 @@ func _on_joystick_release(_v: Variant = null) -> void:
 # ============================== 状态 ==============================
 
 func _update_status() -> void:
-	var ble: String = $Net/BLE.get_ble_state()
-	var ws_state: String = $Net/WS.get_state()
+	var ble: String = DeviceConn.get_ble_state()
+	var ws_state: String = DeviceConn.get_ws_state()
 	var online: bool = ws_state == "connected"
 	var ble_on: bool = ble != "off" and ble != "unavailable"
 	_ble_dot.modulate = Color.GREEN if ble_on else Color(1, 1, 1, 0.3)
@@ -807,7 +816,7 @@ func _update_status() -> void:
 	# 顶栏大字：连接中 / 已连接 / 未连接 三态反馈。
 	# 连接判定：WS 在线优先（WS_ONLY 模式下 BLE 已让出射频、主动断开），故只要 WS 连着就算已连接，
 	# 即使 BLE 断开也不显示"未连接"；BLE 断开会先看 WS——WS 也没连才落到"设备未连接"。
-	var ble_ok: bool = $Net/BLE.is_device_connected()
+	var ble_ok: bool = DeviceConn.is_device_connected()
 	if online:
 		_conn_stat.text = ("已连接: %s" % _device_name) if _device_name != "" else "已连接(WS)"
 	elif ble_ok and _device_name != "":

@@ -1,9 +1,7 @@
 [gd_scene format=3 uid="uid://djeb0cuoeaeet"]
 
 [ext_resource type="Script" uid="uid://d1tmutexp2vuy" path="res://Main.gd" id="1_main"]
-[ext_resource type="Script" uid="uid://cat6olj1u350v" path="res://net/ble/BLEClient.gd" id="2_ble"]
 [ext_resource type="Texture2D" uid="uid://dcyjjrs18hhhd" path="res://res/bg.jpg" id="2_trn2v"]
-[ext_resource type="Script" uid="uid://coab8np8s88w0" path="res://net/ws/WSCarClient.gd" id="3_ws"]
 [ext_resource type="Texture2D" uid="uid://bx6teaav65tma" path="res://res/scan_devices.png" id="5_j4qnp"]
 [ext_resource type="Script" uid="uid://c7y01patjmc1s" path="res://ui/video/VideoView.gd" id="5_trn2v"]
 [ext_resource type="Script" uid="uid://dmgue5hwo2dt3" path="res://ui/control/DirectControl.gd" id="6_03owx"]
@@ -345,14 +343,6 @@ grow_horizontal = 2
 grow_vertical = 2
 texture = ExtResource("2_trn2v")
 stretch_mode = 6
-
-[node name="Net" type="Node" parent="." unique_id=152732727]
-
-[node name="BLE" type="Node" parent="Net" unique_id=1301374098]
-script = ExtResource("2_ble")
-
-[node name="WS" type="Node" parent="Net" unique_id=901716668]
-script = ExtResource("3_ws")
 
 [node name="TopBar" type="PanelContainer" parent="." unique_id=442524444]
 layout_mode = 1
@@ -935,16 +925,6 @@ horizontal_alignment = 1
 visible = false
 layout_mode = 1
 
-[connection signal="ble_state_changed" from="Net/BLE" to="." method="_on_ble_state"]
-[connection signal="device_connected" from="Net/BLE" to="." method="_on_device_connected"]
-[connection signal="device_disconnected" from="Net/BLE" to="." method="_on_device_disconnected"]
-[connection signal="device_found" from="Net/BLE" to="." method="_on_device_found"]
-[connection signal="scan_finished" from="Net/BLE" to="." method="_on_scan_finished"]
-[connection signal="status_received" from="Net/BLE" to="." method="_on_ble_status"]
-[connection signal="connected" from="Net/WS" to="." method="_on_ws_connected"]
-[connection signal="disconnected" from="Net/WS" to="." method="_on_ws_disconnected"]
-[connection signal="frame_received" from="Net/WS" to="." method="_on_frame"]
-[connection signal="text_received" from="Net/WS" to="." method="_on_ws_text"]
 [connection signal="toggled" from="BodyBTScan/RefreshBtn" to="." method="_on_refresh_toggled"]
 [connection signal="toggled" from="BodyControl/VidControls/StreamToggle" to="." method="_on_stream_toggled"]
 [connection signal="pressed" from="BodyControl/VidControls/AnnotateBtn" to="." method="_on_annotate_pressed"]

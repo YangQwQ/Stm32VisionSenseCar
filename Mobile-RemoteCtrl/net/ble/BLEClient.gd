@@ -28,6 +28,8 @@ var _mgr: Node = null
 var _initialized := false
 var _pending_scan := false
 var _restart_scan := false   # 扫描中又点刷新：当前扫描结束后立即重扫一轮
+var _scan_since_ms := 0      # 进入 scanning 的时刻（监控扫描时长用）
+var _stop_request_ms := 0    # stop_scan 请求时刻；gdble 漏发 scan_stopped 时兜底强制收尾
 
 # GATT 客户端状态
 var _dev: Variant = null            # BleDevice (RefCounted)，connect_device 返回的句柄
@@ -65,6 +67,7 @@ func _ready() -> void:
 	if OS.get_name() == "Android":
 		OS.request_permissions()
 	_call_if("initialize")
+	set_process(true)   # 扫描自愈看门狗：不依赖 gdble 的 scan_stopped 回调
 
 func _on_adapter_initialized(success: bool, error: String) -> void:
 	_initialized = success
@@ -89,8 +92,9 @@ func scan() -> void:
 		# 扫描中又点刷新：不吞掉，先停旧扫描，结束后 _on_scan_stopped 里立即重扫。
 		# 也顺带自愈"上一轮没收到 scan_stopped 导致状态卡死 scanning"的情况。
 		_restart_scan = true
+		_stop_request_ms = Time.get_ticks_msec()   # gdble 漏回调则由 _process 兜底收尾后重扫
 		print("[BLE] scan() 遇扫描中，当前轮结束后重扫")
-		_mgr.call("stop_scan")
+		_mgr.call_deferred("stop_scan")
 		return
 	if not _initialized:
 		_pending_scan = true
@@ -99,20 +103,58 @@ func scan() -> void:
 		return
 	_start_real_scan()
 
+## 对 manager 的启停扫描调用：一律 call_deferred，避开 gdble 信号回调主体的重入——
+## 在 gdble 回调（如 scan_stopped / connection_failed）里同步再进 _mgr.call("start_scan"/"stop_scan")
+## 会触发 gdext 的 "bind_mut() already bound"，崩溃(1337)。延到下帧执行即可逃出回调栈。
 func _start_real_scan() -> void:
+	_scan_since_ms = Time.get_ticks_msec()
+	_stop_request_ms = 0
 	_set_state("scanning")
-	_mgr.call("start_scan", SCAN_DURATION)
+	_mgr.call_deferred("start_scan", SCAN_DURATION)
 
 ## 提前结束扫描（不重扫）。扫描中由 UI 松开刷新按钮调用。
 func stop_scan() -> void:
 	_restart_scan = false   # 手动停，不重扫
-	if _state == "scanning" and _mgr != null:
-		_mgr.call("stop_scan")
+	if _state == "scanning":
+		if _mgr != null:
+			_stop_request_ms = Time.get_ticks_msec()   # gdble 漏回调则在 _process 里兜底强制收尾
+			_mgr.call_deferred("stop_scan")
+		else:
+			_finish_scan_forced()
 
 func _on_scan_started() -> void:
+	_scan_since_ms = Time.get_ticks_msec()
+	_stop_request_ms = 0
 	_set_state("scanning")
 
+## 扫描自愈看门狗：gdble 偶发漏发 scan_stopped，导致状态长期卡在 scanning、手动停/重启无效。
+## 这里不依赖回调：扫描超时、或收到停扫请求但迟迟无回调时，强制收尾回 idle，让扫描始终可打断/可重开。
+func _process(_delta: float) -> void:
+	if _state != "scanning":
+		return
+	var now := Time.get_ticks_msec()
+	if _stop_request_ms > 0:
+		if now - _stop_request_ms > 1500:   # 停扫已请求但 gdble 无回调 → 兜底
+			_finish_scan_forced()
+		return
+	if now - _scan_since_ms > SCAN_DURATION * 1000 + 3000:   # 一轮扫描跑超時长仍无回调 → 兜底
+		_finish_scan_forced()
+
+## 强制收尾一轮扫描（不依赖 gdble 回调）。若期间又点刷新（_restart_scan）则立即重扫。
+func _finish_scan_forced() -> void:
+	if _state in ["connecting", "connected"]:
+		return   # 设备连接生命周期优先，不回写 idle
+	_stop_request_ms = 0
+	var restart := _restart_scan
+	_restart_scan = false
+	if restart:
+		_start_real_scan()
+	else:
+		_set_state("idle")
+		_scan_finish_empty()
+
 func _on_scan_stopped() -> void:
+	_stop_request_ms = 0
 	var devs: Array = _mgr.call("get_discovered_devices")
 	var named := _named_devices(devs)
 	print("[BLE] 扫描结束，发现设备: ", str(named))

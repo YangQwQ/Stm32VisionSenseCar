@@ -166,13 +166,17 @@ func _handle_text(text: String) -> void:
 	text_received.emit(data)
 
 ## 异常断线统一出口：断开并（若处于自动模式）调度重连。reason 为空时给个兜底文案，避免显示"已断开:"。
+## 去抖：只在「从已连接掉线」时 emit disconnected 一次；重试/首连失败保留内部收尾与 reconnect_failed
+## 计数（供连接策略判断何时转 BLE 恢复），但不刷 UI 提示，避免自动重连自旋时反复弹「WS 已断开」。
 func _abnormal_disconnect(reason: String) -> void:
 	var r := reason.strip_edges()
 	if r.is_empty():
 		r = "连接中断"
+	var was_connected := _state == "connected"
 	_teardown_peer()
 	_state = "disconnected"
-	disconnected.emit(r)
+	if was_connected:
+		disconnected.emit(r)
 	if _auto:
 		_consecutive_fail += 1
 		reconnect_failed.emit(_consecutive_fail)
