@@ -23,7 +23,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `Stm32-Vision.ino` | 入口：setup 按 cfg→ble→uart→cam→net→web 初始化；loop 调各模块 update |
-| `camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`，别处不再重复定义 |
+| `camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`；画质参数（分辨率/JPEG 质量）集中在 `camera.cpp` `init()` 顶部，WS 推流帧率在 `app_httpd.cpp` `WS_STREAM_FPS` |
 | `camera_pins.h` | 各摄像头型号 GPIO 引脚定义（按 `CAMERA_MODEL_*` 分支） |
 | `camera_index.h` | Web 前端页面（HTML/JS 内嵌数组，源自例程，现基本不用） |
 | `config.h/.cpp` | WiFi / AI 接口 / `uart_baud` 参数配置，NVS 持久化（不再写死 ssid/password） |
@@ -48,15 +48,16 @@
 - 依赖库：**ArduinoJson v7（Benoit Blanchon）**，装在用户 sketchbook `D:\Documents\Arduino\libraries\ArduinoJson`。⚠️ sketch 内 `libraries/ArduinoJson` 子目录 **Arduino 不会自动扫描**，属冗余副本，勿依赖（可删）。
 - 分区：**PartitionScheme=huge_app**（3MB APP、无 OTA），已含在上方完整 fqbn 内；真机烧录同此方案。依赖库与编译缓存目录同 IDE（`%LOCALAPPDATA%\arduino\sketches\<sketch哈希>\`）。
 
-## 实现进度（2026-09-06）
+## 实现进度（2026-09-08）
 
-各模块已接线并在核心 3.3.11 **编译通过**（此前 Phase B「仅代码复核、未编译」的历史问题已全部解决）。目标板为 **ESP32-S3-CAM**（esp32:esp32s3:esp32s3 + 16M flash / opi psram + huge_app；此前误用的 esp32cam 固件已弃用，勿烧）：
+目标板为 **ESP32-S3-CAM**（esp32:esp32s3:esp32s3 + 16M flash / opi psram + huge_app；此前误用的 esp32cam 固件已弃用，勿烧）。换装 **OV3660** 后相机与图传已**真机联调正常**：
 
-- `camera` / `config` / `wifi_net` ✅ 编译通过
-- `uart` / `command` / `ble` / `app_httpd`（web_server）✅ 编译通过（帧/词表语义以架构文档为准）
+- `camera` ✅ 真机验证：OV3660 识别正常（默认倒置/饱和偏高已在 init 回正），JPEG 抓帧与 WS 图传工作
+- `config` / `wifi_net` / `ble` ✅ 真机可用：BLE 配网、WS 图传链路已联调
+- `uart` / `command` / `app_httpd`（web_server）✅ 编译通过（帧/词表语义以架构文档为准）
 - `ai_client`（板载多模态 AI HTTP 调用）❌ **未做**；`ai_goal` 仍为 command.cpp 桩回复
 
-> ⚠️ 仍未真机联调（代码就绪、未上硬件）。待联调项：
+> 待联调项：
 > ② arm 词表 `duration_ms` 按 `dist_cm` 判定（UI 现发 0）；
 > ③ 执行板 UART 帧语义（CRC16/CMD 表）以 STM32 固件为准。
 
