@@ -1,0 +1,145 @@
+[gd_scene format=3 uid="uid://b3nn00g0v4o37"]
+
+[ext_resource type="Script" uid="uid://64g1jpram2nr" path="res://ui/editor/ImageEditor.gd" id="1_img"]
+[ext_resource type="Script" uid="uid://btli42s8fbnmg" path="res://ui/editor/EditorCanvas.gd" id="2_can"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBox_editor"]
+content_margin_left = 24.0
+content_margin_top = 24.0
+content_margin_right = 24.0
+content_margin_bottom = 24.0
+bg_color = Color(0.059, 0.09, 0.165, 0.98)
+corner_radius_top_left = 12
+corner_radius_top_right = 12
+corner_radius_bottom_right = 12
+corner_radius_bottom_left = 12
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_bq0dv"]
+content_margin_left = 4.0
+content_margin_top = 4.0
+content_margin_right = 4.0
+content_margin_bottom = 4.0
+bg_color = Color(0, 0, 0, 0.6)
+border_width_left = 12
+border_width_top = 12
+border_width_right = 12
+border_width_bottom = 12
+corner_radius_top_left = 12
+corner_radius_top_right = 12
+corner_radius_bottom_right = 12
+corner_radius_bottom_left = 12
+corner_detail = 5
+
+[node name="ImageEditor" type="Control" unique_id=1431221797]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_img")
+
+[node name="Dim" type="ColorRect" parent="." unique_id=560222472]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0, 0, 0, 0.65)
+
+[node name="Panel" type="PanelContainer" parent="." unique_id=1162974657]
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -430.0
+offset_top = -290.0
+offset_right = 430.0
+offset_bottom = 290.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_styles/panel = SubResource("StyleBox_editor")
+
+[node name="VBox" type="VBoxContainer" parent="Panel" unique_id=1927840336]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="Toolbar" type="HBoxContainer" parent="Panel/VBox" unique_id=325984816]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="RectBtn" type="Button" parent="Panel/VBox/Toolbar" unique_id=816937480]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+theme_override_styles/pressed = SubResource("StyleBoxFlat_bq0dv")
+toggle_mode = true
+text = "方框"
+
+[node name="CircleBtn" type="Button" parent="Panel/VBox/Toolbar" unique_id=752401855]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+theme_override_styles/pressed = SubResource("StyleBoxFlat_bq0dv")
+toggle_mode = true
+text = "圆圈"
+
+[node name="UndoBtn" type="Button" parent="Panel/VBox/Toolbar" unique_id=633847790]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "撤销"
+
+[node name="ClearBtn" type="Button" parent="Panel/VBox/Toolbar" unique_id=1414112505]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "清除"
+
+[node name="Spacer" type="Control" parent="Panel/VBox/Toolbar" unique_id=1622606467]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CancelBtn" type="Button" parent="Panel/VBox/Toolbar" unique_id=1684055791]
+custom_minimum_size = Vector2(80, 0)
+layout_mode = 2
+text = "取消"
+
+[node name="DoneBtn" type="Button" parent="Panel/VBox/Toolbar" unique_id=1792465908]
+custom_minimum_size = Vector2(80, 0)
+layout_mode = 2
+text = "采用"
+
+[node name="ViewportWrap" type="Control" parent="Panel/VBox" unique_id=1026887931]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="SubViewportContainer" type="SubViewportContainer" parent="Panel/VBox/ViewportWrap" unique_id=1028011752]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+stretch = true
+
+[node name="Viewport" type="SubViewport" parent="Panel/VBox/ViewportWrap/SubViewportContainer" unique_id=792698952]
+transparent_bg = true
+handle_input_locally = false
+size = Vector2i(812, 480)
+render_target_update_mode = 4
+
+[node name="Canvas" type="Control" parent="Panel/VBox/ViewportWrap/SubViewportContainer/Viewport" unique_id=716677853]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("2_can")
+
+[connection signal="pressed" from="Panel/VBox/Toolbar/RectBtn" to="." method="_on_rect_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/CircleBtn" to="." method="_on_circle_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/UndoBtn" to="." method="_on_undo_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/ClearBtn" to="." method="_on_clear_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/CancelBtn" to="." method="_on_cancel_pressed"]
+[connection signal="pressed" from="Panel/VBox/Toolbar/DoneBtn" to="." method="_on_done_pressed"]

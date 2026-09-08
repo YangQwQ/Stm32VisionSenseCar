@@ -1,0 +1,5 @@
+.godot
+/android
+.claude
+addons/gdble/~libgdble.windows.x86_64.dll
+*.TMP

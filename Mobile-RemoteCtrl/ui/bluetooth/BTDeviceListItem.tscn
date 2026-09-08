@@ -1,0 +1,68 @@
+[gd_scene format=3 uid="uid://b4xjf0s65d01l"]
+
+[ext_resource type="Texture2D" uid="uid://crhs6fraysima" path="res://res/bluetooth.png" id="1_bp7m5"]
+[ext_resource type="Script" uid="uid://ciyuaayl55brc" path="res://ui/bluetooth/BTDeviceListItem.gd" id="1_mmk82"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_i6pqd"]
+bg_color = Color(0.050980393, 0.078431375, 0.15294118, 0.5176471)
+corner_radius_top_left = 75
+corner_radius_top_right = 75
+corner_radius_bottom_right = 75
+corner_radius_bottom_left = 75
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_bp7m5"]
+bg_color = Color(0.02064852, 0.03592377, 0.08667397, 0.5176471)
+corner_radius_top_left = 75
+corner_radius_top_right = 75
+corner_radius_bottom_right = 75
+corner_radius_bottom_left = 75
+
+[node name="DeviceListItem" type="Button" unique_id=1719577304]
+custom_minimum_size = Vector2(500, 150)
+theme_override_styles/normal = SubResource("StyleBoxFlat_i6pqd")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_bp7m5")
+theme_override_styles/hover = SubResource("StyleBoxFlat_i6pqd")
+script = ExtResource("1_mmk82")
+
+[node name="BTIcon" type="TextureRect" parent="." unique_id=793128511]
+layout_mode = 1
+anchors_preset = -1
+anchor_bottom = 1.0
+offset_left = 50.0
+offset_top = 35.0
+offset_bottom = -35.0
+grow_vertical = 2
+texture = ExtResource("1_bp7m5")
+expand_mode = 3
+stretch_mode = 5
+
+[node name="Name" type="Label" parent="." unique_id=216729634]
+layout_mode = 1
+anchors_preset = -1
+anchor_top = 0.5
+anchor_right = 1.0
+anchor_bottom = 0.5
+offset_left = 150.0
+offset_top = -40.0
+offset_right = -75.0
+offset_bottom = -20.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_font_sizes/font_size = 50
+text = "未知设备"
+
+[node name="Mac" type="Label" parent="." unique_id=1685372966]
+layout_mode = 1
+anchors_preset = -1
+anchor_top = 0.5
+anchor_right = 1.0
+anchor_bottom = 0.5
+offset_left = 150.0
+offset_top = 40.0
+offset_right = -75.0
+offset_bottom = 22.5
+grow_horizontal = 2
+grow_vertical = 2
+text = "11:45:15:19:19:81:0a"
+
+[connection signal="pressed" from="." to="." method="_on_device_selected"]
