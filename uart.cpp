@@ -174,10 +174,35 @@ void uart::set_forward_cb(uart::ForwardCb cb) { g_forward_cb = cb; }
 
 // ---------------- 执行板上行帧镜像 ----------------
 // 把校验通过的一帧拼成「执行板日志」JSON，经广播回调发给手机（开启镜像时）：
-//   { type:"exec_status", params:{ dev, cmd, hex:[payload原始字节] } }
-// 内容即执行板原始上行数据，代偿执行板上没有的串口查看手段。
+//   { type:"exec_status", params:{ dev, cmd, hex:[payload原始字节][, text:解码文本] } }
+// 内容即执行板原始上行数据，代偿执行板上没有的串口查看手段；状态帧额外附上人话解码。
 static void forward_frame(const uint8_t* buf, uint8_t dev, uint8_t cmd, uint8_t len) {
   if (!g_forward || !g_forward_cb) return;
+  String text;
+  // 状态帧(0x0A) payload 满 5 字节（len=7）时按 §5.5 解码，否则只留 hex 兜底。
+  if (cmd == 0x0A && len >= 7) {
+    uint16_t param = buf[7] | ((uint16_t)buf[8] << 8);
+    uint8_t flag = buf[9];
+    if (dev == 0x01) {  // 小车：state 0停止/1移动中/2转动中
+      const char* st = buf[5] == 1 ? "移动中" : (buf[5] == 2 ? "转动中" : "停止");
+      text = "小车:";
+      text += String(st);
+      text += " 距";
+      text += param;
+      text += "cm";
+      if (flag & 1) text += " 打滑/堵转";
+    } else {            // 机械臂：state 0空闲/1升降中/2移爪中；grip 0松/1夹
+      const char* st = buf[5] == 1 ? "升降中" : (buf[5] == 2 ? "移爪中" : "空闲");
+      text = "机械臂:";
+      text += String(st);
+      text += " 夹爪:";
+      text += (buf[6] & 1) ? "夹住" : "松开";
+      text += " 距";
+      text += param;
+      text += "cm";
+      if (flag & 1) text += " 故障";
+    }
+  }
   JsonDocument doc;
   doc["type"] = "exec_status";
   JsonObject p = doc["params"].to<JsonObject>();
@@ -185,6 +210,7 @@ static void forward_frame(const uint8_t* buf, uint8_t dev, uint8_t cmd, uint8_t 
   p["cmd"] = cmd;
   JsonArray hex = p["hex"].to<JsonArray>();
   for (size_t i = 5; i < 3 + (size_t)len; i++) hex.add(buf[i]);  // payload 原始字节（DEV 前到 PAYLOAD 尾）
+  if (text.length()) p["text"] = text;
   String s;
   serializeJson(doc, s);
   g_forward_cb(s.c_str());
@@ -221,6 +247,21 @@ void uart::update() {
         if (got == calc) {
           uint8_t dev = buf[3], cmd = buf[4];
           if (cmd == 0x0A) {
+            // 状态帧：payload 满 5 字节时更新缓存。执行板只在状态变化时上报，
+            // 未变化即不重报——故沿用上次值，供 AI/镜像读取"当前状态"。
+            if (len >= 7) {
+              ExecState s = {};
+              s.dev = dev;
+              s.state = buf[5];
+              if (dev == 0x01) s.speed = buf[6];  // 小车：state speed param(2) flag
+              else s.grip = buf[6];               // 机械臂：state grip param(2) flag
+              s.param = buf[7] | ((uint16_t)buf[8] << 8);
+              s.flag = buf[9];
+              s.valid = true;
+              if (g_exec_mtx) xSemaphoreTake(g_exec_mtx, portMAX_DELAY);
+              g_exec = s;
+              if (g_exec_mtx) xSemaphoreGive(g_exec_mtx);
+            }
 #if UART_STATE_HEX_DUMP
             Serial.printf("[uart] 状态帧 dev=%02X payload=", dev);
             for (size_t i = 5; i < 3 + 1 + len; i++) Serial.printf("%02X ", buf[i]);
