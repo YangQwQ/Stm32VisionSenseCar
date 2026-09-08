@@ -251,15 +251,15 @@ func _on_services_discovered(_services: Array) -> void:
 		_dev.call("read_characteristic", BP.SVC_UUID, BP.STATUS_UUID)
 
 func _on_device_disconnected() -> void:
-	var reason := "连接已断开"
+	# 链路已死：teardown 跳过 .disconnect()，避免 gdble 反向回波 disconnected 重复上报。
 	_set_state("idle")
-	_teardown_device()
-	device_disconnected.emit(reason)
+	_teardown_device(false)
+	device_disconnected.emit("BLE 连接中断")
 
 func _on_device_connection_failed(error: String) -> void:
 	push_warning("BLE 连接失败: %s" % error)
 	_set_state("idle")
-	_teardown_device()
+	_teardown_device(false)   # 连接未建立，避免 .disconnect() 回波 disconnected 造成重复上报
 	device_disconnected.emit("连接失败")
 
 func _on_operation_failed(_operation: String, error: String) -> void:
@@ -363,8 +363,10 @@ func _connect_if_absent(sig: String, handler: Callable) -> void:
 			return
 	_dev.connect(sig, handler)
 
-func _teardown_device() -> void:
-	if _dev != null and is_instance_valid(_dev):
+## 清理当前 BleDevice。disconnect_conn=false 用于链路已死/未建成的场景，跳过 .disconnect()，
+## 避免对已断开的设备再调 disconnect 触发 gdble 反向回波 disconnected → 处理器被重入、重复上报。
+func _teardown_device(disconnect_conn: bool = true) -> void:
+	if disconnect_conn and _dev != null and is_instance_valid(_dev):
 		_dev.call("disconnect")
 	_dev = null
 	_dev_addr = ""

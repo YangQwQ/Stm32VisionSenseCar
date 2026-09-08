@@ -84,6 +84,8 @@ func _ready() -> void:
 	_auto_conn_btn.set_pressed_no_signal(Store.get_auto_conn())
 	_disable_ws_btn.set_pressed_no_signal(Store.get_disable_auto_ws())
 	if Store.get_auto_conn():
+		# 启动即自动连接：直接进控制页（页 1，触发 _on_nav_toggled → _switch_page），不再停在蓝牙扫描页。
+		_nav_ctrl.button_pressed = true
 		_try_startup_connect()
 
 # Android 运行时权限：BLE 扫描/连接 + 定位。声明在 export_presets（BLUETOOTH_* 等），
@@ -283,6 +285,9 @@ func _on_device_disconnected(reason: String) -> void:
 	# 例外：WS_ONLY 模式下断开 BLE 是"让出射频"（on_ws_ready 主动断开），此时 WS 仍要继续，不随之断开。
 	if AppState.ws != null and not AppState.is_ws_only():
 		AppState.ws.disconnect_car()
+	# WS_ONLY 下断 BLE 是主动让出射频（通信转到 WiFi WS），并非真掉线，故不报"设备已断开"。
+	if AppState.is_ws_only():
+		return
 	_chat("提示", "设备已断开: %s" % reason)
 
 func _on_ble_status(data: Dictionary) -> void:
@@ -304,14 +309,22 @@ func _on_ble_status(data: Dictionary) -> void:
 	_update_status()
 
 func _on_refresh_toggled(pressed_on: bool) -> void:
-	# toggle 按下 → 清空旧列表、开始扫描并播放旋转动画；松开 → 停止扫描并复位。
+	# toggle 按下 → 打断启动自连、清空旧列表、开始扫描并播放旋转动画；松开 → 停止扫描并复位。
 	if pressed_on:
+		_cancel_startup_connect()
 		_clear_device_list()
 		_start_scan_animation()
 		$Net/BLE.scan()
 	else:
 		_stop_scan_animation()
 		$Net/BLE.stop_scan()
+
+## 手动按扫描按钮：打断启动自连（清掉待匹配地址与提示名），之后按普通手动扫描流程走，
+## 不再对扫到的目标做自动连接、也不再在整轮没出现时弹"请手动连接"。
+func _cancel_startup_connect() -> void:
+	_startup_connect_addr = ""
+	_pending_addr = ""
+	_pending_name = ""
 
 ## 扫描旋转动画：先左旋两圈、再右旋两圈，往复循环；松开/结束由 _stop 复位。
 func _start_scan_animation() -> void:
