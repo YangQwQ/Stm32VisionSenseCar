@@ -9,7 +9,7 @@
 ### 工作模式
 
 1. **WiFi 直连 AI 模式**：板子经 WiFi 直调多模态 AI 接口，上传画面 → 解析返回控制指令 → UART 转发执行板。⚠️ 板载 AI 客户端（`ai_client`）尚未实现。
-2. **蓝牙配置模式**：BLE（GATT Server，广播名 VisionS3）接收配置（WiFi 账号密码 / AI 接口等）→ 存 NVS → 重启生效。✅ 已实现。**生命周期**：手机在 WS 连上后断开本机 BLE 让出射频（WS_ONLY）；WS 断线恢复时按最近地址重连本机 GATT（`onDisconnect` 自动恢复广播）。
+2. **蓝牙配置模式**：BLE（GATT Server，广播名 VisionS3）接收配置（WiFi 账号密码 / AI 接口等）→ 存 NVS → **在线重建 STA 生效，不整板重启**（BLE 保活，手机无需重连）。✅ 已实现。**生命周期**：手机在 WS 连上后断开本机 BLE 让出射频（WS_ONLY）；WS 就绪时板端 `ble::set_ws_connected` 停广播、断开时恢复可发现（`onDisconnect` 尊重 WS 状态再决定是否恢复）。
 3. **手机中转模式（已弃用）**：App 中转调 AI 的 RELAY 已在手机端移除（2026-09）。现行 **DIRECT**：手机只下发 `ai_goal` 目标文本/区域 → 板子执行并回 status；云端 AI 两侧现均为桩。
 
 ### 执行板
@@ -27,10 +27,10 @@
 | `camera_pins.h` | 各摄像头型号 GPIO 引脚定义（按 `CAMERA_MODEL_*` 分支） |
 | `camera_index.h` | Web 前端页面（HTML/JS 内嵌数组，源自例程，现基本不用） |
 | `config.h/.cpp` | WiFi / AI 接口 / `uart_baud` 参数配置，NVS 持久化（不再写死 ssid/password） |
-| `wifi_net.h/.cpp` | STA 连接 + 断线重连（namespace `net`）。⚠️ 勿改回 `network`：会与核心库 `Network.h` 在 Windows 大小写不敏感 FS 上遮蔽冲突 |
+| `wifi_net.h/.cpp` | STA 连接 + 断线重连 + 在线换网 `net::reconnect`（namespace `net`）。⚠️ 勿改回 `network`：会与核心库 `Network.h` 在 Windows 大小写不敏感 FS 上遮蔽冲突 |
 | `uart.h/.cpp` | 执行板串口帧协议（`AA 55 LEN DEV CMD PAYLOAD CRC16`）+ 词表→帧翻译 |
-| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；`ai_goal` 现为桩回复 |
-| `ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知（UUID 见下「协议参考」） |
+| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；`apply_network` 在线换网生效；`ai_goal` 现为桩回复 |
+| `ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知；WS 就绪时停广播（UUID 见下「协议参考」）|
 | `app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令 JSON、二进制=JPEG），已接入 `command`/`ble`。人脸检测/识别已停用（宏置 0） |
 | `partitions.csv` | 分区表：app0 约 3.8MB，需选带 3MB+ APP 空间的开发板分区选项 |
 
@@ -57,7 +57,6 @@
 - `ai_client`（板载多模态 AI HTTP 调用）❌ **未做**；`ai_goal` 仍为 command.cpp 桩回复
 
 > ⚠️ 仍未真机联调（代码就绪、未上硬件）。待联调项：
-> ① BLE 配网后板重启，手机需重连一次 BLE 收 ip；
 > ② arm 词表 `duration_ms` 按 `dist_cm` 判定（UI 现发 0）；
 > ③ 执行板 UART 帧语义（CRC16/CMD 表）以 STM32 固件为准。
 

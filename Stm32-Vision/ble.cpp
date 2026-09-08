@@ -89,10 +89,10 @@ class CharCB : public BLECharacteristicCallbacks {
         s_ssid = "";
         s_pass = "";
         if (changed) {
-          cmd::schedule_restart();  // ~1s 后重启，新 WiFi 生效
-          Serial.println("[ble] wifi 已更新，准备重启");
+          cmd::apply_network();  // 在线重建 STA（不重启，BLE 保持连接）
+          Serial.println("[ble] wifi 已更新，正在连接");
         } else {
-          Serial.println("[ble] wifi 未变化，跳过重启");
+          Serial.println("[ble] wifi 未变化，跳过");
         }
       }
     } else if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ai_url)) ||
@@ -130,8 +130,11 @@ class ServerCB : public BLEServerCallbacks {
     notify_status("");
   }
   void onDisconnect(BLEServer* s) override {
-    Serial.println("[ble] 手机断开，恢复广播");
-    if (s) s->startAdvertising();  // 恢复可发现，供再次配网/兜底
+    bool adv = BLEDevice::getAdvertising()->isAdvertising();
+    // WS 已连（图传/指令走 WiFi）时保持低调，不恢复广播以免被误扫；
+    // 否则(纯兜底/配网)恢复可发现，供再次连接。
+    if (s && !g_ws_connected) s->startAdvertising();
+    Serial.printf("[ble] 手机断开 ws=%d adv=%d\n", g_ws_connected ? 1 : 0, adv);
   }
 };
 
@@ -186,6 +189,14 @@ void ble::reply(const char* text) {
 }
 
 void ble::set_ws_connected(bool on) {
+  // WS 就绪 → 停广播（WS_ONLY，让 WiFi 专注图传）；WS 断开 → 恢复可发现供配网/兜底。
+  // 仅在实际广播状态翻转时打一行，便于确认配网/图传阶段广播的启停。
+  bool before = BLEDevice::getAdvertising()->isAdvertising();
+  if (on) { if (before) BLEDevice::stopAdvertising(); }
+  else    { if (!before) BLEDevice::startAdvertising(); }
+  bool after = BLEDevice::getAdvertising()->isAdvertising();
+  if (before != after)
+    Serial.printf("[ble] ws=%s 广播%s\n", on ? "on" : "off", after ? "已启动" : "已停止");
   if (g_ws_connected == on) return;
   g_ws_connected = on;
   notify_status("");  // 状态变化即上报（ws 字段刷新）

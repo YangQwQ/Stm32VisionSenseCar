@@ -154,9 +154,14 @@ func _handle_text(text: String) -> void:
 	if data.is_empty():
 		return
 	_last_active_ms = Time.get_ticks_msec()  # 任何下行文本都算有活动，续活防误探测
-	if _probe_pending and str(data.get("type", "")) == "pong":
+	var t: String = str(data.get("type", ""))
+	if _probe_pending and t == "pong":
 		# 探测应答：确认仍在线，撤销"疑似断开"，不转发给 UI（避免像 /ping 那样把 pong 刷进消息区）。
 		_probe_pending = false
+		return
+	if t == "ping":
+		# 板子 WS 活体探测：回 pong（同样静默，不进消息区）。
+		send_command({"type": "pong", "params": {}})
 		return
 	text_received.emit(data)
 

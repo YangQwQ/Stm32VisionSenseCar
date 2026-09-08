@@ -60,7 +60,6 @@ void loop() {
   // WiFi 断线重连由 network 模块处理
   net::update();
   ble::update();   // 处理 BLE cmd 队列 + WiFi 状态变化上报
-  cmd::update();   // 延迟重启（配网生效）
   uart::update();  // 收执行板状态帧（骨架）
   ai::update();    // 排空 AI 结果队列（回传 Godot ai_result）
   delay(10);

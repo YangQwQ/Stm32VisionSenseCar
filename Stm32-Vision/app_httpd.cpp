@@ -99,6 +99,38 @@ httpd_handle_t camera_httpd = NULL;
 #define WS_STREAM_FPS 10
 #define WS_EDIT_IMG_MAX (128 * 1024)  // 编辑图（二进制上行）上限，与 ai_client 一致
 
+// WS 对端（手机）活体探测：连续此时间无任何上行 → 发一次探测 ping；再此时间无响应判死。
+// 用于感知"静默断链"（如手机重启），恢复 BLE 广播供再次配网/兜底。探测基于应用层
+// {"type":"ping"}，对端协议栈/客户端回 {"type":"pong"}，均走 WS 文本帧，无附加心跳.
+static const uint32_t WS_IDLE_PING_MS = 30000;    // 连续无上行时长，达到则发探测
+static const uint32_t WS_PING_TIMEOUT_MS = 3000;  // 探测后可容忍的无上行时长（判死界）
+static volatile uint32_t s_ws_last_rx_ms = 0;      // 最近收到任一 WS 文本/binary 上行（ms）
+static volatile bool s_ws_ping_pending = false;    // 已发探测、等 pong（由 httpd 任务写入）
+static uint32_t s_ws_ping_at_ms = 0;
+
+// httpd 活跃 fd 表上限，须 >= 服务器 max_open_sockets（给足余量，过长时跳过）
+#define WS_MAX_CLIENTS 32
+
+// 全量 WS fd 探测/踢除辅助：httpd 仅暴露活跃 fd 表，无 per-fd 状态管理，故按需遍历。
+static esp_err_t ws_send_text(int fd, const char *text);  // 前向声明（定义在下方）
+static void ws_ping_all(void) {
+    int fds[WS_MAX_CLIENTS]; size_t n = WS_MAX_CLIENTS;
+    if (httpd_get_client_list(stream_httpd, &n, fds) != ESP_OK) return;
+    for (size_t i = 0; i < n; i++) {
+        if (httpd_ws_get_fd_info(stream_httpd, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) continue;
+        ws_send_text(fds[i], "{\"type\":\"ping\"}");  // 探测帧，对端回 pong
+    }
+}
+
+static void ws_kick_all(void) {
+    int fds[WS_MAX_CLIENTS]; size_t n = WS_MAX_CLIENTS;
+    if (httpd_get_client_list(stream_httpd, &n, fds) != ESP_OK) return;
+    for (size_t i = 0; i < n; i++) {
+        if (httpd_ws_get_fd_info(stream_httpd, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) continue;
+        httpd_sess_trigger_close(stream_httpd, fds[i]);  // 关闭死 fd，下轮剔出 client list
+    }
+}
+
 static esp_err_t ws_send_text(int fd, const char *text)
 {
     httpd_ws_frame_t frame = {0};
@@ -174,6 +206,8 @@ static esp_err_t ws_handler(httpd_req_t *req)
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
     if (ret != ESP_OK) return ret;
     if (pkt.len == 0) return ESP_OK;
+    s_ws_last_rx_ms = (uint32_t)(esp_timer_get_time() / 1000);  // 任何上行都视为有活动，续活判定准
+    s_ws_ping_pending = false;                                   // 收到上行即撤销探测等待，防误杀
 
     // 二进制帧 = 编辑图（裸 JPEG，手机→板）：覆盖暂存供 ai_goal{use_image}消费。
     if (pkt.type == HTTPD_WS_TYPE_BINARY) {
@@ -204,9 +238,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
 }
 
 // core 3.x / IDF 无 httpd_ws_client_iterate：改由 httpd_get_client_list 取全部活跃
-// fd，再用 httpd_ws_get_fd_info 筛出 WEBSOCKET 会话（HTTP 会话不计入）。数组须 >=
-// 服务器 max_open_sockets；给足余量，过长时本次跳过。
-#define WS_MAX_CLIENTS 32
+// fd，再用 httpd_ws_get_fd_info 筛出 WEBSOCKET 会话（HTTP 会话不计入）。
 
 static bool ws_send_jpeg_to_ws_clients(camera_fb_t *fb, bool *has_client)
 {
@@ -236,7 +268,9 @@ static void ws_send_text_to_ws_clients(const char *text)
 }
 
 // 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧；
-// 同时探测 WS 客户端存在性，喂给 ble::set_ws_connected（status.ws）。
+// 同时探测 WS 客户端存在性喂给 ble::set_ws_connected（status.ws），并做对端活体探测：
+// 连续 WS_IDLE_PING_MS 无上行 → 发探测 ping；再 WS_PING_TIMEOUT_MS 无任意上行 → 判死，
+// 踢掉全部 WS fd 并恢复 BLE 广播（供再次配网/兜底）。assume 单手机客户端（全局 last_rx）。
 static void ws_stream_task(void *arg)
 {
     while (true) {
@@ -250,6 +284,28 @@ static void ws_stream_task(void *arg)
         } else {
             ws_send_jpeg_to_ws_clients(nullptr, &has_client);  // 探测挂着的 WS 客户端
         }
+
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (has_client) {
+            if (s_ws_last_rx_ms == 0) s_ws_last_rx_ms = now;  // 首个挂上的时刻作为 idle 起点
+            if (!s_ws_ping_pending && (int32_t)(now - s_ws_last_rx_ms) >= (int32_t)WS_IDLE_PING_MS) {
+                s_ws_ping_pending = true;
+                s_ws_ping_at_ms = now;
+                ws_ping_all();
+                Serial.println("[ws] idle 超时，发探测 ping");
+            } else if (s_ws_ping_pending &&
+                       (int32_t)(now - s_ws_ping_at_ms) >= (int32_t)WS_PING_TIMEOUT_MS) {
+                // 探测后仍无上行 → 判死：踢 fd，下轮 has_client 回落 → 尾部恢复广播
+                s_ws_ping_pending = false;
+                s_ws_last_rx_ms = 0;
+                has_client = false;
+                ws_kick_all();
+                Serial.println("[ws] 探测超时，判定断线，恢复广播");
+            }
+        } else {
+            s_ws_ping_pending = false;  // 无 WS 挂载时复位探测态
+        }
+
         ble::set_ws_connected(has_client);
         vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
     }

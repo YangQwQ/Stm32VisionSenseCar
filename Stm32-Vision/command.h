@@ -19,10 +19,8 @@ void handle(const char* json, bool has_frames, ReplyFn reply, void* reply_ctx);
 bool streaming();
 void set_streaming(bool on);
 
-// 调度约 1s 后重启（BLE 配网写 SSID/PASS 后由 ble 调用，使新 WiFi 生效）
-void schedule_restart();
-
-// loop 中调用：处理延迟重启等定时动作
-void update();
+// 使最新 WiFi 配置生效：在线重建 STA 连接（不重启，BLE 保活）。
+// BLE 配网写 SSID/PASS 后由 ble 调用；command 的 config 分支内部亦调用。
+void apply_network();
 
 }  // namespace cmd

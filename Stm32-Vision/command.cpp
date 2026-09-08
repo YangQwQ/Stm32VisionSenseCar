@@ -1,12 +1,12 @@
 #include "command.h"
 #include "config.h"
+#include "wifi_net.h"
 #include "uart.h"
 #include "ai_client.h"
 
 // 应答格式遵循架构 §5.1：板 → 手机文本 = {type:status/pong, params:{...}, id:<回填>}。
 // move/stop/arm 是高频手动指令，只在 UART 层记录，不回文本（避免刷屏）。
 
-static unsigned long g_restart_at = 0;  // 配置变更后的重启时刻（0=未调度）
 static bool g_streaming = false;         // 图传开关全局状态（WS 推流任务读取）
 
 static bool has_id(const JsonDocument& doc) {
@@ -73,7 +73,7 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   Serial.printf("[cmd] type=%s has_frames=%u\n", type, has_frames);
 
   if (!strcmp(type, "config")) {
-    // 配网（BLE 或 WS 同结构）：落 NVS → 重启连 WiFi → 上线后 BLE 上报 IP
+    // 配网（BLE 或 WS 同结构）：落 NVS → 在线重建 STA（不重启，BLE 保活）→ 上线后 BLE 上报 IP
     const char* ssid = params["ssid"] | "";
     const char* pass = params["password"] | "";
     if (!ssid[0]) {
@@ -81,17 +81,21 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
       return;
     }
     if (!cfg::set_wifi(ssid, pass)) {
-      reply_status(doc, reply, reply_ctx, "WiFi 配置未变化，跳过重启");
+      reply_status(doc, reply, reply_ctx, "WiFi 配置未变化，跳过");
       return;
     }
-    if (g_restart_at == 0) g_restart_at = millis() + 1000;
-    reply_status(doc, reply, reply_ctx, "WiFi 配置已保存，重启连接…");
+    apply_network();
+    reply_status(doc, reply, reply_ctx, "WiFi 配置已保存，正在连接…");
     return;
   }
 
   if (!strcmp(type, "ping")) {
     reply_pong(doc, reply, reply_ctx);
     return;
+  }
+
+  if (!strcmp(type, "pong")) {
+    return;  // 板子 WS 活体探测的应答：仅当上行续活用，静默不回复
   }
 
   if (!strcmp(type, "stream")) {
@@ -154,18 +158,11 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   reply_status(doc, reply, reply_ctx, "未知指令类型");
 }
 
-void cmd::schedule_restart() {
-  if (g_restart_at == 0) g_restart_at = millis() + 1000;
+void cmd::apply_network() {
+  net::reconnect();  // 在线重建 STA，不整板重启（BLE 保活，配网后无需重连）
+  Serial.println("[cmd] 已在线上网生效（未重启）");
 }
 
 bool cmd::streaming() { return g_streaming; }
 
 void cmd::set_streaming(bool on) { g_streaming = on; }
-
-void cmd::update() {
-  if (g_restart_at != 0 && (long)(millis() - g_restart_at) >= 0) {
-    g_restart_at = 0;
-    Serial.printf("[cmd] 重启生效 WiFi 配置\n");
-    ESP.restart();
-  }
-}

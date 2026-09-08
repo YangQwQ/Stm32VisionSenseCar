@@ -7,6 +7,7 @@ namespace net {
 
 void init();    // 开机调用一次：若已配置则发起连接（非阻塞）
 void update();  // loop 中调用：断线后周期重连
+void reconnect();  // 在线换网：按最新 cfg 断开重建 STA（不重启，BLE 保活）
 
 bool is_connected();
 IPAddress local_ip();
