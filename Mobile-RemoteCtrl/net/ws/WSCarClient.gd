@@ -120,17 +120,16 @@ func _process(delta: float) -> void:
 		if pkt is String:
 			_handle_text(pkt as String)
 		else:
-			# Godot WebSocketPeer 可能按二进制交付文本帧：先试按 JSON 文本解析，非文本再当 JPEG 图传。
+			# 该 Godot 构建可能把文本帧也按二进制交付，故按内容嗅探而非依赖 String/PackedByteArray 区分：
+			# JPEG SOI 头(FF D8) → 图传帧；其余 → JSON 文本帧。文本帧先判 JPEG 再解码，避免 JPEG 字节被当 UTF-8 解析。
 			var bytes := pkt as PackedByteArray
-			var text := bytes.get_string_from_utf8()
-			var data: Dictionary = CP.decode(text)
-			if not data.is_empty():
-				_handle_text(text)
-			else:
+			if bytes.size() >= 2 and bytes[0] == 0xFF and bytes[1] == 0xD8:
 				var img := Image.new()
 				if img.load_jpg_from_buffer(bytes) == OK:
 					_last_active_ms = Time.get_ticks_msec()  # 图传帧也是"有活动"，续活防误探测
 					frame_received.emit(img)
+			else:
+				_handle_text(bytes.get_string_from_utf8())
 	# 读包完成后做断线确认（此时活跃时间已按本帧下行更新，判定更准）。
 	if _state == "connected":
 		_check_keepalive()
