@@ -49,6 +49,7 @@ static func ai_cancel() -> Dictionary:
 static func help_lines() -> PackedStringArray:
 	return PackedStringArray([
 		"/ping  连通性测试",
+		"/clear  清空消息区(仅本机)",
 		"/snapshot  截图",
 		"/stream [on|off]  图传开关",
 		"/exec_log [on|off]  执行板日志(转发给手机)",
@@ -63,6 +64,7 @@ static func help_lines() -> PackedStringArray:
 ## 指令提示表：完整指令（语法） → 说明。/help 与输入 / 时的匹配提示共用。
 const COMMAND_HINTS := {
 	"/ping": "连通性测试",
+	"/clear": "清空消息区(仅本机)",
 	"/snapshot": "截图",
 	"/stream [on|off]": "图传开关",
 	"/exec_log [on|off]": "执行板日志(转发给手机)",

@@ -388,19 +388,24 @@ func _on_ws_text(data: Dictionary) -> void:
 		_show_ai_result(data)
 		return
 	if t == "exec_status":
-		# 执行板日志镜像：板子把执行板上行帧转发过来，逐帧代偿执行板串口显示。
+		# 执行板日志镜像：板子把执行板上行帧转发过来（状态帧已解码成可读文本 text）。
+		# 无 text 的非状态帧回退显示原始 payload hex。
 		var p: Variant = data.get("params")
-		var hex := ""
+		var line := ""
 		if p is Dictionary:
 			var pm := p as Dictionary
-			hex = "%02X" % int(pm.get("cmd", 0))
-			var hx: Variant = pm.get("hex")
-			if hx is Array:
-				var parts := PackedStringArray()
-				for b in hx:
-					parts.append("%02X" % int(b))
-				hex += " " + " ".join(parts)
-		_chat("执行板", hex)
+			var txt: Variant = pm.get("text")
+			if txt is String and not (txt as String).is_empty():
+				line = txt as String
+			else:
+				line = "%02X" % int(pm.get("cmd", 0))
+				var hx: Variant = pm.get("hex")
+				if hx is Array:
+					var parts := PackedStringArray()
+					for b in hx:
+						parts.append("%02X" % int(b))
+					line += " " + " ".join(parts)
+		_chat("执行板", line)
 		return
 	if t != "status":
 		return
@@ -616,6 +621,10 @@ func _handle_slash(text: String) -> void:
 			cmd = CP.ping()
 		"/help", "/h", "?":
 			_show_help()
+			return
+		"/clear":
+			# 仅本地清理聊天区，不下发板子。
+			_chat_log.clear()
 			return
 		"/snapshot", "/snap":
 			cmd = CP.snapshot()
