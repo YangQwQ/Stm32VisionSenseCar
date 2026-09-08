@@ -63,12 +63,12 @@
 
 ## 协议参考
 
-统一架构与完整协议定义（词表 JSON、UART 指令表、BLE GATT UUID）见 `D:\Downloads\Git\vision-control-architecture.md`，开发前必读。
-BLE UUID / 广播名与手机 `Ctrl-App/net/ble/BleProfile.gd` **逐字 mirror**：改一侧必须同步另一侧。
+统一架构与完整协议定义（词表 JSON、UART 指令表、BLE GATT UUID）见仓库根 `../vision-control-architecture.md`（尚未并入本仓库；缺失期间以仓库根 [`../CLAUDE.md`](../CLAUDE.md) 与各子 CLAUDE 协议节为准），开发前必读。
+BLE UUID / 广播名与手机 `../Mobile-RemoteCtrl/net/ble/BleProfile.gd` **逐字 mirror**：改一侧必须同步另一侧。
 
 ## 关联项目
 
-- 手机 App：`D:\Downloads\Git\Ctrl-App`（显示画面 / 指令编辑 / 下发 `ai_goal` / BLE 配网）。
+- 手机 App：`../Mobile-RemoteCtrl`（本仓库内即原外部 `Ctrl-App`：显示画面 / 指令编辑 / 下发 `ai_goal` / BLE 配网）。
 
 ## 约定
 

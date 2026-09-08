@@ -6,9 +6,9 @@
 
 - **Godot 4.7.1 mono（mobile，竖屏** **`window/handheld/orientation=1` = Portrait）+ GDScript**，目标平台 Android。（旧文档误写“横向”；project.godot 与 AndroidManifest 均为 portrait。）
 
-- 一条 **STM32（电机控制）** + 独立 **ESP32-S3-CAM（控制/视觉大脑，`Stm32-Vision`）** 的小车，经 UART 串接。
+- 一条 **STM32 执行板（电机控制，`../Stm32-Executor`）** + 独立 **ESP32-S3-CAM 视觉/控制大脑板（`../Stm32-Vision`）** 的小车，经 UART 串接。
 
-- 完整架构设计见 `.trae/documents/ctrl-app-architecture-and-ui-plan.md`。
+- 完整架构设计原见 `.trae/documents/ctrl-app-architecture-and-ui-plan.md`（该文件未随本仓库收录）；跨子板总览见仓库根 `../CLAUDE.md`。
 
 ## 通信架构（三通道）
 
@@ -40,7 +40,7 @@ res://
   addons/
     gdble/                     # GDBLE 插件运行时（*.aar + libgdble.so，编译产物）
     gdble_export/              # 导出插件（Android libraries + manifest 注入）
-  .trae/documents/             # 架构设计文档
+  .trae/documents/             # 架构设计文档（未随本仓库收录）
   ui/
     control/Joystick.tscn+.gd  # 复用虚拟摇杆
     video/VideoView.tscn+.gd   # 图传显示
@@ -77,7 +77,7 @@ res://
 - **导出 = 编译动作**（非“无需编译”）：用 Godot 编辑器 headless 导出 Android debug APK。实测命令：
   `"D:/PortableApp/Godot/Godot_v4.7.1-stable_mono_win64.exe" --headless --path <工程根> --export-debug "Android" <输出.apk>`（preset 名 `Android`）。
 
-- **GDBLE 已集成**（非待办）：Java/AAR 部分已编译就绪于 `addons/gdble/android/*.aar` + 导出插件 `addons/gdble_export`；Rust 源在独立仓库 `D:\Downloads\Git\gdble`。若要改 btleplug/Java 侧需重编 AAR 的 classes.jar 再导出。
+- **GDBLE 已集成**（非待办）：Java/AAR 部分已编译就绪于 `addons/gdble/android/*.aar` + 导出插件 `addons/gdble_export`；Rust 源在独立仓库 `D:\Downloads\Git\gdble`（仓库外，未收录进本容器）。若要改 btleplug/Java 侧需重编 AAR 的 classes.jar 再导出。
 
 - 导出预置：`export_presets.cfg` 中 `gradle_build/use_gradle_build=true`，但实际走的是 **Godot 标准模板导出**（未真正跑 gradle assemble）；`plugins/GDBLE=false`、`plugins/GDBLEBridge=false`（插件经导出插件注入，不勾这两个开关）。
 

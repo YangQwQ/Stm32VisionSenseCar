@@ -4,11 +4,11 @@
 > 它带 **阿克曼底盘**（后轮驱动 + 前轮舵机转向）和 **机械臂**，经 **USART1** 接上游「视觉/控制大脑板」，只做"执行"：
 > 收到大脑板下发的动作指令帧 → 驱动底盘/机械臂 → 回传状态帧。**不解析手机词表、不调 AI**。
 >
-> 整个协作体系的角色划分见 `D:\Downloads\Git\CLAUDE.md`（工作区总纲）；详细架构与协议见 `D:\Downloads\Git\vision-control-architecture.md`。(文件可能不存在)
+> 整个协作体系的角色划分见仓库根 [`../CLAUDE.md`](../CLAUDE.md)（本仓库总纲）；详细架构与协议见 `../vision-control-architecture.md`（尚未并入本仓库，缺失期间以本文件「通信协议速查」+ 仓库根总纲为准）。
 
 ## 一句话架构
 
-大脑板（`D:\Downloads\Git\Stm32-Vision`，ESP32-S3）按 `AA 55 LEN DEV CMD [PAYLOAD] CRC16` 组帧，
+大脑板（`../Stm32-Vision`，ESP32-S3）按 `AA 55 LEN DEV CMD [PAYLOAD] CRC16` 组帧，
 经 UART 发给本板 → `Control/` 层译码执行 → 周期回传 `0x0A` 状态帧。**协议（§5.4 帧 / §5.5 指令表与状态字段）以本执行板为最终实现基准**，改指令码/状态语义须与大脑板、架构文档同步。
 
 ## 代码结构
@@ -137,8 +137,8 @@ flag 位：`car_flag` bit0=打滑/堵转、bit1=定距/定角完成；`arm_flag`
 ## 约定与已知坑
 
 - 与用户交流用中文；注释精简、**不在注释里写死魔法数值**（数值都收敛到各头文件顶部宏）。
-- **本板只认帧指令，不经手词表 JSON**；词表本体归手机 `Ctrl-App`，`词表→UART 帧`的翻译在大脑板 `Stm32-Vision/uart` 侧。
-- **改动协议（帧格式/CRC/DEV/CMD/状态字段/flag）必须三侧同步**：本 `Control/` 内常量 ↔ `Stm32-Vision/uart`（+架构文档 §5.4/§5.5）。状态/flag 语义以本板为基准，改完知会大脑板侧。
+- **本板只认帧指令，不经手词表 JSON**；词表本体归手机 `../Mobile-RemoteCtrl`（本仓库内即原 `Ctrl-App`），`词表→UART 帧`的翻译在大脑板 `../Stm32-Vision/uart` 侧。
+- **改动协议（帧格式/CRC/DEV/CMD/状态字段/flag）必须三侧同步**：本 `Control/` 内常量 ↔ `../Stm32-Vision/uart`（+架构文档 §5.4/§5.5）。状态/flag 语义以本板为基准，改完知会大脑板侧。
 - 2026-09 清理：删除示例程遗留且当前无调用的 `OLED.c/.h`、`OLED_Font.h`、`compute_pid.c/.h`，以及 `Hardware/` 下与 `NeZha/` 重复的 `NeZha_I2C.h`（实际生效的是 `NeZha/NeZha_I2C.h`，I2C 接口统一在 `NeZha/`）。
 - **`ps2.c/.h`（PS2 遥控驱动）接入自测模式**：`User/main.c` 顶部 `PS2_SELFTEST` 宏，`0`=UART 指令主链路（默认），`1`=PS2 手柄直驱自测（不接大脑板时确认电机方向/舵机/编码器参数用）。接线 CS=PA4 / SCK=PA5 / DI=PA6 / DO=PA7（见 `Hardware/ps2.c` `PS2_GPIO_Init`，板子不同改那里）。改宏后需在 Keil 全量重编。
 - 本仓库刚做过目录扁平化（源码从 `car_firmware/` 子目录上移到仓库根），路径改动都进了 git rename 记录，查找历史文件用 `git log --follow`。
@@ -147,7 +147,7 @@ flag 位：`car_flag` bit0=打滑/堵转、bit1=定距/定角完成；`arm_flag`
 
 | 角色 | 位置 |
 |---|---|
-| 大脑板（组帧下发本板、解析状态帧） | `D:\Downloads\Git\Stm32-Vision`（读其 `CLAUDE.md`） |
-| 手机 App（指挥，词表源） | `D:\Downloads\Git\Ctrl-App` |
-| 架构 + 完整协议 | `D:\Downloads\Git\vision-control-architecture.md` |
-| 工作区总纲 | `D:\Downloads\Git\CLAUDE.md` |
+| 大脑板（组帧下发本板、解析状态帧） | `../Stm32-Vision/`（读其 `CLAUDE.md`） |
+| 手机 App（指挥，词表源） | `../Mobile-RemoteCtrl/`（本仓库内即原 `Ctrl-App`） |
+| 架构 + 完整协议 | `../vision-control-architecture.md`（尚未并入本仓库） |
+| 仓库根总纲 | `../CLAUDE.md` |
