@@ -46,6 +46,7 @@ var _pending_target_addr := ""   # 扫描整批列表匹配到的待自连目标
 var _last_scan_ms := 0
 var _rescan_cd_ms := 0
 const _RESCAN_INTERVAL := 5.0        # 仍双断且未在扫时的周期重扫秒数
+const _CONNECT_RETRY_INTERVAL := 8.0 # 锁定目标后自连失败的重试冷却秒数
 const _SCAN_WATCHDOG_MS := 12000     # 一轮扫描不该超过它；gdble 漏发 scan_stopped 时的自愈阈值
 
 func _ready() -> void:
@@ -116,6 +117,7 @@ func scan() -> void:
 func stop_scan() -> void:
 	_recovery_active = false   # 用户手动打断：同时停掉恢复扫描
 	_pending_target_addr = ""
+	_auto_target_addr = ""
 	_ble.stop_scan()
 
 func connect_device(address: String, display_name: String = "") -> bool:
@@ -193,8 +195,8 @@ func _on_device_found(device: Dictionary) -> void:
 	# 双断恢复：发现目标地址 → 记录待自连并停扫，统一由 _process 在 manager 空闲帧连接。
 	if _recovery_active and _auto_target_addr != "" \
 			and (raw_addr as String).to_lower() == _auto_target_addr.to_lower():
-		_pending_target_addr = _auto_target_addr
-		_auto_target_addr = ""
+		_pending_target_addr = _auto_target_addr   # 锁定目标；统一交给 _on_ble_connected 收口清理
+		_rescan_cd_ms = 0.0                        # 尽快一次自连
 		_ble.stop_scan()
 
 func _on_scan_finished(devices: Array) -> void:
@@ -209,8 +211,8 @@ func _on_scan_finished(devices: Array) -> void:
 			var ra: Variant = (d as Dictionary).get("address")
 			if ra is String and not (ra as String).is_empty() \
 					and (ra as String).to_lower() == _auto_target_addr.to_lower():
-				_pending_target_addr = _auto_target_addr
-				_auto_target_addr = ""
+				_pending_target_addr = _auto_target_addr   # 锁定目标；保留 _auto_target_addr 供 _on_ble_connected 统一清理
+				_rescan_cd_ms = 0.0                        # 尽快发起首次自连
 				break
 
 func _on_ble_connected(address: String, name: String) -> void:
@@ -246,6 +248,8 @@ func _on_ws_connected() -> void:
 	# WS 上连：主信道转 WS，让出射频（WS_ONLY 语义）。恢复扫描若仍在跑则一并停掉，避免残留。
 	_channel = Channel.WS
 	_recovery_active = false
+	_pending_target_addr = ""
+	_auto_target_addr = ""
 	_evaluate_state()
 	if _ble.get_ble_state() == "scanning":
 		_ble.stop_scan()        # 残留的恢复扫描：停掉（连上停扫兜底）
@@ -297,16 +301,20 @@ func _process(delta: float) -> void:
 	if is_online():
 		_recovery_active = false
 		_pending_target_addr = ""
+		_auto_target_addr = ""
 		if _ble.get_ble_state() == "scanning":
 			_ble.stop_scan()   # 连上停扫
 		return
-	if _pending_target_addr != "" and _ble.get_ble_state() == "idle":
-		# 上轮整批列表里已匹配目标：在 manager 空闲（非回调）帧执行自连，避开蓝牙回调栈重入 1337。
-		_rescan_cd_ms = _RESCAN_INTERVAL * 1000.0   # 连接失败也留冷却再重试，不连帧硬啃
-		var addr := _pending_target_addr
-		_pending_target_addr = ""
-		_ble.connect_device(addr, _auto_target_name)
-		return
+	# 已锁定目标（某轮整批列表匹配到最近设备）：进入「专注自连」，不再周期重扫覆盖；
+	# manager 空闲即 connect，失败按 _CONNECT_RETRY_INTERVAL 冷却重试，成功由 _on_ble_connected 统一收口清状态。
+	if _pending_target_addr != "":
+		if _ble.get_ble_state() == "idle":
+			_rescan_cd_ms -= delta * 1000.0
+			if _rescan_cd_ms <= 0.0:
+				_rescan_cd_ms = _CONNECT_RETRY_INTERVAL * 1000.0
+				_ble.connect_device(_pending_target_addr, _auto_target_name)
+			return
+		return   # connecting/scanning：等在目标上，不重扫
 	if _ble.get_ble_state() == "scanning":
 		# 扫描进行中：不攒冷却，等这轮自然结束（给手动按钮留出可打断的间隙）。
 		# 兜底：若 gdble 漏发 scan_stopped 使状态长期卡在 scanning，超过阈值强制停扫，交给下轮重扫自愈。

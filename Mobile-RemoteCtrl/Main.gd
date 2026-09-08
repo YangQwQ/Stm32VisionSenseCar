@@ -389,6 +389,11 @@ func _on_ws_connected() -> void:
 	_chat("板", "WS 已连接")
 	_update_status()
 	# WS 建立即进入 WS_ONLY（让出 BLE 射频）由 DeviceConn 在内部处理。
+	# 重连/复线后按图传开关当前状态重发一次开启指令：断连期间开关仍保持「开」而板子画面已断，
+	# 若不重发需要用户手动再拨一次。
+	if _stream_toggle.button_pressed:
+		AppState.send_command(CP.stream(true))
+		_video.visible = true
 
 func _on_ws_disconnected(reason: String) -> void:
 	_video.call("show_no_signal", true)
