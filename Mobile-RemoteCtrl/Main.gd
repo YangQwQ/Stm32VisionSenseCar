@@ -465,12 +465,29 @@ func _apply_stream(on: bool) -> void:
 	AppState.send_command(CP.stream(on, port if port > 0 else 0, _my_ipv4()))
 	_video.visible = on
 
-## 取手机非回环 IPv4 本机地址（板端建 UDP 会话用，见 CommandProto.stream）
+## 取手机非回环 IPv4 本机地址（板端建 UDP 会话用，见 CommandProto.stream）。
+## 优先挑与板子（WS 对端）同网段的地址：手机可能带 VPN/虚拟网卡（如 tun0 172.19.0.1），
+## 若直接取首个非回环地址，可能把隧道 IP 报给板子，板端 UDP 发到该地址不可达 → 手机收不到画面。
 func _my_ipv4() -> String:
+	var host: String = DeviceConn.board_ip()
 	for a in IP.get_local_addresses():
-		if a.find(".") != -1 and not a.begins_with("127.") and a != "0.0.0.0":
+		if _is_usable_ipv4(a) and not host.is_empty() and _same_subnet(a, host):
+			return a
+	# 兜底：无匹配网段时任取一个可用 IPv4（无 VPN 环境与旧行为一致）
+	for a in IP.get_local_addresses():
+		if _is_usable_ipv4(a):
 			return a
 	return ""
+
+func _is_usable_ipv4(a: String) -> bool:
+	return a.find(".") != -1 and not a.begins_with("127.") and a != "0.0.0.0"
+
+## 板子与手机同接一个 WiFi/LAN，一般 /24：前 3 段一致即视为同网段。
+func _same_subnet(a: String, b: String) -> bool:
+	var sa := a.split(".")
+	var sb := b.split(".")
+	return sa.size() >= 3 and sb.size() >= 3 \
+		and sa[0] == sb[0] and sa[1] == sb[1] and sa[2] == sb[2]
 
 # ============================== 框选（编辑器） ==============================
 

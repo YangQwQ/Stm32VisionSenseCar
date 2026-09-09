@@ -119,6 +119,15 @@ func get_ble_state() -> String:
 func get_ws_state() -> String:
 	return _ws.get_state()
 
+## 板子 WS 地址的 IP 段（如 ws://192.168.64.5:81 → 192.168.64.5），供按网段挑本机地址。
+func board_ip() -> String:
+	var u: String = _ws.url  # 形如 ws://<ip>:81；未连上时为默认 192.168.4.1
+	u = u.trim_prefix("ws://").trim_prefix("wss://")
+	var i := u.find(":")
+	if i != -1:
+		u = u.substr(0, i)
+	return u
+
 func scan() -> void:
 	_ble.scan()
 
