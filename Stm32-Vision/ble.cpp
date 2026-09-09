@@ -206,7 +206,7 @@ void ble::set_transmission(bool on) {
   else    { if (!before) BLEDevice::startAdvertising(); }
   bool after = BLEDevice::getAdvertising()->isAdvertising();
   if (before != after)
-    Serial.printf("[ble] 图传=%d 广播%s\n", on ? "on" : "off", after ? "已启动" : "已停止");
+    Serial.printf("[ble] 图传=%s 广播%s\n", on ? "on" : "off", after ? "已启动" : "已停止");
 }
 
 void ble::update() {

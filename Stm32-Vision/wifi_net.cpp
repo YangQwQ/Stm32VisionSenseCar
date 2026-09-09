@@ -5,7 +5,7 @@
 // 单次连接尝试超时：begin 后此期间视为"正在尝试"，静默等待连接结果不重复 begin。
 // ESP32 内置 autoconnect 本身会断线重连；手动周期 begin 与它打架会反复打
 // "wifi:sta is connecting, cannot set config"，故只做低频兜底。
-static const unsigned long k_connect_timeout_ms = 30000;
+static const unsigned long k_connect_timeout_ms = 10000;
 static unsigned long s_begin_at = 0;  // 最近一次发起连接的时刻（0=从未发起）
 
 void net::init() {

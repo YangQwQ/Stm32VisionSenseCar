@@ -93,11 +93,12 @@ static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
 
-// 连接建立后一次性调大 TCP 发送缓冲并关 Nagle：
-// 默认小发送窗口 + Nagle 会让新连接慢启动期吞吐爬坡慢，表现为图传前慢后快
+// 连接建立后关 Nagle（指令/结果小报文低延迟）。
+// 图传帧已改走 UDP，WS 不再承载大帧，故发送缓冲不再放大；
+// 之前 64KB 的 SO_SNDBUF 会吃掉内部 RAM 连续块，反而挤占 ai_client 的 TLS 握手堆。
 static void tune_socket(int fd)
 {
-    int sndbuf = 64 * 1024;
+    int sndbuf = 8 * 1024;
     lwip_setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     int nodelay = 1;
     lwip_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
@@ -118,7 +119,7 @@ static void tune_socket(int fd)
 // WS 对端（手机）活体探测：连续此时间无任何上行 → 发一次探测 ping；再此时间无响应判死。
 // 用于感知"静默断链"（如手机重启），恢复 BLE 广播供再次配网/兜底。探测基于应用层
 // {"type":"ping"}，对端协议栈/客户端回 {"type":"pong"}，均走 WS 文本帧，无附加心跳.
-static const uint32_t WS_IDLE_PING_MS = 30000;    // 连续无上行时长，达到则发探测
+static const uint32_t WS_IDLE_PING_MS = 10000;    // 连续无上行时长，达到则发探测
 static const uint32_t WS_PING_TIMEOUT_MS = 3000;  // 探测后可容忍的无上行时长（判死界）
 static volatile uint32_t s_ws_last_rx_ms = 0;      // 最近收到任一 WS 文本/binary 上行（ms）
 static volatile bool s_ws_ping_pending = false;    // 已发探测、等 pong（由 httpd 任务写入）
@@ -263,11 +264,12 @@ static void ws_handle_text(const char *json, int fd)
         if (!strcmp(type, "stream")) {
             bool on = doc["params"]["on"] | false;
             int port = doc["params"]["udp_port"] | 0;
+            const char *src_ip = doc["params"]["src_ip"] | "";
+            Serial.printf("[udp] stream on=%d port=%d src_ip=%s\n", on, port, src_ip);
             if (on && port > 0) {
                 struct sockaddr_in src;
                 socklen_t sl = sizeof(src);
                 uint32_t peer_ip = 0;
-                const char *src_ip = doc["params"]["src_ip"] | "";
                 // 优先采用手机上报的本机 IP（实测 lwip_getpeername 对 httpd fd 回 0.0.0.0，不可靠）
                 if (src_ip[0]) {
                     uint32_t a = 0, b = 0, c = 0, d = 0;
@@ -281,8 +283,12 @@ static void ws_handle_text(const char *json, int fd)
                 } else if (lwip_getpeername(fd, (struct sockaddr *)&src, &sl) == 0) {
                     udp_peer_set(src.sin_addr.s_addr, (uint16_t)port);
                 }
+                Serial.printf("[udp] peer set -> %u.%u.%u.%u:%d\n",
+                              (uint8_t)(peer_ip), (uint8_t)(peer_ip >> 8),
+                              (uint8_t)(peer_ip >> 16), (uint8_t)(peer_ip >> 24), port);
             } else {
                 udp_peer_clear();
+                Serial.printf("[udp] peer cleared (on=%d port=%d)\n", on, port);
             }
         }
         // 统一词表：move/stop/arm/config/stream/ai_goal/ai_cancel 等交给 command
@@ -429,9 +435,10 @@ static void ws_stream_task(void *arg)
         }
 
         ble::set_ws_connected(has_client);
-        // 任一图传通道活跃（WS 客户端 / MJPEG 推流 / streaming 标志）即停 BLE 广播：
-        // BLE 与 WiFi 共用射频，广播会显著压低吞吐（手机离线但电脑 MJPEG 在推时尤为明显）。
-        ble::set_transmission(has_client || isStreaming || cmd::streaming());
+        // 图传已改走 UDP：WS 客户端在位仅作指令/状态通道，几乎不占射频；
+        // 只有"真在推帧"（UDP 图传 / MJPEG 推流）才停 BLE 广播，否则手机随时可发现
+        // VisionS3 重连（此前 WS 常挂/半开会让广播永久关闭，导致手机不重启连不上）。
+        ble::set_transmission(isStreaming || cmd::streaming());
         vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
     }
 }

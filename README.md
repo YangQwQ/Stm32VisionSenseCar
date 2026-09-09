@@ -67,6 +67,10 @@
 | [`Stm32-Executor/`](Stm32-Executor/CLAUDE.md) | 执行板固件 | C · Keil MDK（STM32F10x 标准库） | 帧协议译码、阿克曼运动/速度闭环、里程计、机械臂步进、状态上报 |
 | [`Mobile-RemoteCtrl/`](Mobile-RemoteCtrl/CLAUDE.md) | 手机遥控 App | GDScript · Godot 4.7.1 mono（Android） | 三通道通信、虚拟摇杆、图传显示、图片标注、BLE 配网界面 |
 
+> ⚠️ **大脑板依赖自编译内核库**（esp32 core 3.3.11，用 esp32-arduino-lib-builder 在 WSL 自编译后覆盖到 Arduino15）：
+> ① mbedTLS SSL 收发缓冲设 8192B（`CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN` / `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN`），否则 AI 直连 TLS 握手因内部堆碎片化失败（-17040/-32512）；
+> ② lwIP TCP 缓冲上调（`CONFIG_TCP_SND_BUF_DEFAULT`=32768 / `CONFIG_TCP_WND_DEFAULT`=16384），否则 40KB 级请求体发送 `write()` 超时。
+
 ## 3. 硬件选型（BOM）
 
 > 下表为当前固件所面向的硬件清单。标注「待补充」处请按实物回填型号/数量，并把商品页截图放入对应图片位（见 [3.2](#32-硬件配图)）。
