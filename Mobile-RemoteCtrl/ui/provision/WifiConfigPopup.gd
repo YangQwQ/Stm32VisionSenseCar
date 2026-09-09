@@ -11,7 +11,6 @@ signal cancelled
 @onready var _url: LineEdit = $VBox/Url
 @onready var _key: LineEdit = $VBox/Key
 @onready var _model: LineEdit = $VBox/Model
-@onready var _status: Label = $VBox/Status
 
 func set_device(name: String) -> void:
 	_device_label.text = "设备：%s" % name
@@ -25,7 +24,6 @@ func popup() -> void:
 	_url.text = str(a.get("url", ""))
 	_key.text = str(a.get("key", ""))
 	_model.text = str(a.get("model", ""))
-	_status.text = ""
 	visible = true
 	AnimationManager.fade_scale_in(self)
 
