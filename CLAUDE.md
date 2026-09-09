@@ -1,10 +1,12 @@
 # CLAUDE.md（仓库根 · 总览与索引）
 
+> 本文档基准：仓库 HEAD `07aa659`（2026-09-09）。只覆盖已提交内容；未提交改动不收录。
+
 本仓库是「视觉控制小车」协作工程的**容器仓库**，把三块独立开发的子工程收拢到同一仓库：
 
 | 目录 | 角色 | 硬件 / 技术栈 | 权威文档 |
 |---|---|---|---|
-| `Stm32-Vision/` | 视觉/控制大脑板（采集画面→AI→转发指令→解析状态） | ESP32-S3-CAM（N16R8，板载 OV2640）· Arduino（esp32 3.3.x） | [`Stm32-Vision/CLAUDE.md`](Stm32-Vision/CLAUDE.md) |
+| `Stm32-Vision/` | 视觉/控制大脑板（采集画面→AI→转发指令→解析状态） | ESP32-S3-CAM（N16R8，现装 OV3660）· Arduino（esp32 3.3.x） | [`Stm32-Vision/CLAUDE.md`](Stm32-Vision/CLAUDE.md) |
 | `Stm32-Executor/` | 执行板（只执行：驱动阿克曼小车 + 机械臂，回传状态） | STM32F103C8T6 · Keil MDK + 标准外设库 | [`Stm32-Executor/CLAUDE.md`](Stm32-Executor/CLAUDE.md) |
 | `Mobile-RemoteCtrl/` | 手机遥控 App（图传/摇杆/指令/配网，词表源） | Android · Godot 4.7.1 mono + GDScript | [`Mobile-RemoteCtrl/CLAUDE.md`](Mobile-RemoteCtrl/CLAUDE.md) |
 
@@ -12,33 +14,11 @@
 
 ## 一句话架构与数据流
 
-手机经 BLE 给大脑板配网（广播名 `VisionS3`）；连上后走 WiFi，WebSocket（端口 81）做图传（二进制 JPEG）与指令/消息（文本 JSON）；大脑板把指令翻译成 UART 帧发给执行板；执行板驱动电机/舵机并周期回传状态帧，大脑板（或 App）据此闭环。
-
-```
-┌──────────────────┐   BLE 配网 / 兜底控制（GATT VisionS3）
-│   手机 App         │ ◀────────────────────────────────────┐
-│ Mobile-RemoteCtrl │   WiFi WebSocket：图传 JPEG / 指令(JSON)│
-│   (Godot/Android) │ ◀───────────────────────────────────▶ │
-└──────────────────┘                                        ▼
-                                                           ┌──────────────────────┐
-┌───────────────────────┐        (DIRECT 目标下发)          │  视觉大脑板 Stm32-Vision│
-│ 云端多模态 AI（桩/未接）  │                                 │   ESP32-S3-CAM N16R8   │
-│   DeepSeek V4 Flash    │ ──── ai_goal 目标/文字 ─────────▶│   OV2640 / AI 桩/命令分发│
-└───────────────────────┘                                 └──────────┬───────────┘
-                                                                     │ UART 帧 115200
-                                                                     │ AA 55 LEN DEV CMD [PAYLOAD] CRC16
-                                                                     ▼
-                                            ┌──────────────────────────────┐
-                                            │  执行板 Stm32-Executor          │
-                                            │  STM32F103C8T6 · 5ms 主调度     │
-                                            │  阿克曼底盘(电机+编码器+转向舵机)   │
-                                            │  机械臂(3×舵机) · 哪吒扩展板驱动    │
-                                            └──────────────────────────────┘
-```
+手机经 BLE 给大脑板配网（广播名 `VisionS3`）；连上后走 WiFi，WebSocket（端口 81）承载指令/状态/消息（文本 JSON），JPEG 图传帧改走 UDP；大脑板把指令翻译成 UART 帧发给执行板；执行板驱动电机/舵机并周期回传状态帧，大脑板（或 App）据此闭环。
 
 - **大脑板是「视觉/控制大脑」，不是执行板**；执行板只认帧、**不经手词表 JSON**。
 - **词表 JSON 只由手机 App 持有**；`词表 → UART 帧` 的翻译在大脑板 `Stm32-Vision/uart` 一侧。
-- 当前状态：大脑板 `ai_client`（板载多模态 AI 调用）**未实现**，`ai_goal` 为桩回复；手机/云端 AI 两侧均为桩。BLE 配网、WS 图传、UART 帧链路已接通。
+- 当前状态：大脑板 `ai_client` 已实现 DIRECT 板载 AI（板子直调云端多模态模型，任务级迭代闭环），`ai_goal` 真实触发；BLE 配网、WS 指令/UDP 图传、UART 帧链路均已接通；手机端云端 AI（`AIClient.gd`）仍为桩（DIRECT 不经过手机侧）。
 
 ## 各子工程文件索引（简）
 
@@ -54,10 +34,10 @@
 | `config(.h/.cpp)` | WiFi / AI 接口 / `uart_baud` 参数，NVS 持久化 |
 | `wifi_net(.h/.cpp)` | STA 连接 + 断线重连（namespace `net`，勿改回 `network`） |
 | `uart(.h/.cpp)` | 执行板串口帧协议（`AA 55 LEN DEV CMD PAYLOAD CRC16`）+ 词表→帧翻译 |
-| `command(.h/.cpp)` | 统一词表 JSON 分发（与传输解耦）；`ai_goal` 现为桩 |
+| `command(.h/.cpp)` | 统一词表 JSON 分发（与传输解耦）；`ai_goal` 触发 `ai::set_goal` 闭环 |
 | `ble(.h/.cpp)` | BLE GATT Server：配网 + 兜底控制 + status 通知（广播名 VisionS3） |
-| `app_httpd.cpp` | HTTP（MJPEG/拍照/LED）+ WS（端口 81）；已接入 command/ble |
-| `ai_client(.h/.cpp)` | 板载多模态 AI HTTP 调用（❌ 未实现） |
+| `app_httpd.cpp` | HTTP（MJPEG/拍照/LED）+ WS（端口 81 文本 JSON）+ UDP 图传帧推送；已接入 command/ble |
+| `ai_client(.h/.cpp)` | 板载多模态 AI（DIRECT 直调云端，任务级闭环：move/arm/stop/wait、双帧运动感知、PSRAM 分配 + keep-alive TLS） |
 | `partitions.csv` | 分区表（3MB APP，需 `huge_app`） |
 
 ### Stm32-Executor/ — 执行板（Keil 工程）
@@ -76,16 +56,18 @@
 
 ### Mobile-RemoteCtrl/ — 手机遥控 App（Godot 工程）
 
-三通道通信（BLE 配网/兜底、WiFi WS 图传+指令、云端 AI 桩）；`CommandProto` 为唯一命令词表。详见其 [CLAUDE.md](Mobile-RemoteCtrl/CLAUDE.md) 的「目录结构」。
+通信：BLE 配网/兜底控制、WiFi WS 指令/状态（文本 JSON）+ UDP 图传（连接策略统一收口 `net/DeviceConn.gd`）、云端 AI 桩；`CommandProto` 为唯一命令词表。详见其 [CLAUDE.md](Mobile-RemoteCtrl/CLAUDE.md) 的「目录结构」。
 
 | 路径 | 内容 |
 |---|---|
 | `Main.tscn/.gd` | App 壳（统一聊天/指令入口、连接状态） |
 | `state/AppState.gd` (+LocalStore) | autoload 全局状态 + send_command 统一出口 |
 | `net/proto/CommandProto.gd` | **统一命令词表**（static） |
-| `net/ws/WSCarClient.gd` | WebSocket 客户端（真实现） |
+| `net/DeviceConn.gd` | **统一连接层**：自建并持有 BLE/WS/UDP，收敛状态与重连策略（单一事实源；Main/AppState 只订阅其信号） |
+| `net/ws/WSCarClient.gd` | WS 传输（端口 81 文本 JSON：指令/状态/snapshot 单帧；视频已走 UDP） |
 | `net/ble/BLEClient.gd` + `BleProfile.gd` | BLE GATT 客户端；协议常量表（与大脑板 ble.cpp **逐字 mirror**） |
-| `net/ai/AIClient.gd` | 云端 AI 桩（未接） |
+| `net/video/UDPVideoClient.gd` | UDP 图传接收（JPEG 分片重组 → 上抛 frame_received） |
+| `net/ai/AIClient.gd` | 云端 AI 桩（DIRECT 不经手机侧） |
 | `ui/` | 摇杆 / 图传 / 图片标注 / 配网弹窗 |
 | `addons/gdble*` | GDBLE 蓝牙运行时（含导出插件） |
 
@@ -107,6 +89,6 @@
 
 ## 仓库级约定
 
-- 交流用中文；注释精简、不在注释里写死魔法数值（收敛到头文件顶部宏）。
 - 本仓库不配置顶层构建；编译/烧录入口分散：大脑板走 Arduino IDE/arduino-cli，执行板走 Keil MDK，App 走 Godot headless 导出。**不主动跑编译/烧录验证**（耗时无谓），默认交给用户在其 IDE 中做。
-- Git：代码提交由用户操作（全局规则），助手可查看与撤回，若用户要求提交，请在提交消息中注意区分涉及部分，如(Vision/Mobile/Executor)，具体可见历史提交
+- Git：代码提交由用户操作（全局规则），助手可查看与撤回，若用户要求提交，请在提交消息中注意区分涉及部分，如(Vision/Mobile/Executor)，具体可见历史提交。推送时若发现需要先pull，尽量尝试使用git pull --rebase
+- 文档维护：每份 `CLAUDE.md` 顶部标注「本文档基准：仓库 HEAD `<短hash>`（日期）」= 该文档对应的代码基准；更新文档前先基于该 hash `git diff` 检查，规则见全局 CLAUDE「CLAUDE.md 维护约定」

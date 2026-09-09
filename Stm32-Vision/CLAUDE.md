@@ -1,16 +1,18 @@
 # CLAUDE.md
 
-本文件为当前项目（ESP32-S3-CAM / OV2640 摄像头板）的 AI 助手工作指南。
+> 本文档基准：仓库 HEAD `07aa659`（2026-09-09）。只覆盖已提交内容；未提交改动不收录。
+
+本文件为当前项目（ESP32-S3-CAM / OV3660 摄像头板）的 AI 助手工作指南。
 
 ## 项目概述
 
-基于经典 ESP32-CAM（AI-Thinker 板，ESP32 + OV2640，带 PSRAM）的视觉控制板。板子采集画面，交给多模态大模型（DeepSeek V4 Flash）识别，生成小车与机械臂的控制指令，通过串口（UART）转发给对应的执行板。
+基于 **ESP32-S3-CAM（N16R8，带 PSRAM）** 的视觉控制板。板子采集画面，交给多模态大模型（DeepSeek V4 Flash）识别，生成小车与机械臂的控制指令，通过串口（UART）转发给对应的执行板。
 
 ### 工作模式
 
-1. **WiFi 直连 AI 模式**：板子经 WiFi 直调多模态 AI 接口，上传画面 → 解析返回控制指令 → UART 转发执行板。⚠️ 板载 AI 客户端（`ai_client`）尚未实现。
-2. **蓝牙配置模式**：BLE（GATT Server，广播名 VisionS3）接收配置（WiFi 账号密码 / AI 接口等）→ 存 NVS → **在线重建 STA 生效，不整板重启**（BLE 保活，手机无需重连）。✅ 已实现。**生命周期**：手机在 WS 连上后断开本机 BLE 让出射频（WS_ONLY）；WS 就绪时板端 `ble::set_ws_connected` 停广播、断开时恢复可发现（`onDisconnect` 尊重 WS 状态再决定是否恢复）。
-3. **手机中转模式（已弃用）**：App 中转调 AI 的 RELAY 已在手机端移除（2026-09）。现行 **DIRECT**：手机只下发 `ai_goal` 目标文本/区域 → 板子执行并回 status；云端 AI 两侧现均为桩。
+1. **WiFi 直连 AI 模式**：板子经 WiFi 直调多模态 AI 接口，上传画面 → 解析返回控制指令 → UART 转发执行板。✅ 已实现（DIRECT：`ai_goal` → `ai_client` 迭代闭环，真机联调中）。
+2. **蓝牙配置模式**：BLE（GATT Server，广播名 VisionS3）接收配置（WiFi 账号密码 / AI 接口等）→ 存 NVS → **在线重建 STA 生效，不整板重启**（BLE 保活，手机无需重连）。✅ 已实现。**生命周期**：手机在 WS 连上后断开本机 BLE 让出射频（WS_ONLY）；广播开关由 `ble::set_transmission` 统一控制——仅当**真在推帧**（UDP 图传 / MJPEG）时停广播让 WiFi 独占射频；WS 指令/状态通道在位时不关广播，保持可发现（手机随时可重连/兜底，`onDisconnect` 尊重该状态）。
+3. **手机中转模式（已弃用）**：App 中转调 AI 的 RELAY 已在手机端移除（2026-09）。现行 **DIRECT**：手机只下发 `ai_goal` 目标文本/区域 → 板子 `ai_client` 直调云端 AI 执行闭环并回 `ai_result`；手机端云端 AI（`AIClient.gd`）仍为桩（DIRECT 不经手机侧）。
 
 ### 执行板
 
@@ -23,15 +25,16 @@
 | 文件 | 作用 |
 | --- | --- |
 | `Stm32-Vision.ino` | 入口：setup 按 cfg→ble→uart→cam→net→web 初始化；loop 调各模块 update |
-| `camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`；画质参数（分辨率/JPEG 质量）集中在 `camera.cpp` `init()` 顶部，WS 推流帧率在 `app_httpd.cpp` `WS_STREAM_FPS` |
+| `camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`；画质参数（分辨率/JPEG 质量）集中在 `camera.cpp` `init()` 顶部，推流帧率在 `app_httpd.cpp`（`WS_STREAM_FPS`，图传走 UDP） |
 | `camera_pins.h` | 各摄像头型号 GPIO 引脚定义（按 `CAMERA_MODEL_*` 分支） |
 | `camera_index.h` | Web 前端页面（HTML/JS 内嵌数组，源自例程，现基本不用） |
 | `config.h/.cpp` | WiFi / AI 接口 / `uart_baud` 参数配置，NVS 持久化（不再写死 ssid/password） |
 | `wifi_net.h/.cpp` | STA 连接 + 断线重连 + 在线换网 `net::reconnect`（namespace `net`）。⚠️ 勿改回 `network`：会与核心库 `Network.h` 在 Windows 大小写不敏感 FS 上遮蔽冲突 |
 | `uart.h/.cpp` | 执行板串口帧协议（`AA 55 LEN DEV CMD PAYLOAD CRC16`）+ 词表→帧翻译 |
-| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；`apply_network` 在线换网生效；`ai_goal` 现为桩回复 |
-| `ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知；WS 就绪时停广播（UUID 见下「协议参考」）|
-| `app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令 JSON、二进制=JPEG），已接入 `command`/`ble`。人脸检测/识别已停用（宏置 0） |
+| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal` 触发板载 AI |
+| `ai_client.h/.cpp` | 板载多模态 AI HTTP 调用（DIRECT 直调云端，任务级闭环：move/arm/stop/wait、双帧运动感知、PSRAM 分配 + keep-alive TLS） |
+| `ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知；广播开关随 `set_transmission`（真在推帧即停）（UUID 见下「协议参考」）|
+| `app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送，已接入 `command`/`ble`。人脸检测/识别已停用（宏置 0） |
 | `partitions.csv` | 分区表：app0 约 3.8MB，需选带 3MB+ APP 空间的开发板分区选项 |
 
 ## 构建要点
@@ -41,9 +44,11 @@
   - LEDC 引脚式：`ledcAttach(pin, freq, res)` / `ledcWrite(pin, duty)`（`ledcSetup/ledcAttachPin` 及 channel 式调用已移除）
   - BLE：`getValue()` 返回 Arduino `String`；无 `getNotifyProperty`；发射功率枚举为 `ESP_PWR_LVL_P9`
   - WS 无 `httpd_ws_client_iterate` → 用 `httpd_get_client_list` + `httpd_ws_get_fd_info` 过滤 `HTTPD_WS_CLIENT_WEBSOCKET`
-- 命令行验证（**须与 IDE 板子菜单选项逐字一致**，不同则缓存不共享、来回全量重编）：
-  `arduino-cli compile --fqbn "esp32:esp32s3:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=huge_app,DebugLevel=none,EraseFlash=none" .`
-  （arduino-cli 位于 `D:\Program Files\Arduino IDE\resources\app\lib\backend\resources`，即 IDE 内置同版、缓存目录同源。）
+- 命令行验证
+  当前已核准的 IDE 板子配置的对应 fqbn：
+  `arduino-cli compile --fqbn "esp32:esp32s3:esp32s3:FlashSize=16M,FlashMode=dio,PartitionScheme=huge_app,DebugLevel=debug,PSRAM=opi,EraseFlash=none" .`
+  （arduino-cli 位于 `D:\Program Files\Arduino IDE\resources\app\lib\backend\resources`，即 IDE 内置同版、缓存目录同源。若某次 IDE 把 DebugLevel 调回 none/其它，命令行同步改回，避免不共享缓存。）
+- ⚠️ mbedTLS 握手内存优化依赖自定义核心库：`Arduino15\packages\esp32\tools\esp32s3-libs\3.3.11` 已被按 IDF `defconfig` `CONFIG_MBEDTLS_SSL_IN/OUT_CONTENT_LEN=8192` 重编替换，以规避内部堆碎片导致的 TLS 握手失败（`-32512`/`-17040`）；替换时勿用官方同名库覆盖。
 - ⚠️ 实测：即使 fqbn 完全一致，**IDE 验证 ↔ 命令行切换仍常各自全量重编**（esp32 core 整包重编，5–10 分钟）；想省时间就让「主编译入口」固定在一侧，别频繁来回。**改/增/删源文件后首次编译若报多定义或「多个文件 -o」错，删 `C:\Users\Yang\AppData\Local\arduino\sketches\` 下本 sketch 缓存目录再编**。
 - 依赖库：**ArduinoJson v7（Benoit Blanchon）**，装在用户 sketchbook `D:\Documents\Arduino\libraries\ArduinoJson`。⚠️ sketch 内 `libraries/ArduinoJson` 子目录 **Arduino 不会自动扫描**，属冗余副本，勿依赖（可删）。
 - 分区：**PartitionScheme=huge_app**（3MB APP、无 OTA），已含在上方完整 fqbn 内；真机烧录同此方案。依赖库与编译缓存目录同 IDE（`%LOCALAPPDATA%\arduino\sketches\<sketch哈希>\`）。
@@ -52,10 +57,10 @@
 
 目标板为 **ESP32-S3-CAM**（esp32:esp32s3:esp32s3 + 16M flash / opi psram + huge_app；此前误用的 esp32cam 固件已弃用，勿烧）。换装 **OV3660** 后相机与图传已**真机联调正常**：
 
-- `camera` ✅ 真机验证：OV3660 识别正常（默认倒置/饱和偏高已在 init 回正），JPEG 抓帧与 WS 图传工作
-- `config` / `wifi_net` / `ble` ✅ 真机可用：BLE 配网、WS 图传链路已联调
+- `camera` ✅ 真机验证：OV3660 识别正常（默认倒置/饱和偏高已在 init 回正），JPEG 抓帧与 UDP 图传工作
+- `config` / `wifi_net` / `ble` ✅ 真机可用：BLE 配网、图传链路已联调
 - `uart` / `command` / `app_httpd`（web_server）✅ 编译通过（帧/词表语义以架构文档为准）
-- `ai_client`（板载多模态 AI HTTP 调用）❌ **未做**；`ai_goal` 仍为 command.cpp 桩回复
+- `ai_client`（板载多模态 AI HTTP 调用）✅ 已实现（DIRECT 直调云端，任务级闭环；含 wait/双帧运动感知/PSRAM 分配/keep-alive，真机联调中）
 
 > 待联调项：
 > ② arm 词表 `duration_ms` 按 `dist_cm` 判定（UI 现发 0）；
