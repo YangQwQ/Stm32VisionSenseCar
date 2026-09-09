@@ -38,6 +38,7 @@ struct TaskLocal {
   char* text = nullptr;   // 目标文本（堆）
   char* ann = nullptr;    // 标注 JSON 或 {x,y,w,h,label}（堆）
   bool use_image = false;
+  bool one_shot = false;  // 单轮模式：只执行一轮决策即收尾（/ai oneshot）
   long id = 0;            // 对应 ai_goal 的词表 id（回填 ai_result）
   unsigned long generation = 0;
   cmd::ReplyFn fn = nullptr;
@@ -876,6 +877,18 @@ static void ai_worker(void*) {
       }
 
       if (done) break;
+      // 单轮模式（/ai oneshot）：一轮决策即收尾。本轮无有效输出（网络/解码/校验失败）
+      // 时把原因作为 error 回报，不跳 3s 继续观察；持续指令残留由任务出口 resolve_stop 补停。
+      if (t.one_shot) {
+        if (!got && fail) {
+          JsonDocument e(&g_js_alloc);
+          e["error"] = fail;
+          String s = build_feedback(t.id, e);
+          enqueue_result(s.c_str(), t.fn, t.ctx);
+        }
+        done = true;
+        break;
+      }
       if (!got) {
         // 本轮无有效输出（网络/解码/校验瞬态失败）：不终结任务，跳过本轮继续观察，
         // 由 AI 输出 stop(done) / 手动中断 / 步骤上限收尾。多等 3s 给瞬态错误
@@ -918,7 +931,7 @@ void ai::init() {
 }
 
 void ai::set_goal(const char* text, bool use_image, const char* annotation, long id,
-                  cmd::ReplyFn reply, void* reply_ctx) {
+                  cmd::ReplyFn reply, void* reply_ctx, bool one_shot) {
   xSemaphoreTake(g_mtx, portMAX_DELAY);
   ++m_generation;
   // 替换旧槽（旧字符串为空因 worker 已取走；残余则释放）
@@ -928,6 +941,7 @@ void ai::set_goal(const char* text, bool use_image, const char* annotation, long
   g_slot.text = strdup(text ? text : "");
   g_slot.ann = (annotation && annotation[0]) ? strdup(annotation) : nullptr;
   g_slot.use_image = use_image;
+  g_slot.one_shot = one_shot;
   g_slot.id = id;
   g_slot.generation = m_generation;
   g_slot.fn = reply;

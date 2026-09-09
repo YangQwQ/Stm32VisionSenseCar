@@ -239,7 +239,7 @@ static void ws_cmd_reply(void *ctx, const char *text)
     ws_send_text(fd, text);
 }
 
-// 文本帧 = 指令 JSON；snapshot/ping 就地处理，其余类型统一移交 command 模块
+// 文本帧 = 指令 JSON；stream 就地建/拆 UDP 会话，其余统一移交 command 模块
 static void ws_handle_text(const char *json, int fd)
 {
     JsonDocument doc;
@@ -249,58 +249,48 @@ static void ws_handle_text(const char *json, int fd)
     }
     const char *type = doc["type"] | "";
 
-    if (!strcmp(type, "snapshot")) {
-        camera_fb_t *fb = cam::grab();
-        if (fb) {
-            ws_send_jpeg(fd, fb);
-            cam::return_frame(fb);
-        }
-    } else if (!strcmp(type, "ping")) {
-        // 连通性测试：回 pong（手动 /ping 触发，无周期心跳）。
-        ws_send_text(fd, "{\"type\":\"pong\"}");
-    } else {
-        // UDP 图传握手：stream on 且携带有效 udp_port → 结合 WS 对端 IP 建立 UDP 会话；
-        // 其余（on 无有效端口 / off）→ 拆除旧会话，避免向已失效端口空推。
-        if (!strcmp(type, "stream")) {
-            bool on = doc["params"]["on"] | false;
-            int port = doc["params"]["udp_port"] | 0;
-            const char *src_ip = doc["params"]["src_ip"] | "";
-            Serial.printf("[udp] stream on=%d port=%d src_ip=%s\n", on, port, src_ip);
-            if (on && port > 0) {
-                struct sockaddr_in src;
-                socklen_t sl = sizeof(src);
-                uint32_t peer_ip = 0;
-                // 优先采用手机上报的本机 IP（实测 lwip_getpeername 对 httpd fd 回 0.0.0.0，不可靠）
-                if (src_ip[0]) {
-                    uint32_t a = 0, b = 0, c = 0, d = 0;
-                    if (sscanf(src_ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
-                        peer_ip = a | (b << 8) | (c << 16) | ((uint32_t)d << 24);  // 首字节在低址 = 网络字节序
-                    else
-                        peer_ip = 0;
-                }
-                if (peer_ip) {
-                    udp_peer_set(peer_ip, (uint16_t)port);
-                } else if (lwip_getpeername(fd, (struct sockaddr *)&src, &sl) == 0) {
-                    udp_peer_set(src.sin_addr.s_addr, (uint16_t)port);
-                }
-                Serial.printf("[udp] peer set -> %u.%u.%u.%u:%d\n",
-                              (uint8_t)(peer_ip), (uint8_t)(peer_ip >> 8),
-                              (uint8_t)(peer_ip >> 16), (uint8_t)(peer_ip >> 24), port);
-            } else {
-                udp_peer_clear();
-                Serial.printf("[udp] peer cleared (on=%d port=%d)\n", on, port);
+    // UDP 图传握手：stream on 且携带有效 udp_port → 结合 WS 对端 IP 建立 UDP 会话；
+    // 其余（on 无有效端口 / off）→ 拆除旧会话，避免向已失效端口空推。
+    if (!strcmp(type, "stream")) {
+        bool on = doc["params"]["on"] | false;
+        int port = doc["params"]["udp_port"] | 0;
+        const char *src_ip = doc["params"]["src_ip"] | "";
+        Serial.printf("[udp] stream on=%d port=%d src_ip=%s\n", on, port, src_ip);
+        if (on && port > 0) {
+            struct sockaddr_in src;
+            socklen_t sl = sizeof(src);
+            uint32_t peer_ip = 0;
+            // 优先采用手机上报的本机 IP（实测 lwip_getpeername 对 httpd fd 回 0.0.0.0，不可靠）
+            if (src_ip[0]) {
+                uint32_t a = 0, b = 0, c = 0, d = 0;
+                if (sscanf(src_ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
+                    peer_ip = a | (b << 8) | (c << 16) | ((uint32_t)d << 24);  // 首字节在低址 = 网络字节序
+                else
+                    peer_ip = 0;
             }
+            if (peer_ip) {
+                udp_peer_set(peer_ip, (uint16_t)port);
+            } else if (lwip_getpeername(fd, (struct sockaddr *)&src, &sl) == 0) {
+                udp_peer_set(src.sin_addr.s_addr, (uint16_t)port);
+            }
+            Serial.printf("[udp] peer set -> %u.%u.%u.%u:%d\n",
+                          (uint8_t)(peer_ip), (uint8_t)(peer_ip >> 8),
+                          (uint8_t)(peer_ip >> 16), (uint8_t)(peer_ip >> 24), port);
+        } else {
+            udp_peer_clear();
+            Serial.printf("[udp] peer cleared (on=%d port=%d)\n", on, port);
         }
-        // 统一词表：move/stop/arm/config/stream/ai_goal/ai_cancel 等交给 command
-        // （stream 由 command 更新全局图传开关；ai_goal 异步结果回传）。
-        // 摇杆高频帧同指令连续重复时只记首条，避免刷屏；换指令再记。
-        static String s_last_cmd;
-        if (s_last_cmd != type) {
-          log_i("[ws] forward to cmd: %s", type);
-          s_last_cmd = type;
-        }
-        cmd::handle(json, true, ws_cmd_reply, &fd);
     }
+    // 统一词表：move/stop/arm/config/stream/ai_goal/ai_cancel 等交给 command
+    // （stream 由 command 更新全局图传开关；ai_goal 异步结果回传）。
+    // 摇杆高频帧同指令连续重复时只记首条，避免刷屏；换指令再记。
+    // has_frames=false：图传已走 UDP，WS 文本帧不内嵌 JPEG（该参数仅用于日志）。
+    static String s_last_cmd;
+    if (s_last_cmd != type) {
+        log_i("[ws] forward to cmd: %s", type);
+        s_last_cmd = type;
+    }
+    cmd::handle(json, false, ws_cmd_reply, &fd);
 }
 
 static esp_err_t ws_handler(httpd_req_t *req)

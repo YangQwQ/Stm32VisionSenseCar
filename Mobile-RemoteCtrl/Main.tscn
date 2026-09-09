@@ -3,8 +3,10 @@
 [ext_resource type="Script" uid="uid://d1tmutexp2vuy" path="res://Main.gd" id="1_main"]
 [ext_resource type="Texture2D" uid="uid://dcyjjrs18hhhd" path="res://res/bg.jpg" id="2_trn2v"]
 [ext_resource type="Texture2D" uid="uid://bx6teaav65tma" path="res://res/scan_devices.png" id="5_j4qnp"]
+[ext_resource type="Script" uid="uid://ccoaatpwj6ivp" path="res://ui/chat/ChatPanel.gd" id="5_kjvhd"]
 [ext_resource type="Script" uid="uid://c7y01patjmc1s" path="res://ui/video/VideoView.gd" id="5_trn2v"]
 [ext_resource type="Script" uid="uid://dmgue5hwo2dt3" path="res://ui/control/DirectControl.gd" id="6_03owx"]
+[ext_resource type="Texture2D" uid="uid://cojg54jdu10rk" path="res://res/delete.png" id="6_sc1dx"]
 [ext_resource type="Texture2D" uid="uid://btk412diyh6ht" path="res://res/device.png" id="7_20pc6"]
 [ext_resource type="Texture2D" uid="uid://bvs2gus24nc05" path="res://res/device_a.png" id="7_c2ibq"]
 [ext_resource type="FontFile" uid="uid://cj1s2ldyof8o4" path="res://res/MapleMono-NF-CN-Regular.ttf" id="7_fpfj3"]
@@ -247,9 +249,55 @@ shadow_color = Color(0, 0, 0, 0.3)
 shadow_size = 6
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_o6qdn"]
-content_margin_left = 10.0
-content_margin_top = 10.0
 bg_color = Color(0, 0, 0, 0.54901963)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_vi5kq"]
+content_margin_left = 0.0
+content_margin_top = 0.0
+content_margin_right = 0.0
+content_margin_bottom = 0.0
+bg_color = Color(1, 1, 1, 1)
+corner_radius_top_left = 25
+corner_radius_top_right = 25
+corner_radius_bottom_right = 25
+corner_radius_bottom_left = 25
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_5mkgo"]
+content_margin_left = 15.0
+content_margin_top = 12.0
+content_margin_right = 12.0
+content_margin_bottom = 15.0
+bg_color = Color(0.83137256, 0.13725491, 0.12156863, 0.9098039)
+corner_radius_bottom_left = 35
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_3ccbu"]
+content_margin_left = 15.0
+content_margin_top = 12.0
+content_margin_right = 12.0
+content_margin_bottom = 15.0
+bg_color = Color(0.4793434, 0.054537505, 0.047085457, 0.9098039)
+corner_radius_bottom_left = 35
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_ny7u2"]
+content_margin_left = 15.0
+content_margin_top = 12.0
+content_margin_right = 12.0
+content_margin_bottom = 15.0
+bg_color = Color(0.83137256, 0.13725491, 0.12156863, 0.9098039)
+corner_radius_bottom_left = 35
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_x3yn0"]
+content_margin_left = 15.0
+content_margin_top = 12.0
+content_margin_right = 12.0
+content_margin_bottom = 15.0
+bg_color = Color(0.4793434, 0.054537505, 0.047085457, 0.9098039)
+corner_radius_bottom_left = 35
+corner_detail = 5
 
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3y6u5"]
 
@@ -830,6 +878,7 @@ custom_minimum_size = Vector2(0, 200)
 layout_mode = 2
 size_flags_vertical = 3
 theme_override_constants/separation = 8
+script = ExtResource("5_kjvhd")
 
 [node name="ChatLog" type="RichTextLabel" parent="BodyControl/ChatPanel" unique_id=590147692]
 layout_mode = 2
@@ -839,19 +888,147 @@ theme_override_styles/normal = SubResource("StyleBox_panel")
 bbcode_enabled = true
 scroll_following = true
 
-[node name="CommandHint" type="Label" parent="BodyControl/ChatPanel/ChatLog" unique_id=1043703248]
+[node name="BottomPanl" type="TabContainer" parent="BodyControl/ChatPanel/ChatLog" unique_id=1726379680]
 visible = false
 layout_mode = 1
-anchors_preset = -1
+anchors_preset = 12
 anchor_top = 1.0
 anchor_right = 1.0
 anchor_bottom = 1.0
+offset_top = -43.0
 grow_horizontal = 2
 grow_vertical = 0
+theme_override_styles/panel = SubResource("StyleBoxFlat_o6qdn")
+current_tab = 0
+tabs_visible = false
+
+[node name="CommandHint" type="Label" parent="BodyControl/ChatPanel/ChatLog/BottomPanl" unique_id=1043703248]
+layout_mode = 2
 theme_override_colors/font_color = Color(0.6, 0.76, 0.94, 1)
 theme_override_fonts/font = ExtResource("7_fpfj3")
 theme_override_font_sizes/font_size = 32
-theme_override_styles/normal = SubResource("StyleBoxFlat_o6qdn")
+metadata/_tab_index = 0
+
+[node name="ImageList" type="HBoxContainer" parent="BodyControl/ChatPanel/ChatLog/BottomPanl" unique_id=709334818]
+visible = false
+custom_minimum_size = Vector2(0, 300)
+layout_mode = 2
+theme_override_constants/separation = 25
+metadata/_tab_index = 1
+
+[node name="Image1" type="Panel" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList" unique_id=2042593161]
+visible = false
+clip_children = 1
+custom_minimum_size = Vector2(250, 250)
+layout_mode = 2
+size_flags_vertical = 4
+theme_override_styles/panel = SubResource("StyleBoxFlat_vi5kq")
+
+[node name="img" type="TextureRect" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList/Image1" unique_id=774260400]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+expand_mode = 1
+stretch_mode = 6
+
+[node name="delBtn" type="Button" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList/Image1" unique_id=1340685554]
+custom_minimum_size = Vector2(70, 70)
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -70.0
+offset_bottom = 70.0
+grow_horizontal = 0
+focus_mode = 0
+theme_override_colors/icon_pressed_color = Color(0.556953, 0.556953, 0.556953, 1)
+theme_override_colors/icon_hover_color = Color(0.74978, 0.74978, 0.7497799, 1)
+theme_override_styles/normal = SubResource("StyleBoxFlat_5mkgo")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_3ccbu")
+theme_override_styles/hover = SubResource("StyleBoxFlat_ny7u2")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_x3yn0")
+icon = ExtResource("6_sc1dx")
+icon_alignment = 1
+expand_icon = true
+
+[node name="Image2" type="Panel" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList" unique_id=1648899434]
+visible = false
+clip_children = 1
+custom_minimum_size = Vector2(250, 250)
+layout_mode = 2
+size_flags_vertical = 4
+theme_override_styles/panel = SubResource("StyleBoxFlat_vi5kq")
+
+[node name="img" type="TextureRect" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList/Image2" unique_id=1333438418]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+expand_mode = 1
+stretch_mode = 6
+
+[node name="delBtn" type="Button" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList/Image2" unique_id=468867659]
+custom_minimum_size = Vector2(70, 70)
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -70.0
+offset_bottom = 70.0
+grow_horizontal = 0
+focus_mode = 0
+theme_override_colors/icon_pressed_color = Color(0.556953, 0.556953, 0.556953, 1)
+theme_override_colors/icon_hover_color = Color(0.74978, 0.74978, 0.7497799, 1)
+theme_override_styles/normal = SubResource("StyleBoxFlat_5mkgo")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_3ccbu")
+theme_override_styles/hover = SubResource("StyleBoxFlat_ny7u2")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_x3yn0")
+icon = ExtResource("6_sc1dx")
+icon_alignment = 1
+expand_icon = true
+
+[node name="Image3" type="Panel" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList" unique_id=522547216]
+visible = false
+clip_children = 1
+custom_minimum_size = Vector2(250, 250)
+layout_mode = 2
+size_flags_vertical = 4
+theme_override_styles/panel = SubResource("StyleBoxFlat_vi5kq")
+
+[node name="img" type="TextureRect" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList/Image3" unique_id=1841328095]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+expand_mode = 1
+stretch_mode = 6
+
+[node name="delBtn" type="Button" parent="BodyControl/ChatPanel/ChatLog/BottomPanl/ImageList/Image3" unique_id=1274338496]
+custom_minimum_size = Vector2(70, 70)
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -70.0
+offset_bottom = 70.0
+grow_horizontal = 0
+focus_mode = 0
+theme_override_colors/icon_pressed_color = Color(0.556953, 0.556953, 0.556953, 1)
+theme_override_colors/icon_hover_color = Color(0.74978, 0.74978, 0.7497799, 1)
+theme_override_styles/normal = SubResource("StyleBoxFlat_5mkgo")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_3ccbu")
+theme_override_styles/hover = SubResource("StyleBoxFlat_ny7u2")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_x3yn0")
+icon = ExtResource("6_sc1dx")
+icon_alignment = 1
+expand_icon = true
 
 [node name="InputRow" type="HBoxContainer" parent="BodyControl/ChatPanel" unique_id=1129907710]
 layout_mode = 2
@@ -1261,9 +1438,10 @@ layout_mode = 1
 [connection signal="toggled" from="BodyBTScan/RefreshBtn" to="." method="_on_refresh_toggled"]
 [connection signal="toggled" from="BodyControl/VidControls/StreamToggle" to="." method="_on_stream_toggled"]
 [connection signal="pressed" from="BodyControl/VidControls/AnnotateBtn" to="." method="_on_annotate_pressed"]
-[connection signal="text_changed" from="BodyControl/ChatPanel/InputRow/MessageInput" to="." method="_on_input_text_changed"]
-[connection signal="text_submitted" from="BodyControl/ChatPanel/InputRow/MessageInput" to="." method="_on_send_pressed"]
-[connection signal="pressed" from="BodyControl/ChatPanel/InputRow/SendBtn" to="." method="_on_send_pressed"]
+[connection signal="text_changed" from="BodyControl/ChatPanel/InputRow/MessageInput" to="BodyControl/ChatPanel" method="_on_input_text_changed"]
+[connection signal="text_submitted" from="BodyControl/ChatPanel/InputRow/MessageInput" to="BodyControl/ChatPanel" method="_on_send_pressed"]
+[connection signal="pressed" from="BodyControl/ChatPanel/InputRow/SendBtn" to="BodyControl/ChatPanel" method="_on_send_pressed"]
+[connection signal="stream_requested" from="BodyControl/ChatPanel" to="." method="_on_chat_stream_requested"]
 [connection signal="pressed" from="BodyControl/CtrlArea/Joystick" to="." method="_on_joystick_pressed"]
 [connection signal="released" from="BodyControl/CtrlArea/Joystick" to="." method="_on_joystick_release"]
 [connection signal="toggled" from="BodyAbout/Options/AutoConnOnStart" to="." method="_on_auto_conn_toggled"]
@@ -1272,4 +1450,4 @@ layout_mode = 1
 [connection signal="pressed" from="WifiPopup/VBox/Btns/Cancel" to="WifiPopup" method="_on_cancel_pressed"]
 [connection signal="pressed" from="WifiPopup/VBox/Btns/Confirm" to="WifiPopup" method="_on_confirm_pressed"]
 [connection signal="cancelled" from="ImageEditor" to="." method="_on_editor_cancelled"]
-[connection signal="image_sent" from="ImageEditor" to="." method="_on_image_sent"]
+[connection signal="image_sent" from="ImageEditor" to="BodyControl/ChatPanel" method="_on_image_sent"]

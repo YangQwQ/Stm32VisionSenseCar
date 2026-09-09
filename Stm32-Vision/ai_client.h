@@ -15,8 +15,9 @@ void update();                  // loop 中调用：排空结果队列（发送 
 // 下发新目标。id 为对应 ai_goal 的词表 id（回填 ai_result）。reply/reply_ctx 为
 // 结果回传通道（同 cmd::handle）；WS 来源的 reply_ctx 是堆拷贝后的 fd 指针（本模块
 // 持有并在任务结束时释放），BLE 为 nullptr。
+// one_shot=true：只执行一轮决策即收尾（/ai oneshot），区别于 ai_goal 的迭代闭环。
 void set_goal(const char* text, bool use_image, const char* annotation, long id,
-              cmd::ReplyFn reply, void* reply_ctx);
+              cmd::ReplyFn reply, void* reply_ctx, bool one_shot = false);
 
 // 中止任务的兜底 stop 模式：None=被用户指令接管（执行板已被新指令覆盖，不补发）；
 // Wheels=手动 arm 打断（只停轮子）；All=取消/任务终结（全停）。

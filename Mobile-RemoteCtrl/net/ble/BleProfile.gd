@@ -26,7 +26,7 @@ const ADVERT_NAME := "VisionS3"
 
 ## 兜底控制白名单：WS 掉线时这些词表指令允许经 BLE cmd 特征下发。
 ## 图传/ai_goal 需 WiFi（抓帧 + 云端 HTTP），不进白名单；ai_cancel 取消任务应离线可用。
-const FALLBACK_TYPES := ["move", "stop", "arm", "ping", "config", "stream", "snapshot", "ai_cancel"]
+const FALLBACK_TYPES := ["move", "stop", "arm", "ping", "config", "stream", "ai_cancel"]
 
 ## 16-bit 短值拼全量（小写输入，统一大写输出），如 uuid("c0e5")
 static func uuid(short: String) -> String:

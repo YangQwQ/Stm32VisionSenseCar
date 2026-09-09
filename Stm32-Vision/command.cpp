@@ -3,6 +3,7 @@
 #include "wifi_net.h"
 #include "uart.h"
 #include "ai_client.h"
+#include "ping_svc.h"
 
 // 应答格式遵循架构 §5.1：板 → 手机文本 = {type:status/pong, params:{...}, id:<回填>}。
 // move/stop/arm 是高频手动指令，只在 UART 层记录，不回文本（避免刷屏）。
@@ -90,7 +91,15 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   }
 
   if (!strcmp(type, "ping")) {
-    reply_pong(doc, reply, reply_ctx);
+    // 无 target = 测小车连通性（回 pong）；带 target（IP/域名）= 板子去 ping 并回报延迟。
+    const char* target = params["target"] | "";
+    if (target[0]) {
+      ping::start(target, 5, reply, reply_ctx);
+      String tip = "正在 ping " + String(target) + "…";
+      reply_status(doc, reply, reply_ctx, tip.c_str());
+    } else {
+      reply_pong(doc, reply, reply_ctx);
+    }
     return;
   }
 
@@ -114,24 +123,15 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
-  if (!strcmp(type, "snapshot")) {
-    // 抓帧需 WS 通道（带帧/权限）；BLE 无此能力，如实引导。
-    if (has_frames) {
-      Serial.printf("[cmd] snapshot 由 WS 层处理\n");
-    } else {
-      reply_status(doc, reply, reply_ctx, "截图需 WiFi（BLE 仅为兜底控制），请连上 WS 后使用");
-    }
-    return;
-  }
-
-  if (!strcmp(type, "ai_goal")) {
-    // DIRECT：手机下发目标 → 板载 ai_client 调 AI（迭代闭环，中途可被新目标/手动打断）。
+  if (!strcmp(type, "ai_goal") || !strcmp(type, "ai_oneshot")) {
+    // DIRECT：手机下发目标 → 板载 ai_client 调 AI。ai_goal=迭代闭环；ai_oneshot=只执行一轮收尾。
     if (cfg::ai_key().isEmpty()) {
       reply_status(doc, reply, reply_ctx, "AI 未配置（ai_key 为空），未调用云端");
       return;
     }
     const char* msg = params["message"] | "";
     bool use_image = params["use_image"] | false;
+    bool one_shot = !strcmp(type, "ai_oneshot");
 
     // 组标注字符串（供 AI 观察近似意图区域）
     String ann;
@@ -143,8 +143,8 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     void* actx = nullptr;
     if (reply_ctx) actx = new int(*(int*)reply_ctx);
     long id = has_id(doc) ? doc["id"].as<long>() : 0;
-    ai::set_goal(msg, use_image, ann.length() ? ann.c_str() : nullptr, id, reply, actx);
-    reply_status(doc, reply, reply_ctx, "已收到目标，AI 处理中");
+    ai::set_goal(msg, use_image, ann.length() ? ann.c_str() : nullptr, id, reply, actx, one_shot);
+    reply_status(doc, reply, reply_ctx, one_shot ? "已收到单轮 AI 目标" : "已收到目标，AI 处理中");
     return;
   }
 

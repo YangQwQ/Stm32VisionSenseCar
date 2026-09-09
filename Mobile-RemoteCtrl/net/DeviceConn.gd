@@ -73,8 +73,9 @@ func _ready() -> void:
 	_ws.text_received.connect(text_received.emit)
 	_ws.frame_received.connect(frame_received.emit)
 
-	# UDP 图传帧 → 统一 frame_received 上抛（Main 的 _on_frame 据此刷新画面）
-	_udp.frame_received.connect(frame_received.emit)
+	# UDP 图传帧 → 统一 frame_received 上抛（Main 的 _on_frame 据此刷新画面），
+	# 同时刷新 WS 断线探测计时：推流期间链路上持续有活跃，避免 WS 层误发 ping 探测。
+	_udp.frame_received.connect(_on_udp_frame)
 
 	add_child(_ble)
 	add_child(_ws)
@@ -258,6 +259,11 @@ func _on_ble_disconnected(reason: String) -> void:
 	_evaluate_state()
 	device_disconnected.emit(reason)
 	_maybe_recover()
+
+## UDP 图传帧：上抛画面 + 记 WS 活跃（见 _ready 注释）。
+func _on_udp_frame(img: Image) -> void:
+	_ws.note_activity()
+	frame_received.emit(img)
 
 func _on_ble_status(data: Dictionary) -> void:
 	status_received.emit(data)

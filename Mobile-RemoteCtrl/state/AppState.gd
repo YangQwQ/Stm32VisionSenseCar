@@ -5,7 +5,7 @@ extends Node
 var current_image: Image = null  # 最新一帧，供编辑/框选用
 
 ## 统一命令出口：所有手动控制 / 聊天 / 图传开关都经此。路由与选路由 DeviceConn 负责。
-## ai_goal / snapshot 图像类不走 BLE（需 WiFi），DeviceConn 仅在 WS 可用时下发。
+## ai_goal 图像类不走 BLE（需 WiFi），DeviceConn 仅在 WS 可用时下发。
 func send_command(cmd: Dictionary) -> bool:
 	return DeviceConn.send_command(cmd)
 

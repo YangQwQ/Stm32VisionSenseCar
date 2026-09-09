@@ -86,7 +86,15 @@ func send_image(img: Image) -> void:
 		return
 	var jpg := img.save_jpg_to_buffer()
 	if jpg.size() > 0:
-		_peer.send_binary(jpg)
+		_peer.put_packet(jpg)  # Godot 4：二进制帧用 put_packet（send_binary 是 Godot 3 API）
+
+## 外部（UDP 图传帧等）确认链路仍活跃：刷新断线探测计时并撤销疑似断线，
+## 避免图传推流期间 WS 层误发 ping 探测。
+func note_activity() -> void:
+	if _state != "connected":
+		return
+	_last_active_ms = Time.get_ticks_msec()
+	_probe_pending = false
 
 func _process(delta: float) -> void:
 	# 自动重连倒计时（_peer 为空期间计时）

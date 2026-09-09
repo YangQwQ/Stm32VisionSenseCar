@@ -14,9 +14,6 @@ static func arm(act: String, duration_ms: int = 0) -> Dictionary:
 	# duration_ms == 0 表示持续移动，直到收到 stop(scope="arm")
 	return {"type": "arm", "params": {"act": act, "duration_ms": duration_ms}, "id": _new_id()}
 
-static func snapshot(quality: int = 82) -> Dictionary:
-	return {"type": "snapshot", "params": {"quality": quality}, "id": _new_id()}
-
 static func stream(on: bool, udp_port: int = 0, src_ip: String = "") -> Dictionary:
 	# udp_port：图传走 UDP 时手机本地接收端口（>0 才带上）；src_ip：手机本机 IP（板子据此建 UDP 会话，
 	# 因实测板端 lwip_getpeername 对 httpd fd 取 peer 会回 0.0.0.0，依赖上报更可靠）。
@@ -34,9 +31,12 @@ static func exec_forward(on: bool) -> Dictionary:
 static func config_wifi(ssid: String, password: String) -> Dictionary:
 	return {"type": "config", "params": {"ssid": ssid, "password": password}, "id": _new_id()}
 
-static func ping() -> Dictionary:
-	# 手动连通性测试（/ping）。无周期心跳。
-	return {"type": "ping", "params": {}, "id": _new_id()}
+static func ping(target: String = "") -> Dictionary:
+	# target 为空 = 测小车连通性（板子直接回 pong）；带目标（IP/域名）= 板子去 ping 并回报延迟。
+	var params: Dictionary = {}
+	if not target.is_empty():
+		params["target"] = target
+	return {"type": "ping", "params": params, "id": _new_id()}
 
 static func ai_goal(message: String, annotation: Dictionary = {}, use_image: bool = false) -> Dictionary:
 	# DIRECT 链路目标下发：手机 → 板子。annotation 为可选圈选区域 {x,y,w,h,label}（坐标相对手机画面）。
@@ -52,47 +52,65 @@ static func ai_cancel() -> Dictionary:
 	# 取消当前 AI 任务（板侧须手动/新目标也能中止；此指令离线经 BLE 兜底也可用）。
 	return {"type": "ai_cancel", "params": {}, "id": _new_id()}
 
+static func ai_oneshot(message: String, annotation: Dictionary = {}, use_image: bool = false) -> Dictionary:
+	# 单轮 AI：板侧只执行一次决策即自动收尾（区别于 ai_goal 的迭代闭环）。参数同 ai_goal。
+	var params: Dictionary = {"message": message}
+	if not annotation.is_empty():
+		params["annotation"] = annotation
+	if use_image:
+		params["use_image"] = true
+	return {"type": "ai_oneshot", "params": params, "id": _new_id()}
+
 ## /help 文案：可用指令说明（仅供本地展示，不下发板子）。
 static func help_lines() -> PackedStringArray:
 	return PackedStringArray([
-		"/ping  连通性测试",
+		"/ping [IP|域名]  连通性测试（不带参数=测小车）",
 		"/clear  清空消息区(仅本机)",
-		"/snapshot  截图",
 		"/stream [on|off]  图传开关",
 		"/exec_log [on|off]  执行板日志(转发给手机)",
 		"/stop [wheels|arm]  停车",
 		"/config <WiFi名> <密码>  配网",
-		"/goal <目标>  下发 AI 目标(DIRECT)",
-		"/cancel  取消当前 AI 任务",
-		"/ws connect|disconnect|status  WS 手动连接/断开/状态",
+		"/ai goal <目标>  下发 AI 目标(DIRECT)",
+		"/ai oneshot <目标>  单轮 AI（只执行一次决策）",
+		"/ai cancel  取消当前 AI 任务",
+		"/ws [connect [IP]|disconnect|status]  WS 手动连接/断开/状态",
+		"/connect <IP>  不经蓝牙直连 WS（等同 /ws connect IP）",
 		"直接输入文字 = 以下发 AI 目标; 框选后发文字 = 带区域目标",
 	])
 
 ## 指令提示表：完整指令（语法） → 说明。/help 与输入 / 时的匹配提示共用。
 const COMMAND_HINTS := {
-	"/ping": "连通性测试",
+	"/ping [IP|域名]": "连通性测试（不带参数=测小车）",
 	"/clear": "清空消息区(仅本机)",
-	"/snapshot": "截图",
 	"/stream [on|off]": "图传开关",
 	"/exec_log [on|off]": "执行板日志(转发给手机)",
 	"/stop [wheels|arm]": "停车",
 	"/config <WiFi名> <密码>": "配网",
-	"/goal <目标>": "下发 AI 目标(DIRECT)",
-	"/cancel": "取消当前 AI 任务",
-	"/ws [connect|disconnect|status]": "WS 手动连接/断开/状态",
+	"/ai [goal|oneshot|cancel] <目标>": "AI 目标 / 单轮 / 取消",
+	"/ws [connect [IP]|disconnect|status]": "WS 手动连接/断开/状态",
+	"/connect <IP>": "不经蓝牙直连 WS",
 }
 
+## 指令提示最多展示条数（超出截断，避免挡住聊天区）。
+const MAX_HINTS := 10
+
 ## 按已敲的 / 指令片段过滤可匹配项，返回"指令 - 说明"行。text 以 / 开头才匹配；删到空则返回空。
+## 只按空格前的指令词匹配：打 /ping 1.2.3.4 这类带参数输入时依旧能匹配到 /ping。
 static func command_hints(text: String) -> PackedStringArray:
 	var t := text.strip_edges()
 	if not t.begins_with("/"):
 		return PackedStringArray()
-	var tok := t.trim_prefix("/").strip_edges().to_lower()
+	# 只按空格前的指令词匹配：打 /ping 1.2.3.4 这类带参数输入时依旧能匹配到 /ping。
+	# 只打 / 时 tok 为空 → 显示全部（按 COMMAND_HINTS 定义顺序）。
+	var rest := t.trim_prefix("/")
+	var tok := rest.split(" ", false)[0].to_lower() if not rest.is_empty() else ""
 	var out := PackedStringArray()
 	for cmd: String in COMMAND_HINTS.keys():
 		var verb := cmd.to_lower().split(" ", true, 1)[0].lstrip("/")
 		if tok.is_empty() or verb.begins_with(tok):
 			out.append("%s - %s" % [cmd, COMMAND_HINTS[cmd]])
+			if out.size() >= MAX_HINTS:
+				break
 	return out
 
 static func raw(type: String, params: Dictionary = {}) -> Dictionary:
