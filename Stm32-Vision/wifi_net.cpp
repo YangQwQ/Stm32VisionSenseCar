@@ -17,12 +17,23 @@ void net::init() {
     return;
   }
   WiFi.setSleep(false);
+//   WiFi.setTxPower(WIFI_POWER_19_5dBm);  // 顶格发射功率，避免省电默认压低上行吞吐
   s_begin_at = millis();
   WiFi.begin(cfg::wifi_ssid().c_str(), cfg::wifi_pass().c_str());
 }
 
 void net::update() {
-  if (cfg::wifi_ssid().isEmpty() || WiFi.status() == WL_CONNECTED) {
+  if (cfg::wifi_ssid().isEmpty()) {
+    return;
+  }
+  static bool s_was_connected = false;
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected && !s_was_connected) {
+    Serial.printf("[net] 已连接 %s, IP: %s, RSSI: %d dBm\n",
+                  cfg::wifi_ssid().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  }
+  s_was_connected = connected;
+  if (connected) {
     return;
   }
   // 距上次 begin 未超时：连接尝试仍在进行，静默等待，不重复 begin
@@ -36,6 +47,7 @@ void net::update() {
 void net::reconnect() {
   WiFi.disconnect();  // 断开当前连接，立即以最新配置重建 STA（不重启，BLE 保活）
   WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // 顶格发射功率，避免省电默认压低上行吞吐
   s_begin_at = millis();
   WiFi.begin(cfg::wifi_ssid().c_str(), cfg::wifi_pass().c_str());
 }

@@ -390,13 +390,13 @@ func _on_ws_connected() -> void:
 	_update_status()
 	# WS 建立即进入 WS_ONLY（让出 BLE 射频）由 DeviceConn 在内部处理。
 	# 重连/复线后按图传开关当前状态重发一次开启指令：断连期间开关仍保持「开」而板子画面已断，
-	# 若不重发需要用户手动再拨一次。
+	# 若不重发需要用户手动再拨一次。UDP VideoClient 每次重连需换新端口并随指令重新上报。
 	if _stream_toggle.button_pressed:
-		AppState.send_command(CP.stream(true))
-		_video.visible = true
+		_apply_stream(true)
 
 func _on_ws_disconnected(reason: String) -> void:
 	_video.call("show_no_signal", true)
+	DeviceConn.stop_video()  # WS 掉线：UDP 对端随之失效，停接收
 	_update_status()
 	var r := reason
 	if r.is_empty():
@@ -452,8 +452,25 @@ func _on_ws_text(data: Dictionary) -> void:
 		_chat("板", line)
 
 func _on_stream_toggled(on: bool) -> void:
-	AppState.send_command(CP.stream(on))
+	_apply_stream(on)
+
+## 图传开关统一出口：开 → 先起 UDP 接收拿本地端口，再发 stream(udp_port) 让板子向该端口推 JPEG；
+## 关 → 停 UDP 接收并发 stream off。_on_ws_connected / /stream 均走这里，保证端口上报一致。
+func _apply_stream(on: bool) -> void:
+	var port := -1
+	if on:
+		port = DeviceConn.start_video()
+		if port < 0:
+			_chat("提示", "UDP 图传初始化失败")
+	AppState.send_command(CP.stream(on, port if port > 0 else 0, _my_ipv4()))
 	_video.visible = on
+
+## 取手机非回环 IPv4 本机地址（板端建 UDP 会话用，见 CommandProto.stream）
+func _my_ipv4() -> String:
+	for a in IP.get_local_addresses():
+		if a.find(".") != -1 and not a.begins_with("127.") and a != "0.0.0.0":
+			return a
+	return ""
 
 # ============================== 框选（编辑器） ==============================
 
@@ -661,8 +678,10 @@ func _handle_slash(text: String) -> void:
 			if pieces.size() > 1:
 				var arg: String = pieces[1].strip_edges().to_lower()
 				on = arg != "off" and arg != "0" and arg != "false"
-			cmd = CP.stream(on)
 			_stream_toggle.set_pressed_no_signal(on)
+			_chat("本机", text)
+			_apply_stream(on)  # 统一出口：含 UDP 接收起停 + stream(udp_port) 上报
+			return
 		"/exec_log":
 			var ela_on := true
 			if pieces.size() > 1:

@@ -17,8 +17,15 @@ static func arm(act: String, duration_ms: int = 0) -> Dictionary:
 static func snapshot(quality: int = 82) -> Dictionary:
 	return {"type": "snapshot", "params": {"quality": quality}, "id": _new_id()}
 
-static func stream(on: bool) -> Dictionary:
-	return {"type": "stream", "params": {"on": on}, "id": _new_id()}
+static func stream(on: bool, udp_port: int = 0, src_ip: String = "") -> Dictionary:
+	# udp_port：图传走 UDP 时手机本地接收端口（>0 才带上）；src_ip：手机本机 IP（板子据此建 UDP 会话，
+	# 因实测板端 lwip_getpeername 对 httpd fd 取 peer 会回 0.0.0.0，依赖上报更可靠）。
+	var params: Dictionary = {"on": on}
+	if udp_port > 0:
+		params["udp_port"] = udp_port
+	if not src_ip.is_empty():
+		params["src_ip"] = src_ip
+	return {"type": "stream", "params": params, "id": _new_id()}
 
 static func exec_forward(on: bool) -> Dictionary:
 	# 执行板日志镜像开关：开启后板子把执行板经 UART 上行的帧转发给本 app（调试看执行板串口）。

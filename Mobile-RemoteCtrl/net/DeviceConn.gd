@@ -10,6 +10,7 @@ extends Node
 const BP := preload("res://net/ble/BleProfile.gd")
 const BLE_SCRIPT := preload("res://net/ble/BLEClient.gd")
 const WS_SCRIPT := preload("res://net/ws/WSCarClient.gd")
+const UDP_SCRIPT := preload("res://net/video/UDPVideoClient.gd")
 
 ## WS 连续重连失败达该次（WSCarClient 每 3s 一次 ≈ 9s）→ 停掉 WS 自旋、转 BLE 恢复。
 const WS_FAIL_LIMIT := 3
@@ -33,6 +34,7 @@ enum Channel { NONE, BLE, WS }
 # --- 传输 & 状态 ---
 var _ble  # BLEClient
 var _ws   # WSCarClient
+var _udp  # UDPVideoClient（图传 UDP 接收）
 var _state := "off"          # off / unavailable / idle / scanning / connecting / connected
 var _channel := Channel.NONE # 当前主信道
 var _device_addr := ""
@@ -54,6 +56,8 @@ func _ready() -> void:
 	_ble.name = "BLE"
 	_ws = WS_SCRIPT.new()
 	_ws.name = "WS"
+	_udp = UDP_SCRIPT.new()
+	_udp.name = "UDPVideo"
 
 	# 传输信号 → 内部处理器 → 上收为统一信号。先在 add_child 前挂好，不遗漏初始化的早期 emit。
 	_ble.scan_finished.connect(_on_scan_finished)
@@ -69,8 +73,12 @@ func _ready() -> void:
 	_ws.text_received.connect(text_received.emit)
 	_ws.frame_received.connect(frame_received.emit)
 
+	# UDP 图传帧 → 统一 frame_received 上抛（Main 的 _on_frame 据此刷新画面）
+	_udp.frame_received.connect(frame_received.emit)
+
 	add_child(_ble)
 	add_child(_ws)
+	add_child(_udp)
 	set_process(true)
 
 # ============================== 统一状态 ==============================
@@ -141,6 +149,14 @@ func connect_ws(ip: String = "") -> void:
 
 func disconnect_ws() -> void:
 	_ws.disconnect_car()
+
+## 开启 UDP 图传接收：绑定本地端口并返回该端口（≤0 表示绑定失败），供 stream 指令上报给板子。
+## 之后板子向「WS 对端 IP + 本端口」推送 JPEG 分片，UDPVideoClient 重组后抛 frame_received。
+func start_video() -> int:
+	return _udp.get_port() if _udp.start() else -1
+
+func stop_video() -> void:
+	_udp.stop()
 
 func ws_is_auto() -> bool:
 	return _ws.is_auto_reconnect()

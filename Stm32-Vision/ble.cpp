@@ -27,7 +27,8 @@ static const char* k_status = "0000C0E6-0000-1000-8000-00805F9B34FB";
 
 static BLEServer* g_server = nullptr;
 static BLECharacteristic* g_status_char = nullptr;
-static bool g_ws_connected = false;
+static bool g_ws_connected = false;   // 仅 WS 客户端在位（status.ws 字段）
+static bool g_transmission = false;   // 任一图传通道活跃（WS 客户端/MJPEG/streaming 标志）
 static bool g_last_net = false;
 
 // cmd JSON 队列：GATT 写回调入队，ble::update()（loop 上下文）取出统一派发。
@@ -131,9 +132,9 @@ class ServerCB : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer* s) override {
     bool adv = BLEDevice::getAdvertising()->isAdvertising();
-    // WS 已连（图传/指令走 WiFi）时保持低调，不恢复广播以免被误扫；
+    // 任一图传通道活跃（WS 客户端/MJPEG/streaming）时保持低调，不恢复广播以免抢 WiFi 射频；
     // 否则(纯兜底/配网)恢复可发现，供再次连接。
-    if (s && !g_ws_connected) s->startAdvertising();
+    if (s && !g_transmission) s->startAdvertising();
     Serial.printf("[ble] 手机断开 ws=%d adv=%d\n", g_ws_connected ? 1 : 0, adv);
   }
 };
@@ -189,17 +190,23 @@ void ble::reply(const char* text) {
 }
 
 void ble::set_ws_connected(bool on) {
-  // WS 就绪 → 停广播（WS_ONLY，让 WiFi 专注图传）；WS 断开 → 恢复可发现供配网/兜底。
-  // 仅在实际广播状态翻转时打一行，便于确认配网/图传阶段广播的启停。
+  // 仅维护 status.ws 上报；广播开关统一由 set_transmission 控制（图传活跃即停广播）。
+  if (g_ws_connected == on) return;
+  g_ws_connected = on;
+  notify_status("");  // 状态变化即上报（ws 字段刷新）
+}
+
+void ble::set_transmission(bool on) {
+  // BLE 与 WiFi 共用 2.4G 射频：广播开启会明显压低 WiFi 吞吐（手机离线但电脑 MJPEG 在推时
+  // 单帧能从 ~100ms 恶化到 ~400ms）。因此任一图传通道活跃即停广播，全部安静再恢复可发现。
+  if (g_transmission == on) return;
+  g_transmission = on;
   bool before = BLEDevice::getAdvertising()->isAdvertising();
   if (on) { if (before) BLEDevice::stopAdvertising(); }
   else    { if (!before) BLEDevice::startAdvertising(); }
   bool after = BLEDevice::getAdvertising()->isAdvertising();
   if (before != after)
-    Serial.printf("[ble] ws=%s 广播%s\n", on ? "on" : "off", after ? "已启动" : "已停止");
-  if (g_ws_connected == on) return;
-  g_ws_connected = on;
-  notify_status("");  // 状态变化即上报（ws 字段刷新）
+    Serial.printf("[ble] 图传=%d 广播%s\n", on ? "on" : "off", after ? "已启动" : "已停止");
 }
 
 void ble::update() {

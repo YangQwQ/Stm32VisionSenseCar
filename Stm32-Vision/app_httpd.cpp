@@ -19,6 +19,12 @@
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "camera_index.h"
+#include "lwip/sockets.h"
+// lwip 的 inet.h 把 INADDR_NONE/IPADDR_NONE 定义为宏，而 Arduino core 的 IPAddress.h
+// 声明同名全局对象（extern const IPAddress INADDR_NONE），宏会在声明处展开破坏语法；
+// lwip 为预编译库，此处撤销宏不影响其编译期使用。
+#undef INADDR_NONE
+#undef IPADDR_NONE
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -87,6 +93,16 @@ static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
 
+// 连接建立后一次性调大 TCP 发送缓冲并关 Nagle：
+// 默认小发送窗口 + Nagle 会让新连接慢启动期吞吐爬坡慢，表现为图传前慢后快
+static void tune_socket(int fd)
+{
+    int sndbuf = 64 * 1024;
+    lwip_setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    int nodelay = 1;
+    lwip_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+}
+
 #ifdef CONFIG_HTTPD_WS_SUPPORT
 // =================== WebSocket（端口 81 根路径，手机 App WSCarClient 通道） ===================
 #include "ArduinoJson.h"
@@ -107,9 +123,75 @@ static const uint32_t WS_PING_TIMEOUT_MS = 3000;  // 探测后可容忍的无上
 static volatile uint32_t s_ws_last_rx_ms = 0;      // 最近收到任一 WS 文本/binary 上行（ms）
 static volatile bool s_ws_ping_pending = false;    // 已发探测、等 pong（由 httpd 任务写入）
 static uint32_t s_ws_ping_at_ms = 0;
+static bool s_ws_had_client = false;               // WS 客户端曾经在位（有→无即判离线）
 
 // httpd 活跃 fd 表上限，须 >= 服务器 max_open_sockets（给足余量，过长时跳过）
 #define WS_MAX_CLIENTS 32
+
+// =================== UDP 图传（手机 App UDPVideoClient 接收端） ===================
+// 图传视频帧改用 UDP 承载，替代 WS 的 TCP 推流：规避 TCP 慢启动/Nagle/重传引发的
+// 延迟时高时低。指令/状态仍走 WS（控制面，低带宽可靠通道）。
+// 握手：手机绑定本地 UDP 端口并上报本机 IP，随 WS 的 stream on 指令发(udp_port, src_ip)；
+// 板据此建立 UDP 会话（同网段，无 NAT）。整帧 JPEG 切成 ≤UDP_JPG_CHUNK 的分片推送。
+#define UDP_JPG_CHUNK 1400     // 每数据报 JPEG 分片负载（留 MTU 余量，避免 IP 分片）
+#define UDP_FRAME_HDR 14       // 分片头固定字节：magic(2) frame_id(4) seq(2) count(2) total(4) 全大端
+#define UDP_MAGIC0 0x56
+#define UDP_MAGIC1 0x44
+static int s_udp_fd = -1;                    // UDP 会话 fd（懒创建）
+static volatile bool s_udp_peer_valid = false; // 已注册手机 UDP 对端
+static struct sockaddr_in s_udp_peer;        // 目标：手机 IP:udp_port（WS 处理任务写、推流任务读）
+static uint32_t s_udp_frame_id = 0;          // 帧序号，接收端按它区分新旧帧
+
+// 建立/更新 UDP 对端：ip_s_addr 为网络字节序、port 为主机序（内部 htons）。懒创建非阻塞 socket（缓冲满即跳帧）。
+static void udp_peer_set(uint32_t ip_s_addr, uint16_t port) {
+    if (s_udp_fd < 0) {
+        s_udp_fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s_udp_fd < 0) { log_e("UDP socket fail"); return; }
+        int nb = 1;
+        lwip_fcntl(s_udp_fd, F_SETFL, O_NONBLOCK);  // 非阻塞：发送缓冲满即本次 hop 失败、整帧跳过
+    }
+    memset(&s_udp_peer, 0, sizeof(s_udp_peer));
+    s_udp_peer.sin_family = AF_INET;
+    s_udp_peer.sin_addr.s_addr = ip_s_addr;
+    s_udp_peer.sin_port = htons(port);
+    s_udp_peer_valid = true;
+}
+
+static void udp_peer_clear(void) {
+    s_udp_peer_valid = false;
+}
+
+// 把一帧 JPEG 切成 UDP 分片推给对端；任一分片发送失败（缓冲满/对端不可达）即整帧放弃
+// （快于降帧率，契合"同步发送+跳帧"控制策略，避免积压抬延迟）。
+static void udp_send_frame(camera_fb_t *fb) {
+    if (!s_udp_peer_valid || s_udp_fd < 0) return;
+    size_t total = fb->len;
+    if (total == 0) return;
+    uint32_t fid = s_udp_frame_id++;
+    uint16_t count = (uint16_t)((total + UDP_JPG_CHUNK - 1) / UDP_JPG_CHUNK);
+    uint8_t hdr[UDP_FRAME_HDR];
+    uint8_t buf[UDP_JPG_CHUNK + UDP_FRAME_HDR];
+    const uint8_t *p = fb->buf;
+    size_t rem = total;
+    for (uint16_t seq = 0; seq < count; seq++) {
+        size_t chunk = rem > UDP_JPG_CHUNK ? UDP_JPG_CHUNK : rem;
+        hdr[0] = UDP_MAGIC0; hdr[1] = UDP_MAGIC1;
+        hdr[2] = (uint8_t)(fid >> 24); hdr[3] = (uint8_t)(fid >> 16);
+        hdr[4] = (uint8_t)(fid >> 8);  hdr[5] = (uint8_t)(fid);
+        hdr[6] = (uint8_t)(seq >> 8);  hdr[7] = (uint8_t)(seq);
+        hdr[8] = (uint8_t)(count >> 8); hdr[9] = (uint8_t)(count);
+        hdr[10] = (uint8_t)(total >> 24); hdr[11] = (uint8_t)(total >> 16);
+        hdr[12] = (uint8_t)(total >> 8);  hdr[13] = (uint8_t)(total);
+        memcpy(buf, hdr, UDP_FRAME_HDR);
+        memcpy(buf + UDP_FRAME_HDR, p, chunk);
+        if (lwip_sendto(s_udp_fd, buf, UDP_FRAME_HDR + chunk, 0,
+                        (struct sockaddr *)&s_udp_peer, sizeof(s_udp_peer)) < 0) {
+            break;  // 非阻塞返回错误 = 队列满/对端不可达，废弃本帧
+        }
+        p += chunk;
+        rem -= chunk;
+    }
+}
 
 // 全量 WS fd 探测/踢除辅助：httpd 仅暴露活跃 fd 表，无 per-fd 状态管理，故按需遍历。
 static esp_err_t ws_send_text(int fd, const char *text);  // 前向声明（定义在下方）
@@ -176,6 +258,33 @@ static void ws_handle_text(const char *json, int fd)
         // 连通性测试：回 pong（手动 /ping 触发，无周期心跳）。
         ws_send_text(fd, "{\"type\":\"pong\"}");
     } else {
+        // UDP 图传握手：stream on 且携带有效 udp_port → 结合 WS 对端 IP 建立 UDP 会话；
+        // 其余（on 无有效端口 / off）→ 拆除旧会话，避免向已失效端口空推。
+        if (!strcmp(type, "stream")) {
+            bool on = doc["params"]["on"] | false;
+            int port = doc["params"]["udp_port"] | 0;
+            if (on && port > 0) {
+                struct sockaddr_in src;
+                socklen_t sl = sizeof(src);
+                uint32_t peer_ip = 0;
+                const char *src_ip = doc["params"]["src_ip"] | "";
+                // 优先采用手机上报的本机 IP（实测 lwip_getpeername 对 httpd fd 回 0.0.0.0，不可靠）
+                if (src_ip[0]) {
+                    uint32_t a = 0, b = 0, c = 0, d = 0;
+                    if (sscanf(src_ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
+                        peer_ip = a | (b << 8) | (c << 16) | ((uint32_t)d << 24);  // 首字节在低址 = 网络字节序
+                    else
+                        peer_ip = 0;
+                }
+                if (peer_ip) {
+                    udp_peer_set(peer_ip, (uint16_t)port);
+                } else if (lwip_getpeername(fd, (struct sockaddr *)&src, &sl) == 0) {
+                    udp_peer_set(src.sin_addr.s_addr, (uint16_t)port);
+                }
+            } else {
+                udp_peer_clear();
+            }
+        }
         // 统一词表：move/stop/arm/config/stream/ai_goal/ai_cancel 等交给 command
         // （stream 由 command 更新全局图传开关；ai_goal 异步结果回传）。
         // 摇杆高频帧同指令连续重复时只记首条，避免刷屏；换指令再记。
@@ -198,6 +307,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
             httpd_resp_send(req, NULL, 0);
             return ESP_OK;
         }
+        tune_socket(httpd_req_to_sockfd(req)); // WS 握手 fd，图传前先调好窗口/Nagle
         return ESP_OK; // WS 握手，101 由 httpd 自动完成
     }
 
@@ -278,7 +388,8 @@ static void ws_stream_task(void *arg)
         if (cmd::streaming()) {
             camera_fb_t *fb = cam::grab();
             if (fb) {
-                ws_send_jpeg_to_ws_clients(fb, &has_client);
+                udp_send_frame(fb);                          // 图传帧走 UDP；WS 仅探测客户端是否在位（不再推帧）
+                ws_send_jpeg_to_ws_clients(nullptr, &has_client);
                 cam::return_frame(fb);
             }
         } else {
@@ -306,7 +417,21 @@ static void ws_stream_task(void *arg)
             s_ws_ping_pending = false;  // 无 WS 挂载时复位探测态
         }
 
+        // 客户端从有到无（手机退出且未先发 stream off）：停掉它发起的推流，
+        // 否则 ws 任务持续白抓帧，BLE 广播也无机会恢复。
+        if (has_client) {
+            s_ws_had_client = true;
+        } else if (s_ws_had_client) {
+            s_ws_had_client = false;
+            cmd::set_streaming(false);
+            udp_peer_clear();  // WS 会话失效，随普通图传一起停掉 UDP 对端
+            Serial.println("[ws] 客户端离线，停止推流");
+        }
+
         ble::set_ws_connected(has_client);
+        // 任一图传通道活跃（WS 客户端 / MJPEG 推流 / streaming 标志）即停 BLE 广播：
+        // BLE 与 WiFi 共用射频，广播会显著压低吞吐（手机离线但电脑 MJPEG 在推时尤为明显）。
+        ble::set_transmission(has_client || isStreaming || cmd::streaming());
         vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
     }
 }
@@ -766,6 +891,9 @@ static esp_err_t stream_handler(httpd_req_t *req)
         last_frame = esp_timer_get_time();
     }
 
+    // 调大发送缓冲 + 关 Nagle，避免新连接慢启动期吞吐爬坡慢（图传前慢后快）
+    tune_socket(httpd_req_to_sockfd(req));
+
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK)
     {
@@ -981,6 +1109,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
 
         int64_t frame_time = fr_end - last_frame;
         frame_time /= 1000;
+        last_frame = fr_end;  // 修复：原未更新，fps 恒为 0.0
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
         uint32_t avg_frame_time = ra_filter_run(&ra_filter, frame_time);
 #endif
