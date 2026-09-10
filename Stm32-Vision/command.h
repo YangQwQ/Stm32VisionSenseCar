@@ -19,6 +19,11 @@ void handle(const char* json, bool has_frames, ReplyFn reply, void* reply_ctx);
 bool streaming();
 void set_streaming(bool on);
 
+// exec_log 开关：默认关。开启后 app_httpd 把本地直驱状态（exec::read_state）
+// 周期性推送给手机（视觉板替代原来的执行板上行帧）。由 command 接收 exec_log 指令更新。
+bool exec_log();
+void set_exec_log(bool on);
+
 // 使最新 WiFi 配置生效：在线重建 STA 连接（不重启，BLE 保活）。
 // BLE 配网写 SSID/PASS 后由 ble 调用；command 的 config 分支内部亦调用。
 void apply_network();

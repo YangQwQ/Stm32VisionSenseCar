@@ -341,11 +341,25 @@ func _handle_slash(text: String) -> void:
 			stream_requested.emit(on)  # 统一出口：Main 同步开关并起停 UDP 接收
 			return
 		"/exec_log":
-			var ela_on := true
+			# 本地直驱状态实时推送开关（默认关）：/exec_log [on|off]
+			var el_on := true
 			if pieces.size() > 1:
-				var el_arg: String = pieces[1].strip_edges().to_lower()
-				ela_on = el_arg != "off" and el_arg != "0" and el_arg != "false"
-			cmd = CP.exec_forward(ela_on)
+				var ea: String = pieces[1].strip_edges().to_lower()
+				el_on = ea == "on" or ea == "1" or ea == "true"
+			cmd = CP.exec_log(el_on)
+		"/light":
+			# 直驱灯光：/light <front|vibe|back> <0|1>
+			var lt_kind := "front"
+			var light_on := false
+			if pieces.size() > 2:
+				lt_kind = pieces[1].strip_edges().to_lower()
+				var lt_arg: String = pieces[2].strip_edges().to_lower()
+				light_on = lt_arg == "on" or lt_arg == "1" or lt_arg == "true"
+			elif pieces.size() > 1:
+				lt_kind = "front"
+				var la: String = pieces[1].strip_edges().to_lower()
+				light_on = la == "on" or la == "1" or la == "true"
+			cmd = CP.light(lt_kind, light_on)
 		"/stop":
 			var scope := "all"
 			if pieces.size() > 1 and pieces[1].strip_edges().to_lower() in ["wheels", "arm"]:
@@ -380,6 +394,41 @@ func _handle_slash(text: String) -> void:
 		"/connect":  # 不经蓝牙直连 WS：等同 /ws connect <IP>
 			_handle_ws_slash("/ws connect %s" % (pieces[1].strip_edges() if pieces.size() > 1 else ""))
 			return
+		"/servo":  # 调试直驱：绕过执行板，大脑板直接驱动哪吒机械臂舵机
+			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
+			var kv := sp.split(" ", true, 1)
+			if kv.size() < 2 or not kv[0].is_valid_int() or not kv[1].is_valid_int():
+				chat("提示", "用法: /servo <n=0转向/1左/2右/3前> <pwm=50..250>")
+				return
+			var serv_n := kv[0].to_int()
+			var serv_pwm := kv[1].to_int()
+			if serv_n < 0 or serv_n > 3 or serv_pwm < 50 or serv_pwm > 250:
+				chat("提示", "用法: /servo <n=0转向/1左/2右/3前> <pwm=50..250>")
+				return
+			cmd = CP.servo(serv_n, serv_pwm)
+		"/motor":  # 调试直驱：绕过执行板，大脑板直接驱动哪吒单轮电机
+			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
+			var mv := sp.split(" ", true, 2)
+			if mv.size() < 3 or not mv[0].is_valid_int() or not mv[1].is_valid_int() or not mv[2].is_valid_int():
+				chat("提示", "用法: /motor <n=1..4> <a=0..1000> <b=0..1000>")
+				return
+			var m_n := mv[0].to_int()
+			var m_a := mv[1].to_int()
+			var m_b := mv[2].to_int()
+			if m_n < 1 or m_n > 4 or m_a < 0 or m_a > 1000 or m_b < 0 or m_b > 1000:
+				chat("提示", "用法: /motor <n=1..4> <a=0..1000> <b=0..1000>")
+				return
+			cmd = CP.motor(m_n, m_a, m_b)
+		"/drive":  # 调试直驱：一键全车前进/后退/停
+			var sp := pieces[1].strip_edges() if pieces.size() > 1 else "0"
+			if not sp.is_valid_int():
+				chat("提示", "用法: /drive <speed=-1000..1000> (0=停)")
+				return
+			var d_spd := sp.to_int()
+			if d_spd < -1000 or d_spd > 1000:
+				chat("提示", "用法: /drive <speed=-1000..1000> (0=停)")
+				return
+			cmd = CP.drive(d_spd)
 		_:
 			chat("提示", "未知指令: %s(/help 查看可用指令)" % verb)
 			return

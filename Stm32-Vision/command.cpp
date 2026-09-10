@@ -1,14 +1,16 @@
 #include "command.h"
 #include "config.h"
 #include "wifi_net.h"
-#include "uart.h"
 #include "ai_client.h"
+#include "direct_exec.h"
 #include "ping_svc.h"
+#include "nezha_direct.h"
 
 // 应答格式遵循架构 §5.1：板 → 手机文本 = {type:status/pong, params:{...}, id:<回填>}。
 // move/stop/arm 是高频手动指令，只在 UART 层记录，不回文本（避免刷屏）。
 
 static bool g_streaming = false;         // 图传开关全局状态（WS 推流任务读取）
+static bool g_exec_log = false;          // exec_log 开关（默认关；开启后周期性推本地状态）
 
 static bool has_id(const JsonDocument& doc) {
   return doc["id"].is<int>() || doc["id"].is<long>();
@@ -62,11 +64,11 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   JsonObject params = doc["params"].as<JsonObject>();
   bool manual = !strcmp(type, "move") || !strcmp(type, "stop") || !strcmp(type, "arm");
   if (manual) {
-    // 手动高频指令：先立即打断 AI 闭环并译帧下发执行板（电机控制优先），
+    // 手动高频指令：先立即打断 AI 闭环并直接驱动哪吒扩展板（电机控制优先），
     // 串口日志只在类型切换时打一行，绝不让日志阻塞控制时序。
-    // arm 打断只停轮子（机械臂指令即接管）；move/stop 由用户指令覆盖，不补停。
+    // move/stop/arm 由本板直驱，不再经执行板。arm 打断只停轮子（机械臂指令即接管）。
     ai::cancel(!strcmp(type, "arm") ? ai::StopMode::Wheels : ai::StopMode::None);
-    uart::act(type, params);
+    exec::act(type, params);
     log_manual_throttled(type);
     return;
   }
@@ -115,11 +117,30 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
-  if (!strcmp(type, "exec_forward")) {
-    // 执行板日志镜像：开启后把执行板经 UART 上行的帧转发给手机（调试看执行板串口）。
+  if (!strcmp(type, "exec_log")) {
+    // 本地直驱状态实时推送开关（默认关，避免空闲刷屏）：开启后 app_httpd 周期性推
+    // exec::read_state 合成的状态文本给手机，替代原执行板上行帧镜像。
     bool on = params["on"] | false;
-    uart::set_forward(on);
-    reply_status(doc, reply, reply_ctx, on ? "执行板日志已开启，转发给手机" : "执行板日志已关闭");
+    set_exec_log(on);
+    reply_status(doc, reply, reply_ctx, on ? "状态实时推送已开启" : "状态实时推送已关闭");
+    return;
+  }
+
+  if (!strcmp(type, "light")) {
+    // 直驱灯光（绕过执行板）：/light <front|vibe|back> <0|1>。
+    bool on = params["on"] | false;
+    if (exec::act("light", params)) {
+      reply_status(doc, reply, reply_ctx, on ? "灯已开" : "灯已关");
+    } else {
+      reply_status(doc, reply, reply_ctx, "light: kind 需 front|vibe|back");
+    }
+    return;
+  }
+
+  if (!strcmp(type, "reset")) {
+    // 回正：机械臂四舵机回中 + 电机停（绕过执行板，直驱）。
+    exec::reset();
+    reply_status(doc, reply, reply_ctx, "已回正");
     return;
   }
 
@@ -155,6 +176,55 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
+  if (!strcmp(type, "servo")) {
+    // 调试直驱：绕过执行板，本板软件 I2C 直接驱动哪吒舵机（逻辑通道 n=0转向/1左(前后)/2右(抬落)/3前(夹爪)）。
+    // 直接写原始 pwm（50..250），不过标定限位，用于探机械极限/标定；走 exec::set_servo 同步内部状态。
+    int n = params["n"] | -1;
+    int p = params["pwm"] | -1;
+    if (n >= 0 && n <= 3 && p >= 50 && p <= 250 && exec::set_servo((uint8_t)n, (uint16_t)p)) {
+      reply_status(doc, reply, reply_ctx, "servo ok");
+    } else {
+      reply_status(doc, reply, reply_ctx, "servo: n=0转向/1左/2右/3前 pwm=50..250(可超标定限位)");
+    }
+    return;
+  }
+
+  if (!strcmp(type, "motor")) {
+    // 调试直驱：绕过执行板，本板直接驱动哪吒单轮电机（隔离执行板是否异常）。
+    // 用法 /motor <n=1..4> <a=0..1000> <b=0..1000>；a=正转 b=反转，都 0 即停。
+    int n = params["n"] | -1;
+    int a = params["a"] | -1;
+    int b = params["b"] | -1;
+    if (n >= 1 && n <= 4 && a >= 0 && b >= 0 && a <= 1000 && b <= 1000 &&
+        nezha::set_motor((uint8_t)n, (uint16_t)a, (uint16_t)b)) {
+      reply_status(doc, reply, reply_ctx, "motor ok");
+    } else {
+      reply_status(doc, reply, reply_ctx, "motor: 参数需 n=1..4 a,b=0..1000");
+    }
+    return;
+  }
+
+  if (!strcmp(type, "drive")) {
+    // 调试直驱：一键发全车四轮前进/后退/停（单条命令保证四轮同时起转）。
+    // 用法 /drive <speed=-1000..1000>；>0 前进 <0 后退 0 停车。
+    int spd = params["speed"] | 0;
+    if (spd < -1000 || spd > 1000) {
+      reply_status(doc, reply, reply_ctx, "drive: speed 需在 -1000..1000");
+      return;
+    }
+    int S = spd < 0 ? -spd : spd;
+    uint16_t u = (uint16_t)S;
+    bool rev = spd < 0;
+    // 轮map：M1左后 M2右后 M3右前 M4左前；左轮 a 正前，右轮 b 正前。
+    // 前进：M1(S,0) M2(0,S) M3(0,S) M4(S,0)；后退：四轮 a/b 对调。
+    nezha::set_motor(1, rev ? 0 : u, rev ? u : 0);
+    nezha::set_motor(2, rev ? u : 0, rev ? 0 : u);
+    nezha::set_motor(3, rev ? u : 0, rev ? 0 : u);
+    nezha::set_motor(4, rev ? 0 : u, rev ? u : 0);
+    reply_status(doc, reply, reply_ctx, "drive ok");
+    return;
+  }
+
   reply_status(doc, reply, reply_ctx, "未知指令类型");
 }
 
@@ -166,3 +236,7 @@ void cmd::apply_network() {
 bool cmd::streaming() { return g_streaming; }
 
 void cmd::set_streaming(bool on) { g_streaming = on; }
+
+bool cmd::exec_log() { return g_exec_log; }
+
+void cmd::set_exec_log(bool on) { g_exec_log = on; }

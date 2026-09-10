@@ -382,8 +382,59 @@ border_width_bottom = 2
 border_color = Color(0.278, 0.333, 0.412, 0.4)
 corner_radius_top_left = 100
 corner_radius_top_right = 100
-corner_radius_bottom_right = 12
-corner_radius_bottom_left = 12
+corner_radius_bottom_right = 100
+corner_radius_bottom_left = 100
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_sqvbp"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 20.0
+content_margin_bottom = 4.0
+bg_color = Color(0.388, 0.4, 0.945, 0.97)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.647, 0.706, 0.988, 0.6)
+corner_radius_top_left = 100
+corner_radius_top_right = 100
+corner_radius_bottom_right = 100
+corner_radius_bottom_left = 100
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_1w2xm"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 20.0
+content_margin_bottom = 4.0
+bg_color = Color(0.118, 0.161, 0.231, 0.94)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.278, 0.333, 0.412, 0.4)
+corner_radius_top_left = 100
+corner_radius_top_right = 100
+corner_radius_bottom_right = 100
+corner_radius_bottom_left = 100
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_gngx1"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 20.0
+content_margin_bottom = 4.0
+bg_color = Color(0.388, 0.4, 0.945, 0.97)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.647, 0.706, 0.988, 0.6)
+corner_radius_top_left = 100
+corner_radius_top_right = 100
+corner_radius_bottom_right = 100
+corner_radius_bottom_left = 100
 corner_detail = 5
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_bg4s2"]
@@ -454,7 +505,7 @@ corner_radius_bottom_right = 100
 corner_radius_bottom_left = 100
 corner_detail = 5
 
-[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_sqvbp"]
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_jt61w"]
 content_margin_left = 20.0
 content_margin_top = 4.0
 content_margin_right = 20.0
@@ -465,8 +516,59 @@ border_width_top = 2
 border_width_right = 2
 border_width_bottom = 2
 border_color = Color(0.278, 0.333, 0.412, 0.4)
-corner_radius_top_left = 12
-corner_radius_top_right = 12
+corner_radius_top_left = 100
+corner_radius_top_right = 100
+corner_radius_bottom_right = 100
+corner_radius_bottom_left = 100
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_v8qla"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 20.0
+content_margin_bottom = 4.0
+bg_color = Color(0.388, 0.4, 0.945, 0.97)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.647, 0.706, 0.988, 0.6)
+corner_radius_top_left = 100
+corner_radius_top_right = 100
+corner_radius_bottom_right = 100
+corner_radius_bottom_left = 100
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_y1tbi"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 20.0
+content_margin_bottom = 4.0
+bg_color = Color(0.118, 0.161, 0.231, 0.94)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.278, 0.333, 0.412, 0.4)
+corner_radius_top_left = 100
+corner_radius_top_right = 100
+corner_radius_bottom_right = 100
+corner_radius_bottom_left = 100
+corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_c2s76"]
+content_margin_left = 20.0
+content_margin_top = 4.0
+content_margin_right = 20.0
+content_margin_bottom = 4.0
+bg_color = Color(0.388, 0.4, 0.945, 0.97)
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.647, 0.706, 0.988, 0.6)
+corner_radius_top_left = 100
+corner_radius_top_right = 100
 corner_radius_bottom_right = 100
 corner_radius_bottom_left = 100
 corner_detail = 5
@@ -1096,16 +1198,17 @@ theme_override_styles/hover = SubResource("StyleBoxFlat_2gh4u")
 theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_devvj")
 text = "升爪"
 
-[node name="ClawClipBtn" type="Button" parent="BodyControl/CtrlArea/Btns" unique_id=1930993390]
+[node name="ClawClipReleaseBtn" type="Button" parent="BodyControl/CtrlArea/Btns" unique_id=1930993390]
 custom_minimum_size = Vector2(150, 150)
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 6
 focus_mode = 0
 theme_override_styles/normal = SubResource("StyleBoxFlat_3b0ty")
-theme_override_styles/pressed = SubResource("StyleBoxFlat_5tuhn")
-theme_override_styles/hover = SubResource("StyleBoxFlat_2gh4u")
-theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_devvj")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_sqvbp")
+theme_override_styles/hover = SubResource("StyleBoxFlat_1w2xm")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_gngx1")
+toggle_mode = true
 text = "夹取"
 
 [node name="ClawDownBtn" type="Button" parent="BodyControl/CtrlArea/Btns" unique_id=1495522071]
@@ -1120,17 +1223,17 @@ theme_override_styles/hover = SubResource("StyleBoxFlat_mxvw5")
 theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_xrxkg")
 text = "降爪"
 
-[node name="ClawReleaseBtn" type="Button" parent="BodyControl/CtrlArea/Btns" unique_id=802783876]
+[node name="ResetPosBtn" type="Button" parent="BodyControl/CtrlArea/Btns" unique_id=802783876]
 custom_minimum_size = Vector2(150, 150)
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 6
 focus_mode = 0
-theme_override_styles/normal = SubResource("StyleBoxFlat_sqvbp")
-theme_override_styles/pressed = SubResource("StyleBoxFlat_hhcpw")
-theme_override_styles/hover = SubResource("StyleBoxFlat_mxvw5")
-theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_xrxkg")
-text = "松爪"
+theme_override_styles/normal = SubResource("StyleBoxFlat_jt61w")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_v8qla")
+theme_override_styles/hover = SubResource("StyleBoxFlat_y1tbi")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_c2s76")
+text = "回正"
 
 [node name="ClawForwardBtn" type="Button" parent="BodyControl/CtrlArea/Btns" unique_id=576355115]
 custom_minimum_size = Vector2(150, 150)
@@ -1155,6 +1258,51 @@ theme_override_styles/pressed = SubResource("StyleBoxFlat_gb15f")
 theme_override_styles/hover = SubResource("StyleBoxFlat_sph85")
 theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_o7g6l")
 text = "爪后退"
+
+[node name="LightCtrl" type="HBoxContainer" parent="BodyControl/CtrlArea" unique_id=550712096]
+custom_minimum_size = Vector2(0, 120)
+layout_mode = 1
+anchors_preset = 12
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 0
+theme_override_constants/separation = 40
+alignment = 1
+
+[node name="ForeLight" type="Button" parent="BodyControl/CtrlArea/LightCtrl" unique_id=1299088123]
+layout_mode = 2
+size_flags_horizontal = 3
+focus_mode = 0
+theme_override_styles/normal = SubResource("StyleBoxFlat_jt61w")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_v8qla")
+theme_override_styles/hover = SubResource("StyleBoxFlat_y1tbi")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_c2s76")
+toggle_mode = true
+text = "前灯"
+
+[node name="VibeLight" type="Button" parent="BodyControl/CtrlArea/LightCtrl" unique_id=1301434913]
+layout_mode = 2
+size_flags_horizontal = 3
+focus_mode = 0
+theme_override_styles/normal = SubResource("StyleBoxFlat_jt61w")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_v8qla")
+theme_override_styles/hover = SubResource("StyleBoxFlat_y1tbi")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_c2s76")
+toggle_mode = true
+text = "氛围灯"
+
+[node name="BackLight" type="Button" parent="BodyControl/CtrlArea/LightCtrl" unique_id=292408791]
+layout_mode = 2
+size_flags_horizontal = 3
+focus_mode = 0
+theme_override_styles/normal = SubResource("StyleBoxFlat_jt61w")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_v8qla")
+theme_override_styles/hover = SubResource("StyleBoxFlat_y1tbi")
+theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_c2s76")
+toggle_mode = true
+text = "尾灯"
 
 [node name="BodyAbout" type="VBoxContainer" parent="." unique_id=19168388]
 layout_mode = 1

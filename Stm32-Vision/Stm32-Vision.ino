@@ -3,7 +3,7 @@
 #include "config.h"
 #include "wifi_net.h"
 #include "camera.h"
-#include "uart.h"
+#include "direct_exec.h"
 #include "command.h"
 #include "ble.h"
 #include "ai_client.h"
@@ -37,7 +37,7 @@ void setup() {
   // BLE GATT Server 不依赖摄像头/WiFi——配网阶段无网可用，也要先能连上手机
   ble::init();
 
-  uart::init();  // Serial2 → 执行板（STM32）
+  exec::init();  // 直驱执行器：哪吒舵机回中 + 电机 0（不再经执行板）
 
   if (!cam::init()) {
     Serial.println("Camera init failed (继续：BLE 配网/控制仍可用)");
@@ -60,7 +60,7 @@ void loop() {
   // WiFi 断线重连由 network 模块处理
   net::update();
   ble::update();   // 处理 BLE cmd 队列 + WiFi 状态变化上报
-  uart::update();  // 收执行板状态帧（骨架）
+  exec::update_tick();  // 直驱连续机械臂动作步进（约 10ms 一拍）
   ai::update();    // 排空 AI 结果队列（回传 Godot ai_result）
   delay(10);
 }

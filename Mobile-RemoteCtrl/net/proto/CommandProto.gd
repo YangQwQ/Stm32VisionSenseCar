@@ -24,9 +24,12 @@ static func stream(on: bool, udp_port: int = 0, src_ip: String = "") -> Dictiona
 		params["src_ip"] = src_ip
 	return {"type": "stream", "params": params, "id": _new_id()}
 
-static func exec_forward(on: bool) -> Dictionary:
-	# 执行板日志镜像开关：开启后板子把执行板经 UART 上行的帧转发给本 app（调试看执行板串口）。
-	return {"type": "exec_forward", "params": {"on": on}, "id": _new_id()}
+static func exec_log(on: bool) -> Dictionary:
+	# 本地直驱状态实时推送开关（默认关）：开启后板端周期性推送 exec_status（视觉板合成的小车/机械臂状态），
+	# 替代旧执行板上行帧镜像。默认关，避免空闲时状态一直刷屏。
+	return {"type": "exec_log", "params": {"on": on}, "id": _new_id()}
+
+
 
 static func config_wifi(ssid: String, password: String) -> Dictionary:
 	return {"type": "config", "params": {"ssid": ssid, "password": password}, "id": _new_id()}
@@ -61,20 +64,45 @@ static func ai_oneshot(message: String, annotation: Dictionary = {}, use_image: 
 		params["use_image"] = true
 	return {"type": "ai_oneshot", "params": params, "id": _new_id()}
 
+static func light(kind: String, on: bool) -> Dictionary:
+	# 直驱灯光：kind = front/vibe/back → 前灯/氛围灯/尾灯(左右一起)
+	return {"type": "light", "params": {"kind": kind, "on": on}, "id": _new_id()}
+
+static func reset() -> Dictionary:
+	# 回正：转向+机械臂四个舵机全部回中+电机停（直驱专用）
+	return {"type": "reset", "id": _new_id()}
+
+static func servo(n: int, pwm: int) -> Dictionary:
+	# 调试直驱：大脑板直接驱动哪吒舵机（n=0转向/1左(前后)/2右(抬落)/3前(夹爪), pwm=50..250）
+	return {"type": "servo", "params": {"n": n, "pwm": pwm}, "id": _new_id()}
+
+static func motor(n: int, a: int, b: int) -> Dictionary:
+	# 调试直驱：绕过执行板，大脑板直接驱动哪吒单轮电机（n=1..4, a=正转 b=反转, 0..1000）
+	return {"type": "motor", "params": {"n": n, "a": a, "b": b}, "id": _new_id()}
+
+static func drive(speed: int) -> Dictionary:
+	# 调试直驱：一键全车前进/后退/停（单条命令；speed=-1000..1000, 0=停）
+	return {"type": "drive", "params": {"speed": speed}, "id": _new_id()}
+
 ## /help 文案：可用指令说明（仅供本地展示，不下发板子）。
 static func help_lines() -> PackedStringArray:
 	return PackedStringArray([
 		"/ping [IP|域名]  连通性测试（不带参数=测小车）",
 		"/clear  清空消息区(仅本机)",
 		"/stream [on|off]  图传开关",
-		"/exec_log [on|off]  执行板日志(转发给手机)",
 		"/stop [wheels|arm]  停车",
+		"/exec_log [on|off]  实时状态推送开关（默认关）",
+		"/light <front|vibe|back> <0|1>  直驱灯开关(前/氛围/尾)",
+		"/reset  机械臂+转向回正",
 		"/config <WiFi名> <密码>  配网",
 		"/ai goal <目标>  下发 AI 目标(DIRECT)",
 		"/ai oneshot <目标>  单轮 AI（只执行一次决策）",
 		"/ai cancel  取消当前 AI 任务",
 		"/ws [connect [IP]|disconnect|status]  WS 手动连接/断开/状态",
 		"/connect <IP>  不经蓝牙直连 WS（等同 /ws connect IP）",
+		"/servo <n> <pwm>  直驱机械臂舵机(绕过执行板,调试用)",
+		"/motor <n> <a> <b>  直驱单轮电机(绕过执行板,调试用)",
+		"/drive <speed>  一键全车前进/后退/停(绕过执行板)",
 		"直接输入文字 = 以下发 AI 目标; 框选后发文字 = 带区域目标",
 	])
 
@@ -83,12 +111,17 @@ const COMMAND_HINTS := {
 	"/ping [IP|域名]": "连通性测试（不带参数=测小车）",
 	"/clear": "清空消息区(仅本机)",
 	"/stream [on|off]": "图传开关",
-	"/exec_log [on|off]": "执行板日志(转发给手机)",
 	"/stop [wheels|arm]": "停车",
+	"/exec_log [on|off]": "实时状态推送开关（默认关）",
+	"/light <front|vibe|back> <0|1>": "直驱灯开关(前/氛围/尾)",
+	"/reset": "机械臂+转向回正",
 	"/config <WiFi名> <密码>": "配网",
 	"/ai [goal|oneshot|cancel] <目标>": "AI 目标 / 单轮 / 取消",
 	"/ws [connect [IP]|disconnect|status]": "WS 手动连接/断开/状态",
 	"/connect <IP>": "不经蓝牙直连 WS",
+	"/servo <n=0转向/1左/2右/3前> <pwm=50..250>": "直驱舵机(可超标定限位)",
+	"/motor <n> <a> <b>": "直驱单轮电机(绕过执行板)",
+	"/drive <speed>": "一键全车前进/后退/停(绕过执行板)",
 }
 
 ## 指令提示最多展示条数（超出截断，避免挡住聊天区）。

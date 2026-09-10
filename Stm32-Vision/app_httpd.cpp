@@ -111,7 +111,7 @@ static void tune_socket(int fd)
 #include "command.h"
 #include "ble.h"
 #include "ai_client.h"
-#include "uart.h"
+#include "direct_exec.h"
 
 #define WS_STREAM_FPS 10
 #define WS_EDIT_IMG_MAX (128 * 1024)  // 编辑图（二进制上行）上限，与 ai_client 一致
@@ -361,7 +361,7 @@ static bool ws_send_jpeg_to_ws_clients(camera_fb_t *fb, bool *has_client)
     return any;
 }
 
-// 执行板日志镜像回调：把一帧文本广播给全部 WS 客户端（uart::update 主循环上下文，async 安全）。
+// 文本广播给全部 WS 客户端（本直驱状态推送，async 安全）。
 static void ws_send_text_to_ws_clients(const char *text)
 {
     int fds[WS_MAX_CLIENTS];
@@ -425,6 +425,23 @@ static void ws_stream_task(void *arg)
         }
 
         ble::set_ws_connected(has_client);
+        // 本地直驱状态 → 手机（exec_log 开启时实时推送；替代原执行板上行帧镜像）。
+        // 默认关：空闲不刷屏。开启后约 400ms 推一条 exec::read_state 合成的状态文本。
+        static uint32_t s_last_status_ms = 0;
+        if (has_client && cmd::exec_log() &&
+            (int32_t)(now - s_last_status_ms) >= (int32_t)400) {
+            s_last_status_ms = now;
+            char st[64];
+            if (exec::read_state(st, sizeof(st))) {
+                JsonDocument sdoc;
+                sdoc["type"] = "exec_status";
+                JsonObject sp = sdoc["params"].to<JsonObject>();
+                sp["text"] = st;
+                String js;
+                serializeJson(sdoc, js);
+                ws_send_text_to_ws_clients(js.c_str());
+            }
+        }
         // 图传已改走 UDP：WS 客户端在位仅作指令/状态通道，几乎不占射频；
         // 只有"真在推帧"（UDP 图传 / MJPEG 推流）才停 BLE 广播，否则手机随时可发现
         // VisionS3 重连（此前 WS 常挂/半开会让广播永久关闭，导致手机不重启连不上）。
@@ -1736,7 +1753,6 @@ void startCameraServer()
 #ifdef CONFIG_HTTPD_WS_SUPPORT
         httpd_register_uri_handler(stream_httpd, &ws_uri);
         xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 4096, NULL, 5, NULL, 1);
-        uart::set_forward_cb(ws_send_text_to_ws_clients);  // 执行板日志镜像 → 广播给手机
 #endif
     }
 }

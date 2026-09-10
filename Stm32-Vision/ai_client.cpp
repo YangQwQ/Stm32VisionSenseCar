@@ -1,7 +1,7 @@
 #include "ai_client.h"
 #include "config.h"
 #include "camera.h"
-#include "uart.h"
+#include "direct_exec.h"
 #include "wifi_net.h"
 
 #include <WiFiClientSecure.h>
@@ -763,7 +763,7 @@ static void ai_worker(void*) {
       // Wheels 模式只对轮子持续残留停轮子；臂持续残留（或未知）必须全停。
       const char* scope = (g_stop_mode == (int)ai::StopMode::Wheels && g_last_cont_type == 1) ? "wheels" : "all";
       JsonDocument d; d["scope"] = scope;   // d 即 stop 的 params 对象
-      uart::act("stop", d.as<JsonObjectConst>());
+      exec::act("stop", d.as<JsonObjectConst>());
       Serial.printf("[ai] 兜底 stop scope=%s\n", scope);
       g_last_continuous = false;
     };
@@ -807,7 +807,7 @@ static void ai_worker(void*) {
                                    : (stall_hint ? "画面与指令多轮无进展：请先小幅转向环视探索，或判断任务无法达成则输出 stop。" : "");
         PsaBuf body;
         char st[64];
-        const char* stp = uart::read_state(st, sizeof(st)) ? st : "";  // 执行板状态（无数据为空）
+        const char* stp = exec::read_state(st, sizeof(st)) ? st : "";  // 本地直驱状态（无执行板，状态本地合成）
         build_body(body, t.text, t.ann, hint, last_cmd, stp,
                    frame, frame_len, prev, prev_len, edited != nullptr, edited, edited_len);
         if (!body.ok) { fail = "组装请求 body 失败"; break; }
@@ -849,9 +849,9 @@ static void ai_worker(void*) {
             got = true;
             break;
           }
-          // 校验通过 → 执行 move/arm/stop
-          uart::act(type, params);
-          g_last_continuous = uart::is_continuous(type, params);
+          // 校验通过 → 执行 move/arm/stop（本板直驱，不再经执行板）
+          exec::act(type, params);
+          g_last_continuous = exec::is_continuous(type, params);
           g_last_cont_type = g_last_continuous ? (!strcmp(type, "move") ? 1 : 2) : 0;
           Serial.printf("[ai] 执行 %s%s\n", type, g_last_continuous ? "（持续）" : "");
           String fb = build_feedback(t.id, cmdD);

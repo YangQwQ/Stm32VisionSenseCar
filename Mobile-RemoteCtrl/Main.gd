@@ -39,6 +39,10 @@ const _JOY_SLOW := 0.5
 const _JOY_FAST := 1.0
 const _JOY_FAST_THRESH := 0.7
 const _JOY_STEER := 0.8
+## 直接驱动（绕过执行板）时的摇杆映射参数。
+const _DRIVE_MAX := 1000       # 油门满量程 PWM（低速档 500 / 高速档 1000）
+const _SERVO_CENTER := 150     # 转向舵中位（/servo 1 150 = 正前）
+const _SERVO_RANGE := 30       # 转向舵单侧偏转量（右 +30→180 / 左 -30→120）
 ## 最近一次成功连接的设备名，用于顶栏「已连接: xxx」。
 var _device_name := ""
 var _page_tween: Tween = null
@@ -523,9 +527,18 @@ func _update_joystick() -> void:
 	# 摇杆操作 = 手动接管：打断板端 AI 闭环，聊天发送按钮恢复「发送」
 	_chat_panel.set_ai_running(false)
 	if cmd == Vector2.ZERO:
-		AppState.send_command(CP.stop("wheels"))
-		return
-	AppState.send_command(CP.move(throttle, steering))
+			# 松手/居中：停四轮 + 转向回正
+			AppState.send_command(CP.drive(0))
+			AppState.send_command(CP.servo(0, _SERVO_CENTER))
+			return
+		# 直接驱动（绕过执行板）：油门 → 全车 drive，左右 → 转向舵（逻辑 0）。
+	var drive_spd := int(round(absf(throttle) * _DRIVE_MAX))
+	if throttle < 0:
+		drive_spd = -drive_spd
+	AppState.send_command(
+		CP.drive(clampi(drive_spd, -1000, 1000)))
+	AppState.send_command(CP.servo(0, clampi(
+		_SERVO_CENTER + int(round(steering / _JOY_STEER * _SERVO_RANGE)), 50, 250)))
 
 func _on_joystick_pressed(_v: Variant = null) -> void:
 	_joy_held = true
@@ -535,7 +548,8 @@ func _on_joystick_release(_v: Variant = null) -> void:
 	_joy_held = false
 	_last_joy_cmd = Vector2.ZERO
 	_chat_panel.set_ai_running(false)
-	AppState.send_command(CP.stop("wheels"))
+	AppState.send_command(CP.drive(0))
+	AppState.send_command(CP.servo(1, _SERVO_CENTER))
 
 # ============================== 状态 ==============================
 
