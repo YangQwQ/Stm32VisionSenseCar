@@ -1,5 +1,36 @@
 #include "direct_exec.h"
 #include "nezha_direct.h"
+#include <math.h>
+#include <string.h>
+
+// ================= 二连杆 IK 标定（挖掘机式机械臂） =================
+// 几何：第一节(A)长 L1，第二节(B)长 L2，右舵机控 A 相对水平角 α，左舵机(推杆)控两臂夹角 β。
+// 轴(肩)高于地面 AXIS_H cm；末端夹爪位置 = f(α,β)。L1=L2=7.5cm（转轴到转轴）。
+#define IK_L1       7.5f
+#define IK_L2       7.5f
+#define AXIS_H      9.5f   // 肩轴相对地面的高度（3.5 平台 + 0.5 转轴 + 5.5 底盘）
+#define RMIN        4.0f   // 可达最近（约 3.5，留余量）
+#define RMAX        15.0f  // 理论最远 L1+L2
+
+// 标定映射（实测）：表按横轴升序排列。纵轴出界自动夹到首尾。
+// α(第一节与水平夹角, 度) → 右舵机 pwm
+const float ALPHA_X[] = { 0.f, 50.f, 55.f, 90.f };
+const float ALPHA_PWM[] = { 220.f, 200.f, 150.f, 130.f };
+// β(两臂夹角, 度) → 左舵机 pwm
+const float BETA_X[] = { 25.f, 45.f, 80.f, 140.f };
+const float BETA_PWM[] = { 130.f, 150.f, 180.f, 230.f };
+
+// 分段线性插值（查表），横轴需升序
+static float plerp(const float* xs, const float* ys, int n, float x) {
+  if (x <= xs[0]) return ys[0];
+  for (int i = 1; i < n; i++) {
+    if (x <= xs[i]) {
+      float t = (x - xs[i-1]) / (xs[i] - xs[i-1]);
+      return ys[i-1] + t * (ys[i] - ys[i-1]);
+    }
+  }
+  return ys[n-1];
+}
 
 // ================= 舵机限位 / 回中（移植自执行板官方机械臂驱动，勿随意改） =================
 // 大圣机械臂(有方NeZha)三舵机：Servo2=左舵机(前后移爪) Servo3=前舵机(夹爪) Servo4=右舵机(抬落)。
@@ -8,18 +39,18 @@
 #define STEER_CENTER  150
 #define STEER_LO      120
 #define STEER_HI      180
-// Servo2 前后移爪（reach）：中值200，伸(+250)/缩(-186)
+// Servo2 前后移爪（reach/左舵机·推杆）：有效行程按实测 β 表 130..230，留余量 120..250
 #define REACH_CENTER  200
-#define REACH_LO      186
+#define REACH_LO      120
 #define REACH_HI      250
 // Servo3 夹爪（grip）：夹紧 50 / 松 140 / 回正初始 140
 #define GRIP_CENTER   140
 #define GRIP_CLOSE    50
 #define GRIP_LO       50
 #define GRIP_HI       140
-// Servo4 抬落（lift）：中值180，抬(-163)/落(+250)
+// Servo4 抬落（lift/右舵机·第一节）：有效行程按实测 α 表 130..220，留余量 115..250
 #define LIFT_CENTER   180
-#define LIFT_LO       163
+#define LIFT_LO       115
 #define LIFT_HI       250
 // 连续动作每节拍步进；dist_cm 仅近似（无里程计），每 cm 约 8 拍
 #define ARM_STEP      2
@@ -178,6 +209,31 @@ bool exec::set_servo(uint8_t logical, uint16_t pwm) {
     default:
       return false;
   }
+}
+
+bool exec::arm_pose(float x, float h) {
+  // 给末端目标位姿：x=轴前方 cm，h=地面以上高度 cm。
+  // 相对臂基坐标 z = h - AXIS_H；二连杆反解 → (α,β) → 查表得左右两舵机 pwm，联动下发。
+  float z = h - AXIS_H;
+  float r2 = x * x + z * z;
+  if (r2 < RMIN * RMIN || r2 > RMAX * RMAX) return false;  // 目标不可达
+  float r = sqrtf(r2);
+  float d = (IK_L1*IK_L1 + IK_L2*IK_L2 - r2) / (2.f*IK_L1*IK_L2);
+  d = d > 1.f ? 1.f : (d < -1.f ? -1.f : d);
+  float beta = acosf(d) * 180.f / PI;
+  float ph = (IK_L1*IK_L1 + r2 - IK_L2*IK_L2) / (2.f*IK_L1*r);
+  ph = ph > 1.f ? 1.f : (ph < -1.f ? -1.f : ph);
+  float phi0 = acosf(ph) * 180.f / PI;               // 原点处基线与第一节夹角
+  float psi  = atan2f(z, x) * 180.f / PI;            // 原点指向目标的方位角
+  float alpha = psi + phi0;
+
+  int pr = (int)roundf(plerp(ALPHA_X, ALPHA_PWM, 4, alpha));
+  int pl = (int)roundf(plerp(BETA_X,  BETA_PWM,  4, beta));
+  pr = pr < 50 ? 50 : (pr > 250 ? 250 : pr);
+  pl = pl < 50 ? 50 : (pl > 250 ? 250 : pl);
+  // 联动：一次同时给左右两舵机目标。set_servo 内部会限 pwm 并同步状态。
+  bool ok = set_servo(1, (uint16_t)pl) & set_servo(2, (uint16_t)pr);
+  return ok;
 }
 
 bool exec::act(const char* type, const JsonObjectConst& params) {

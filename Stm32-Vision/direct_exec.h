@@ -18,6 +18,8 @@ bool act(const char* type, const JsonObjectConst& params);
 // 调试直驱单舵机：logical 0=转向 / 1=左(前后移爪) / 2=右(抬落) / 3=前(夹爪)。
 // 直接写原始 pwm（50..250），不过标定限位，用于探机械极限/标定。返回 false=参数非法。
 bool set_servo(uint8_t logical, uint16_t pwm);
+// 二连杆 IK：给末端目标位姿(x=轴前方cm, h=地面以上cm)，联动解算并下发左右两舵机 pwm。目标不可达返回 false。
+bool arm_pose(float x, float h);
 // 该指令是否为"持续型"（持续直驱需要配 stop 收尾）。
 bool is_continuous(const char* type, const JsonObjectConst& params);
 // 本地合成状态文本，写不进内容即返回 false。

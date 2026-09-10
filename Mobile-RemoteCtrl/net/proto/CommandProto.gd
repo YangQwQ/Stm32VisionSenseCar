@@ -76,6 +76,10 @@ static func servo(n: int, pwm: int) -> Dictionary:
 	# 调试直驱：大脑板直接驱动哪吒舵机（n=0转向/1左(前后)/2右(抬落)/3前(夹爪), pwm=50..250）
 	return {"type": "servo", "params": {"n": n, "pwm": pwm}, "id": _new_id()}
 
+static func arm_pose(x: float, h: float) -> Dictionary:
+	# 二连杆 IK：末端位姿(x=轴前方cm, h=地面以上cm) → 大脑板联动算左右两舵机 pwm
+	return {"type": "arm_pose", "params": {"x": x, "h": h}, "id": _new_id()}
+
 static func motor(n: int, a: int, b: int) -> Dictionary:
 	# 调试直驱：绕过执行板，大脑板直接驱动哪吒单轮电机（n=1..4, a=正转 b=反转, 0..1000）
 	return {"type": "motor", "params": {"n": n, "a": a, "b": b}, "id": _new_id()}
@@ -120,6 +124,7 @@ const COMMAND_HINTS := {
 	"/ws [connect [IP]|disconnect|status]": "WS 手动连接/断开/状态",
 	"/connect <IP>": "不经蓝牙直连 WS",
 	"/servo <n=0转向/1左/2右/3前> <pwm=50..250>": "直驱舵机(可超标定限位)",
+	"/arm_pose <x> <h>": "机械臂末端到指定位姿(轴前方cm, 地面以上cm)",
 	"/motor <n> <a> <b>": "直驱单轮电机(绕过执行板)",
 	"/drive <speed>": "一键全车前进/后退/停(绕过执行板)",
 }

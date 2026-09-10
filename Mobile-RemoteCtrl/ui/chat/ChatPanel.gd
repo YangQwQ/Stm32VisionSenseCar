@@ -406,6 +406,18 @@ func _handle_slash(text: String) -> void:
 				chat("提示", "用法: /servo <n=0转向/1左/2右/3前> <pwm=50..250>")
 				return
 			cmd = CP.servo(serv_n, serv_pwm)
+		"/arm_pose":  # 二连杆 IK：给末端位姿，让大脑板联动算左右两舵机
+			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
+			var pv := sp.split(" ", true, 1)
+			if pv.size() < 2 or not pv[0].is_valid_float() or not pv[1].is_valid_float():
+				chat("提示", "用法: /arm_pose <x=轴前方cm> <h=地面以上cm>")
+				return
+			var pose_x := pv[0].to_float()
+			var pose_h := pv[1].to_float()
+			if pose_x < 0.0 or pose_h < 0.0:
+				chat("提示", "用法: /arm_pose <x=轴前方cm> <h=地面以上cm>")
+				return
+			cmd = CP.arm_pose(pose_x, pose_h)
 		"/motor":  # 调试直驱：绕过执行板，大脑板直接驱动哪吒单轮电机
 			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
 			var mv := sp.split(" ", true, 2)

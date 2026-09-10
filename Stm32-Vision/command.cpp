@@ -182,9 +182,21 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     int n = params["n"] | -1;
     int p = params["pwm"] | -1;
     if (n >= 0 && n <= 3 && p >= 50 && p <= 250 && exec::set_servo((uint8_t)n, (uint16_t)p)) {
-      reply_status(doc, reply, reply_ctx, "servo ok");
+      // 成功不回执：摇杆/按钮高频下发，状态看 exec_log 即知。
     } else {
       reply_status(doc, reply, reply_ctx, "servo: n=0转向/1左/2右/3前 pwm=50..250(可超标定限位)");
+    }
+    return;
+  }
+
+  if (!strcmp(type, "arm_pose")) {
+    // 二连杆 IK：给末端位姿(x=轴前方cm, h=地面以上cm)，联动算左右两舵机 pwm 一并下发。
+    float x = params["x"] | -1.f;
+    float h = params["h"] | -1.f;
+    if (x >= 0.f && h >= 0.f && exec::arm_pose(x, h)) {
+      // 成功不回执：状态看 exec_log 即知。
+    } else {
+      reply_status(doc, reply, reply_ctx, "arm_pose: 目标不可达，需要 x=轴前方cm h=地面以上cm");
     }
     return;
   }
@@ -197,7 +209,7 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     int b = params["b"] | -1;
     if (n >= 1 && n <= 4 && a >= 0 && b >= 0 && a <= 1000 && b <= 1000 &&
         nezha::set_motor((uint8_t)n, (uint16_t)a, (uint16_t)b)) {
-      reply_status(doc, reply, reply_ctx, "motor ok");
+      // 成功不回执：摇杆/按钮高频下发，状态看 exec_log 即知。
     } else {
       reply_status(doc, reply, reply_ctx, "motor: 参数需 n=1..4 a,b=0..1000");
     }
@@ -221,7 +233,7 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     nezha::set_motor(2, rev ? u : 0, rev ? 0 : u);
     nezha::set_motor(3, rev ? u : 0, rev ? 0 : u);
     nezha::set_motor(4, rev ? 0 : u, rev ? u : 0);
-    reply_status(doc, reply, reply_ctx, "drive ok");
+    // 成功不回执：摇杆/按钮高频下发，状态看 exec_log 即知。
     return;
   }
 
