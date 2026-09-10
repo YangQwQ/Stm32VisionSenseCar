@@ -21,11 +21,15 @@ const _IMAGE_AREA_H := 310.0
 @onready var _bottom: TabContainer = $ChatLog/BottomPanl
 @onready var _cmd_hint: Label = $ChatLog/BottomPanl/CommandHint
 @onready var _message_input: LineEdit = $InputRow/MessageInput
+@onready var _send_btn: Button = $InputRow/SendBtn
 @onready var _panels: Array = [
 	$ChatLog/BottomPanl/ImageList/Image1,
 	$ChatLog/BottomPanl/ImageList/Image2,
 	$ChatLog/BottomPanl/ImageList/Image3,
 ]
+
+## AI 任务执行中：发送按钮切换为「中止」（急停），按下打断任务并停车。
+var _ai_running := false
 
 ## 待上传的编辑图附件 [{image: Image, annotation: Dictionary}]，按加入顺序展示。
 var _attachments: Array = []
@@ -62,6 +66,13 @@ func chat(who: String, msg: String) -> void:
 ## 展示一条 ai_result：{type:"ai_result", id, params:{error?, reason?, done?, command:{type,params,reason}}}。
 func show_ai_result(data: Dictionary) -> void:
 	var params: Variant = data.get("params")
+	# 仅终轮（done:true）复位按钮：多轮任务每轮都回 ai_result，中途复位会让「中止」失效。
+	var is_final := false
+	if params is Dictionary:
+		var dv: Variant = (params as Dictionary).get("done")
+		is_final = dv is bool and (dv as bool)
+	if is_final:
+		set_ai_running(false)
 	var line := ""
 	if params is Dictionary:
 		var pd: Dictionary = params as Dictionary
@@ -156,6 +167,10 @@ func _on_input_text_changed(_new_text: String) -> void:
 	_refresh_bottom()
 
 func _on_send_pressed(_new_text: String = "") -> void:
+	# AI 任务执行中：按钮语义已切换为「中止」，按下即打断任务并急停，不发输入内容。
+	if _ai_running:
+		_abort_ai()
+		return
 	if _message_input.text.strip_edges().is_empty() and _attachments.is_empty():
 		return
 	if not _attachments.is_empty():
@@ -183,11 +198,28 @@ func _on_send_pressed(_new_text: String = "") -> void:
 	else:
 		_send_ai_goal(text)
 
+## 切换 AI 执行中状态，同步发送按钮文字（发送 ↔ 中止）。Main 摇杆手动接管时也会调用。
+func set_ai_running(run: bool) -> void:
+	if _ai_running == run:
+		return
+	_ai_running = run
+	_send_btn.button_pressed = run
+	_send_btn.text = "中止" if run else "发送"
+
+## 中止 AI：打断进行中的任务并急停（板端 ai_cancel 打断闭环并补停残留持续指令）。
+func _abort_ai() -> void:
+	chat("本机", "/ai cancel（中止）")
+	if not AppState.send_command(CP.ai_cancel()):
+		chat("提示", "中止指令未发送(当前离线)")
+	set_ai_running(false)
+
 func _send_ai_goal(text: String) -> void:
 	chat("本机", text)
 	var cmd: Dictionary = CP.ai_goal(text)
 	if not AppState.send_command(cmd):
 		chat("提示", "目标未发送：AI 目标走 WiFi（当前离线）")
+		return
+	set_ai_running(true)
 
 func _send_image_goal(items: Array, message: String) -> void:
 	chat("本机", ("发图·%s" % message) if message.strip_edges() != "" else "发图")
@@ -197,6 +229,8 @@ func _send_image_goal(items: Array, message: String) -> void:
 	var cmd: Dictionary = CP.ai_goal(message, ann, true)
 	if not AppState.send_command(cmd):
 		chat("提示", "AI 目标未发送（WS 掉线？）")
+		return
+	set_ai_running(true)
 
 ## /ai 指令 + 图：按子命令（goal/oneshot/cancel）解析，图作为意图锚点随指令上行。
 func _send_ai_with_images(items: Array, text: String) -> void:
@@ -223,6 +257,8 @@ func _send_ai_with_images(items: Array, text: String) -> void:
 			cmd = CP.ai_goal(msg, ann, true)
 	if not AppState.send_command(cmd):
 		chat("提示", "AI 指令未发送（WS 掉线？）")
+		return
+	set_ai_running(mode != "cancel")
 
 ## 逐张上行编辑图（WS 二进制），任一张失败即中断并返回 false。
 func _upload_images(items: Array) -> bool:
@@ -315,6 +351,7 @@ func _handle_slash(text: String) -> void:
 			if pieces.size() > 1 and pieces[1].strip_edges().to_lower() in ["wheels", "arm"]:
 				scope = pieces[1].strip_edges().to_lower()
 			cmd = CP.stop(scope)
+			set_ai_running(false)  # /stop 手动接管：板端打断 AI 闭环，按钮恢复
 		"/config":
 			var rest := pieces[1] if pieces.size() > 1 else ""
 			var kv := rest.strip_edges().split(" ", true, 1)
@@ -336,6 +373,7 @@ func _handle_slash(text: String) -> void:
 		"/cancel", "/stopai":  # 兼容旧写法，等同 /ai cancel
 			chat("本机", text)
 			cmd = CP.ai_cancel()
+			set_ai_running(false)
 		"/ws":
 			_handle_ws_slash(text)
 			return
@@ -371,6 +409,8 @@ func _handle_ai_slash(text: String) -> void:
 	chat("本机", text)
 	if not AppState.send_command(cmd):
 		chat("提示", "指令未发送(当前离线)")
+		return
+	set_ai_running(mode != "cancel")
 
 func _show_help() -> void:
 	var lines := CP.help_lines()

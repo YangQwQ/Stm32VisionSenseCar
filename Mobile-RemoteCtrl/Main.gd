@@ -386,6 +386,7 @@ func _on_ws_connected() -> void:
 func _on_ws_disconnected(reason: String) -> void:
 	_video.call("show_no_signal", true)
 	DeviceConn.stop_video()  # WS 掉线：UDP 对端随之失效，停接收
+	_chat_panel.set_ai_running(false)  # 掉线即任务中断：按钮复位「发送」，避免重连后残留「中止」
 	_update_status()
 	var r := reason
 	if r.is_empty():
@@ -519,6 +520,8 @@ func _update_joystick() -> void:
 	if cmd == _last_joy_cmd:
 		return
 	_last_joy_cmd = cmd
+	# 摇杆操作 = 手动接管：打断板端 AI 闭环，聊天发送按钮恢复「发送」
+	_chat_panel.set_ai_running(false)
 	if cmd == Vector2.ZERO:
 		AppState.send_command(CP.stop("wheels"))
 		return
@@ -531,6 +534,7 @@ func _on_joystick_pressed(_v: Variant = null) -> void:
 func _on_joystick_release(_v: Variant = null) -> void:
 	_joy_held = false
 	_last_joy_cmd = Vector2.ZERO
+	_chat_panel.set_ai_running(false)
 	AppState.send_command(CP.stop("wheels"))
 
 # ============================== 状态 ==============================

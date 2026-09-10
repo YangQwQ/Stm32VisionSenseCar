@@ -214,7 +214,7 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\",\"dist_cm\":15},\"reason\":\"..\"} act 取 lift_up/lift_down/reach_forward/reach_backward/clip/release；与操作者交接物品时先停稳、伸到其手边再 release；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
   sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 保持当前所有动作不变，原地等待观察：当还在运动中没到目标、或者画面没变化、或者还没锁定目标时，用 wait；");
-  sys.put("规则：1.只输出 JSON，每次只规划一步。2.画面多轮无变化时先小幅转向环视探索；障碍物挡路则尝试绕行；绕行多轮仍无进展才 stop 并说明原因。3.停车信号只认明确手势：掌心正对镜头且五指张开、在镜头前持续上下/左右挥手、或人持续挡在车前，此时才 stop；人只是坐着、抬手或手指出现在画面里，不是停车信号。4.单手指向或手臂指向某一方向=操作者的方向指示，应朝该方向移动；画面中标出目标时朝标注区域移动，不要因为出现人手就停车。5.目标为空或“巡视”时持续小幅转向环视四周。6.reason 一句中文简要解释。");
+  sys.put("规则：1.只输出 JSON，每次只规划一步。2.画面多轮无变化时先小幅转向环视探索；障碍物挡路则尝试绕行；绕行多轮仍无进展才 stop 并说明原因。3.停车信号只认明确手势：掌心正对镜头且五指张开、在镜头前持续上下/左右挥手、或人持续挡在车前，此时才 stop；人只是坐着、抬手或手指出现在画面里，不是停车信号。4.单手指向或手臂指向某一方向=操作者的方向指示，应朝该方向移动；画面中标出目标时朝标注区域移动，不要因为出现人手就停车。5.若目标是纯判断/评估类（含“判断”“是否”“能不能”“可达”“能不能到达”等），以判断优先于移动：不要朝标注区域移动，输出 stop 或 wait 并在 reason 里直接给出结论（如“该位置在对面，不可到达”）。6.目标为空或“巡视”时持续小幅转向环视四周。7.reason 一句中文简要解释。");
   if (hint && hint[0]) { sys.put("注意："); sys.put(hint); }
 
   b.put("{\"model\":");
@@ -861,7 +861,12 @@ static void ai_worker(void*) {
           if (strcmp(cur_cmd, last_cmd)) { stall = 0; stall_hint = false; }
           else if (++stall >= 4 && !stall_hint) { stall_hint = true; Serial.println("[ai] 多轮无进展，注入引导"); }
           snprintf(last_cmd, sizeof(last_cmd), "%s", cur_cmd);
-          // stop 仅停车，不再结束任务；任务由手动中断/cancel 或步数上限结束
+          // stop + done:true = AI 自判任务完成：停车并结束任务（build_feedback 已带 done 上报手机端）；
+          // 不带 done 的 stop 仅临时停车观察，任务继续下一轮。严格按 bool 判定，防模型输出字符串 "true"。
+          if (!strcmp(type, "stop") && cmdD["done"].is<bool>() && cmdD["done"].as<bool>()) {
+            done = true;
+            Serial.println("[ai] AI 判定任务完成（stop+done）");
+          }
           got = true;
           break;
         } else {
@@ -886,6 +891,11 @@ static void ai_worker(void*) {
           String s = build_feedback(t.id, e);
           enqueue_result(s.c_str(), t.fn, t.ctx);
         }
+        // 单轮收尾：补一条带 done 的完成通知，让手机端复位「发送」并显示任务结束。
+        JsonDocument e(&g_js_alloc);
+        e["done"] = true;
+        String s = build_feedback(t.id, e);
+        enqueue_result(s.c_str(), t.fn, t.ctx);
         done = true;
         break;
       }
