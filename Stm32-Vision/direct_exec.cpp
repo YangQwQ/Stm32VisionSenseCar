@@ -66,6 +66,7 @@ static int16_t s_grip  = GRIP_CENTER;
 // 小车行驶状态（本地合成用）：0 停 / 1 前 / 2 后
 static int s_car_motion = 0;
 static int s_steer_dir  = 0;  // 0 正前 / 1 左 / 2 右
+static int s_spin = 0;        // 原地旋转：0 无 / 1 左进右退(逆时针) / -1 右进左退(顺时针)
 
 // 连续机械臂动作：servo=0 表示无活跃动作
 static struct {
@@ -82,6 +83,26 @@ static void drive_motors(int spd) {
   nezha::set_motor(2, rev ? u : 0u, rev ? 0u : u);
   nezha::set_motor(3, rev ? u : 0u, rev ? 0u : u);
   nezha::set_motor(4, rev ? 0u : u, rev ? u : 0u);
+}
+
+// 原地旋转（普通四轮滑移式，无需特殊轮子）：左/右侧轮反向拖胎绕中心旋转。
+// dir=+1 左进右退(逆时针) / -1 左退右进(顺时针) / 0 停；speed=单车轮 pwm 0..1000。
+// 车轮映射与 drive_motors 一致：左轮 a 正前、右轮 b 正前，故 dir>0 统一写 (a,0)、dir<0 统一写 (0,b)。
+static void send_spin(const JsonObjectConst& p) {
+  int dir = p["dir"] | 0;
+  int spd = p["speed"] | 500;
+  if (spd < 0) spd = 0;
+  if (spd > 1000) spd = 1000;
+  s_spin = dir == 0 ? 0 : (dir > 0 ? 1 : -1);
+  uint16_t u = (uint16_t)spd;
+  if (dir > 0) {
+    nezha::set_motor(1, u, 0); nezha::set_motor(2, u, 0);
+    nezha::set_motor(3, u, 0); nezha::set_motor(4, u, 0);
+  } else {
+    nezha::set_motor(1, 0, u); nezha::set_motor(2, 0, u);
+    nezha::set_motor(3, 0, u); nezha::set_motor(4, 0, u);
+  }
+  s_car_motion = 0;  // 原地旋转不算前进/后退
 }
 
 static void clear_active(void) { s_active.servo = 0; s_active.budget = 0; }
@@ -109,6 +130,7 @@ void exec::init(void) {
 
 void exec::reset(void) {
   s_car_motion = 0;
+  s_spin = 0;
   clear_active();
   exec::init();
 }
@@ -177,6 +199,7 @@ static void send_move(const JsonObjectConst& p) {
     float s = st; if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
     set_steer_pwm((int16_t)(STEER_CENTER + s * 30.0f));
   }
+  s_spin = 0;  // 常规行驶（move）接管后清除原地旋转
 }
 
 static void send_stop(const JsonObjectConst& p) {
@@ -186,6 +209,7 @@ static void send_stop(const JsonObjectConst& p) {
   } else {
     drive_motors(0);
     s_car_motion = 0;
+    s_spin = 0;
   }
 }
 
@@ -238,6 +262,7 @@ bool exec::arm_pose(float x, float h) {
 
 bool exec::act(const char* type, const JsonObjectConst& params) {
   if (!strcmp(type, "move"))   { send_move(params); return true; }
+  if (!strcmp(type, "spin"))   { send_spin(params); return true; }
   if (!strcmp(type, "stop"))   { send_stop(params); return true; }
   if (!strcmp(type, "arm"))    { send_arm(params);  return true; }
   if (!strcmp(type, "light")) {
@@ -256,6 +281,9 @@ bool exec::is_continuous(const char* type, const JsonObjectConst& p) {
     return (fabsf(th) > 0.001f && !p["distance_cm"].is<int>()) ||
            (fabsf(st) > 0.001f && !p["angle_deg"].is<int>());
   }
+  if (!strcmp(type, "spin")) {
+    return (p["dir"] | 0) != 0;  // dir 非 0 = 持续原地旋转，需 stop 收尾
+  }
   if (!strcmp(type, "arm")) {
     const char* act_ = p["act"] | "";
     bool cont = !strcmp(act_, "lift_up") || !strcmp(act_, "lift_down") ||
@@ -266,7 +294,8 @@ bool exec::is_continuous(const char* type, const JsonObjectConst& p) {
 }
 
 bool exec::read_state(char* buf, size_t cap) {
-  const char* car = s_car_motion == 1 ? "前进" : (s_car_motion == 2 ? "后退" : "停止");
+  const char* car = s_spin != 0 ? (s_spin > 0 ? "原地左转" : "原地右转")
+                                : (s_car_motion == 1 ? "前进" : (s_car_motion == 2 ? "后退" : "停止"));
   const char* steer = s_steer_dir == 1 ? "左" : (s_steer_dir == 2 ? "右" : "正");
   snprintf(buf, cap, "小车:%s %s | 机械臂:左:%d 右:%d 前:%d",
     car, steer, (int)s_reach, (int)s_lift, (int)s_grip);

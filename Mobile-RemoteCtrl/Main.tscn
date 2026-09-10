@@ -1334,6 +1334,13 @@ theme_override_font_sizes/font_size = 52
 text = "关闭自动建立WS连接"
 flat = true
 
+[node name="SpinMode" type="CheckButton" parent="BodyAbout/Options" unique_id=607347106]
+custom_minimum_size = Vector2(0, 120)
+layout_mode = 2
+theme_override_font_sizes/font_size = 52
+text = "使用原地旋转作为转向行为"
+flat = true
+
 [node name="About" type="Panel" parent="BodyAbout" unique_id=1950890272]
 custom_minimum_size = Vector2(0, 500)
 layout_mode = 2
@@ -1595,6 +1602,7 @@ layout_mode = 1
 [connection signal="released" from="BodyControl/CtrlArea/Joystick" to="." method="_on_joystick_release"]
 [connection signal="toggled" from="BodyAbout/Options/AutoConnOnStart" to="." method="_on_auto_conn_toggled"]
 [connection signal="toggled" from="BodyAbout/Options/DisableAutoConnWS" to="." method="_on_disable_ws_toggled"]
+[connection signal="toggled" from="BodyAbout/Options/SpinMode" to="." method="_on_spin_mode_toggle"]
 [connection signal="confirmed" from="WifiPopup" to="." method="_on_wifi_confirmed"]
 [connection signal="pressed" from="WifiPopup/VBox/Btns/Cancel" to="WifiPopup" method="_on_cancel_pressed"]
 [connection signal="pressed" from="WifiPopup/VBox/Btns/Confirm" to="WifiPopup" method="_on_confirm_pressed"]

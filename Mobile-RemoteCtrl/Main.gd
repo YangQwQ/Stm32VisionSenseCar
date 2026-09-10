@@ -27,6 +27,7 @@ const BT_ITEM := preload("res://ui/bluetooth/BTDeviceListItem.tscn")
 @onready var _body_about: Control = $BodyAbout
 @onready var _auto_conn_btn: CheckButton = $BodyAbout/Options/AutoConnOnStart
 @onready var _disable_ws_btn: CheckButton = $BodyAbout/Options/DisableAutoConnWS
+@onready var _spin_mode_btn: CheckButton = $BodyAbout/Options/SpinMode
 @onready var _nav_bt: TextureButton = $NaviBar/HBox/BTScan
 @onready var _nav_ctrl: TextureButton = $NaviBar/HBox/Control
 @onready var _nav_about: TextureButton = $NaviBar/HBox/About
@@ -43,6 +44,7 @@ const _JOY_STEER := 0.8
 const _DRIVE_MAX := 1000       # 油门满量程 PWM（低速档 500 / 高速档 1000）
 const _SERVO_CENTER := 150     # 转向舵中位（/servo 1 150 = 正前）
 const _SERVO_RANGE := 30       # 转向舵单侧偏转量（右 +30→180 / 左 -30→120）
+const _SPIN_SPEED := 600       # 原地旋转模式下左右推摇杆的单轮 PWM（0..1000）
 ## 最近一次成功连接的设备名，用于顶栏「已连接: xxx」。
 var _device_name := ""
 var _page_tween: Tween = null
@@ -85,6 +87,7 @@ func _ready() -> void:
 	# 设置项：读取本地配置并同步两个开关状态；开启启动自连时按最近设备重连。
 	_auto_conn_btn.set_pressed_no_signal(Store.get_auto_conn())
 	_disable_ws_btn.set_pressed_no_signal(Store.get_disable_auto_ws())
+	_spin_mode_btn.set_pressed_no_signal(Store.get_spin_mode())
 	if Store.get_auto_conn():
 		# 启动即自动连接：直接进控制页（页 1，触发 _on_nav_toggled → _switch_page），不再停在蓝牙扫描页。
 		_nav_ctrl.button_pressed = true
@@ -138,6 +141,10 @@ func _on_auto_conn_toggled(on: bool) -> void:
 ## 设置项：关闭自动建立 WS 连接（纯蓝牙控制）。仅持久化，连连接态下一次设备连接生效。
 func _on_disable_ws_toggled(on: bool) -> void:
 	Store.set_disable_auto_ws(on)
+
+## 设置项：原地旋转模式——开启后左右推摇杆改为发送原地旋转(spin)，取代转向舵。
+func _on_spin_mode_toggle(on: bool) -> void:
+	Store.set_spin_mode(on)
 
 ## 启动（或开启自连开关）时重连上次设备。Android 栈要求设备必须先被扫描到才能连接，
 ## 故这里先扫描、等 `_on_device_found` 中目标地址出现再连（不能像 RECOVERY 那样按地址直连）。
@@ -527,18 +534,25 @@ func _update_joystick() -> void:
 	# 摇杆操作 = 手动接管：打断板端 AI 闭环，聊天发送按钮恢复「发送」
 	_chat_panel.set_ai_running(false)
 	if cmd == Vector2.ZERO:
-			# 松手/居中：停四轮 + 转向回正
+			# 松手/居中：停四轮；原地旋转模式下停旋转，否则转向回正
 			AppState.send_command(CP.drive(0))
-			AppState.send_command(CP.servo(0, _SERVO_CENTER))
+			if _spin_mode_btn.button_pressed:
+				AppState.send_command(CP.spin(0))
+			else:
+				AppState.send_command(CP.servo(0, _SERVO_CENTER))
 			return
-		# 直接驱动（绕过执行板）：油门 → 全车 drive，左右 → 转向舵（逻辑 0）。
+	# 直接驱动（绕过执行板）：油门 → 全车 drive；左右 → 转向舵（逻辑 0），
+	# 原地旋转模式下改为原地旋转(向右推=顺时针 dir=-1 / 向左推=逆时针 dir=+1)。
 	var drive_spd := int(round(absf(throttle) * _DRIVE_MAX))
 	if throttle < 0:
 		drive_spd = -drive_spd
-	AppState.send_command(
-		CP.drive(clampi(drive_spd, -1000, 1000)))
-	AppState.send_command(CP.servo(0, clampi(
-		_SERVO_CENTER + int(round(steering / _JOY_STEER * _SERVO_RANGE)), 50, 250)))
+	AppState.send_command(CP.drive(clampi(drive_spd, -1000, 1000)))
+	if _spin_mode_btn.button_pressed:
+		if absf(steering) >= _JOY_DEADZONE:
+			AppState.send_command(CP.spin(-1 if steering > 0 else 1, _SPIN_SPEED))
+	else:
+		AppState.send_command(CP.servo(0, clampi(
+			_SERVO_CENTER + int(round(steering / _JOY_STEER * _SERVO_RANGE)), 50, 250)))
 
 func _on_joystick_pressed(_v: Variant = null) -> void:
 	_joy_held = true
@@ -549,7 +563,10 @@ func _on_joystick_release(_v: Variant = null) -> void:
 	_last_joy_cmd = Vector2.ZERO
 	_chat_panel.set_ai_running(false)
 	AppState.send_command(CP.drive(0))
-	AppState.send_command(CP.servo(1, _SERVO_CENTER))
+	if _spin_mode_btn.button_pressed:
+		AppState.send_command(CP.spin(0))
+	else:
+		AppState.send_command(CP.servo(1, _SERVO_CENTER))
 
 # ============================== 状态 ==============================
 

@@ -418,6 +418,20 @@ func _handle_slash(text: String) -> void:
 				chat("提示", "用法: /arm_pose <x=轴前方cm> <h=地面以上cm>")
 				return
 			cmd = CP.arm_pose(pose_x, pose_h)
+		"/spin":  # 原地转向（普通四轮滑移式）
+			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
+			var sv := sp.split(" ", true, 1)
+			if sv.size() < 1 or not sv[0].is_valid_int():
+				chat("提示", "用法: /spin <dir=+1/-1/0> [speed 0..1000]")
+				return
+			var spin_dir := sv[0].to_int()
+			var spin_speed := 500
+			if sv.size() > 1 and sv[1].is_valid_int():
+				spin_speed = clampi(sv[1].to_int(), 0, 1000)
+			if spin_dir < -1 or spin_dir > 1:
+				chat("提示", "用法: /spin <dir=+1/-1/0> [speed 0..1000]")
+				return
+			cmd = CP.spin(spin_dir, spin_speed)
 		"/motor":  # 调试直驱：绕过执行板，大脑板直接驱动哪吒单轮电机
 			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
 			var mv := sp.split(" ", true, 2)

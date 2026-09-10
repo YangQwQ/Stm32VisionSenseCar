@@ -211,10 +211,11 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   sys.put(last_cmd && last_cmd[0] ? last_cmd : "无");
   sys.put("。每次只输出一个合法 JSON：");
   sys.put("{\"type\":\"move\",\"params\":{\"throttle\":0.3,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 移动/转向：加 distance_cm 定距、angle_deg 定角，否则持续移动；低速优先 throttle/steering≤0.5；");
+  sys.put("或 {\"type\":\"spin\",\"params\":{\"dir\":1},\"reason\":\"..\"} 原地旋转(dir: +1逆时针/-1顺时针/0停)：保持车头朝向不变原地转动视角，是观察环境/环视四周的推荐转弯方式，须配合前轮保持直行；");
   sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\",\"dist_cm\":15},\"reason\":\"..\"} act 取 lift_up/lift_down/reach_forward/reach_backward/clip/release；与操作者交接物品时先停稳、伸到其手边再 release；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
   sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 保持当前所有动作不变，原地等待观察：当还在运动中没到目标、或者画面没变化、或者还没锁定目标时，用 wait；");
-  sys.put("规则：1.只输出 JSON，每次只规划一步。2.画面多轮无变化时先小幅转向环视探索；障碍物挡路则尝试绕行；绕行多轮仍无进展才 stop 并说明原因。3.停车信号只认明确手势：掌心正对镜头且五指张开、在镜头前持续上下/左右挥手、或人持续挡在车前，此时才 stop；人只是坐着、抬手或手指出现在画面里，不是停车信号。4.单手指向或手臂指向某一方向=操作者的方向指示，应朝该方向移动；画面中标出目标时朝标注区域移动，不要因为出现人手就停车。5.若目标是纯判断/评估类（含“判断”“是否”“能不能”“可达”“能不能到达”等），以判断优先于移动：不要朝标注区域移动，输出 stop 或 wait 并在 reason 里直接给出结论（如“该位置在对面，不可到达”）。6.目标为空或“巡视”时持续小幅转向环视四周。7.reason 一句中文简要解释。");
+  sys.put("规则：1.只输出 JSON，每次只规划一步。2.画面多轮无变化、或需要观察环境/还没锁定目标时，优先用 原地旋转(spin) 小幅环视探索视角；障碍物挡路则尝试绕行；绕行多轮仍无进展才 stop 并说明原因。3.停车信号只认明确手势：掌心正对镜头且五指张开、在镜头前持续上下/左右挥手、或人持续挡在车前，此时才 stop；人只是坐着、抬手或手指出现在画面里，不是停车信号。4.单手指向或手臂指向某一方向=操作者的方向指示，应朝该方向移动；画面中标出目标时朝标注区域移动，不要因为出现人手就停车。5.若目标是纯判断/评估类（含“判断”“是否”“能不能”“可达”“能不能到达”等），以判断优先于移动：不要朝标注区域移动，输出 stop 或 wait 并在 reason 里直接给出结论（如“该位置在对面，不可到达”）。6.目标为空或“巡视”时持续小幅原地旋转(spin)环视四周。7.reason 一句中文简要解释。");
   if (hint && hint[0]) { sys.put("注意："); sys.put(hint); }
 
   b.put("{\"model\":");
@@ -268,6 +269,9 @@ static void fmt_last(char* buf, size_t cap, const char* type, const JsonObjectCo
     int pd = p["dist_cm"] | 0;
     if (pd) snprintf(buf, cap, "arm %s %dcm", act, pd);
     else snprintf(buf, cap, "arm %s 持续", act);
+  } else if (!strcmp(type, "spin")) {
+    int dd = p["dir"] | 0;
+    snprintf(buf, cap, "spin %d", dd);
   } else {
     snprintf(buf, cap, "stop");
   }
@@ -293,7 +297,8 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
     return err_buf;
   }
   const char* type = doc["type"] | "";
-  if (strcmp(type, "move") && strcmp(type, "stop") && strcmp(type, "arm") && strcmp(type, "wait")) {
+  if (strcmp(type, "move") && strcmp(type, "stop") && strcmp(type, "arm") &&
+      strcmp(type, "wait") && strcmp(type, "spin")) {
     return "AI 输出非法 type";
   }
   if (!doc["params"].is<JsonObject>() && strcmp(type, "stop") && strcmp(type, "wait")) {
@@ -322,6 +327,10 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
     if (src["distance_cm"].is<int>() && dc) p["distance_cm"] = constrain(dc, 0, 500);
     if (src["angle_deg"].is<int>() && ad) p["angle_deg"] = constrain(ad, 0, 500);
     if (src["dist_cm"].is<int>() && pd) p["dist_cm"] = constrain(pd, 0, 500);
+    int sd = doc["params"]["dir"] | 0;
+    int ss = doc["params"]["speed"] | 500;
+    p["dir"] = constrain(sd, -1, 1);     // 原地旋转方向：±1/0
+    p["speed"] = constrain(ss, 0, 1000); // 原地旋转单轮 pwm
     const char* act = doc["params"]["act"] | "";
     if (act[0]) p["act"] = act;
     const char* scope = doc["params"]["scope"] | "all";

@@ -88,6 +88,11 @@ static func drive(speed: int) -> Dictionary:
 	# 调试直驱：一键全车前进/后退/停（单条命令；speed=-1000..1000, 0=停）
 	return {"type": "drive", "params": {"speed": speed}, "id": _new_id()}
 
+static func spin(dir: int, speed: int = 500) -> Dictionary:
+	# 原地转向：普通四轮滑移式。dir=+1左进右退 / -1左退右进 / 0停；speed=单轮pwm 0..1000。
+	# 需要转向舵回正前轮直行才转得正。
+	return {"type": "spin", "params": {"dir": dir, "speed": speed}, "id": _new_id()}
+
 ## /help 文案：可用指令说明（仅供本地展示，不下发板子）。
 static func help_lines() -> PackedStringArray:
 	return PackedStringArray([
@@ -127,6 +132,7 @@ const COMMAND_HINTS := {
 	"/arm_pose <x> <h>": "机械臂末端到指定位姿(轴前方cm, 地面以上cm)",
 	"/motor <n> <a> <b>": "直驱单轮电机(绕过执行板)",
 	"/drive <speed>": "一键全车前进/后退/停(绕过执行板)",
+	"/spin <dir> [speed]": "原地转向(±1左进右退/右进左退, 需前轮回正)",
 }
 
 ## 指令提示最多展示条数（超出截断，避免挡住聊天区）。

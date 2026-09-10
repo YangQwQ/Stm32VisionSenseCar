@@ -237,6 +237,22 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
+  if (!strcmp(type, "spin")) {
+    // 原地转向（普通四轮滑移式，无需特殊轮子）：靠左/右侧轮反向拖胎绕中心旋转。
+    // 前提：转向舵回正（steer 居中），前轮保持直行位。
+    // dir=+1 左进右退 / -1 左退右进 / 0 停；speed=单车轮 pwm 0..1000（默认 500）。
+    // 落地统一走 exec 保持马达映射与内部状态一致（持续判定/回正）。
+    int dir = params["dir"] | 0;
+    int spd = params["speed"] | 500;
+    if (dir < -1 || dir > 1 || spd < 0 || spd > 1000) {
+      reply_status(doc, reply, reply_ctx, "spin: dir=±1/0, speed=0..1000");
+      return;
+    }
+    exec::act("spin", params);
+    // 成功不回执：摇杆/按钮高频下发，状态看 exec_log 即知。
+    return;
+  }
+
   reply_status(doc, reply, reply_ctx, "未知指令类型");
 }
 

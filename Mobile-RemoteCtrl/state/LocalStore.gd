@@ -10,7 +10,7 @@ var _data: Dictionary = {
 	"last_device": {"address": "", "name": ""},
 	"wifi": {"ssid": "", "password": ""},
 	"ai": {"url": "", "key": "", "model": ""},
-	"settings": {"auto_conn": false, "disable_auto_ws": false},
+	"settings": {"auto_conn": false, "disable_auto_ws": false, "spin_mode": false},
 }
 
 func _ready() -> void:
@@ -32,6 +32,9 @@ func get_auto_conn() -> bool:
 
 func get_disable_auto_ws() -> bool:
 	return bool(_data.get("settings", {}).get("disable_auto_ws", false))
+
+func get_spin_mode() -> bool:
+	return bool(_data.get("settings", {}).get("spin_mode", false))
 
 # ============================== 写入 ==============================
 
@@ -77,6 +80,12 @@ func set_disable_auto_ws(v: bool) -> void:
 	_data["settings"] = s
 	_save()
 
+func set_spin_mode(v: bool) -> void:
+	var s: Dictionary = _data.get("settings", {})
+	s["spin_mode"] = v
+	_data["settings"] = s
+	_save()
+
 # ============================== 文件 ==============================
 
 func _load() -> void:
@@ -107,7 +116,7 @@ func _default_group(grp: String) -> Dictionary:
 		"ai":
 			return {"url": "", "key": "", "model": ""}
 		"settings":
-			return {"auto_conn": false, "disable_auto_ws": false}
+			return {"auto_conn": false, "disable_auto_ws": false, "spin_mode": false}
 		_:
 			return {}
 
