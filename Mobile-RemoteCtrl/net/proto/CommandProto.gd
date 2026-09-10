@@ -96,10 +96,18 @@ static func drive(speed: int) -> Dictionary:
 	# 调试直驱：一键全车前进/后退/停（单条命令；speed=-1000..1000, 0=停）
 	return {"type": "drive", "params": {"speed": speed}, "id": _new_id()}
 
-static func spin(dir: int, speed: int = 500) -> Dictionary:
+static func spin(dir: int, speed: int = 500, angle_deg: int = 0) -> Dictionary:
 	# 原地转向：普通四轮滑移式。dir=+1左进右退 / -1左退右进 / 0停；speed=单轮pwm 0..1000。
+	# angle_deg>0 时按板端时长近似"转指定度数"到点自停（无里程计，粗略，供微操/标定）。
 	# 需要转向舵回正前轮直行才转得正。
-	return {"type": "spin", "params": {"dir": dir, "speed": speed}, "id": _new_id()}
+	var params: Dictionary = {"dir": dir, "speed": speed}
+	if angle_deg > 0:
+		params["angle_deg"] = angle_deg
+	return {"type": "spin", "params": params, "id": _new_id()}
+
+static func move_dist(throttle: float, cm: int, steering: float = 0.0) -> Dictionary:
+	# 定距移动：油门+距离cm，板端按时长近似到时自停（无里程计，粗略，供微操/标定）。
+	return {"type": "move", "params": {"throttle": throttle, "steering": steering, "distance_cm": cm}, "id": _new_id()}
 
 ## /help 文案：可用指令说明（仅供本地展示，不下发板子）。
 static func help_lines() -> PackedStringArray:
@@ -121,6 +129,7 @@ static func help_lines() -> PackedStringArray:
 		"/servo <n> <pwm>  直驱机械臂舵机(绕过执行板,调试用)",
 		"/motor <n> <a> <b>  直驱单轮电机(绕过执行板,调试用)",
 		"/drive <speed>  一键全车前进/后退/停(绕过执行板)",
+		"/move <油门> <cm>  定距移动测试(板端按时长近似到点自停)",
 		"直接输入文字 = 以下发 AI 目标; 框选后发文字 = 带区域目标",
 	])
 
@@ -142,8 +151,9 @@ const COMMAND_HINTS := {
 	"/arm_pose <x> <h>": "机械臂末端到指定位姿(轴前方cm, 地面以上cm)",
 	"/motor <n> <a> <b>": "直驱单轮电机(绕过执行板)",
 	"/drive <speed>": "一键全车前进/后退/停(绕过执行板)",
-	"/spin <dir> [speed]": "原地转向(±1左进右退/右进左退, 需前轮回正)",
-}
+"/move <油门 -100..100> <距离cm>": "定距移动测试(时长近似到点自停)",
+"/spin <dir> [speed] [angle]": "原地转向(第三参=定角测试)",
+	}
 
 ## 指令提示最多展示条数（超出截断，避免挡住聊天区）。
 const MAX_HINTS := 10

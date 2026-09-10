@@ -22,6 +22,9 @@ bool set_servo(uint8_t logical, uint16_t pwm);
 bool arm_pose(float x, float h);
 // 该指令是否为"持续型"（持续直驱需要配 stop 收尾）。
 bool is_continuous(const char* type, const JsonObjectConst& params);
+// 给 AI 的持续 move 设一个行驶时限（ms，>0 到期自动停轮；<=0 关闭不限时）。
+// 无里程计兜底：AI 决策间隔可达数秒，避免持续 move 在两次决策间一直冲撞墙。
+void set_move_cap_ms(int ms);
 // 夹爪当前是否处于夹紧态（供 get_state 同步手机按钮）。
 bool grip_closing();
 // 某路灯当前是否开启（kind=front/vibe/back；供 get_state 同步手机按钮）。

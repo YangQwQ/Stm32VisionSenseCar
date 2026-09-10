@@ -428,20 +428,36 @@ func _handle_slash(text: String) -> void:
 				chat("提示", "用法: /arm_pose <x=轴前方cm> <h=地面以上cm>")
 				return
 			cmd = CP.arm_pose(pose_x, pose_h)
-		"/spin":  # 原地转向（普通四轮滑移式）
+		"/spin":  # 原地转向（普通四轮滑移式）；第三参 angle_deg 定角微操（板端时长近似）
 			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
-			var sv := sp.split(" ", true, 1)
+			var sv := sp.split(" ", true, 2)
 			if sv.size() < 1 or not sv[0].is_valid_int():
-				chat("提示", "用法: /spin <dir=+1/-1/0> [speed 0..1000]")
+				chat("提示", "用法: /spin <dir=+1/-1/0> [speed 0..1000] [angle_deg]")
 				return
 			var spin_dir := sv[0].to_int()
 			var spin_speed := 500
+			var spin_angle := 0
 			if sv.size() > 1 and sv[1].is_valid_int():
 				spin_speed = clampi(sv[1].to_int(), 0, 1000)
+			if sv.size() > 2 and sv[2].is_valid_int():
+				spin_angle = clampi(sv[2].to_int(), 0, 500)
 			if spin_dir < -1 or spin_dir > 1:
-				chat("提示", "用法: /spin <dir=+1/-1/0> [speed 0..1000]")
+				chat("提示", "用法: /spin <dir=+1/-1/0> [speed 0..1000] [angle_deg]")
 				return
-			cmd = CP.spin(spin_dir, spin_speed)
+			cmd = CP.spin(spin_dir, spin_speed, spin_angle)
+		"/move":  # 微操/标定测试：定距移动（板端时长近似到点自停）
+			# /move <油门 -100..100> <距离 cm 1..500>（油门 50=throttle 0.5）
+			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
+			var mv := sp.split(" ", true, 1)
+			if mv.size() < 2 or not mv[0].is_valid_int() or not mv[1].is_valid_int():
+				chat("提示", "用法: /move <油门 -100..100> <距离 cm 1..500>（油门50=throttle0.5）")
+				return
+			var mv_thr := float(mv[0].to_int()) / 100.0
+			var mv_cm := mv[1].to_int()
+			if mv_thr < -1.0 or mv_thr > 1.0 or mv_cm < 1 or mv_cm > 500:
+				chat("提示", "用法: /move <油门 -100..100> <距离 cm 1..500>（油门50=throttle0.5）")
+				return
+			cmd = CP.move_dist(mv_thr, mv_cm)
 		"/motor":  # 调试直驱：绕过执行板，大脑板直接驱动哪吒单轮电机
 			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
 			var mv := sp.split(" ", true, 2)

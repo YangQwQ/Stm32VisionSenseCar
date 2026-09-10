@@ -7,6 +7,7 @@
 #include <WiFiClientSecure.h>
 #include <esp_timer.h>
 #include <stdlib.h>  // malloc/free/strtol
+#include <math.h>    // fabsf
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -15,14 +16,15 @@
 #include <esp_heap_caps.h>  // MALLOC_CAP_SPIRAM
 #include <stdarg.h>         // vsnprintf（ai::logf）
 
-// 决策频率 / 步数上限（对慢速小车足够，节奏见架构文档）。
-#define AI_INTERVAL_MS 2500
+// 决策频率 / 步数上限（单帧请求后服务端约 2~3s 响应，此值仅作下限节奏）。
+#define AI_INTERVAL_MS 1500
 #define AI_MAX_STEPS_PER_GOAL 120
 #define AI_EDITED_IMG_MAX (128 * 1024)
 #define AI_EDITED_IMG_TTL_MS 60000
 #define AI_CONNECT_TIMEOUT_MS 10000
 #define AI_HTTP_TIMEOUT_MS 30000
 #define AI_WAIT_FB_MIN_MS 10000   // wait 反馈节流：同一动作少于此间隔只回一条
+#define AI_MOVE_CAP_MS 2000       // AI 持续 move 单次行驶时限（无里程计兜底，防决策间隔内盲走撞墙）
 
 // ArduinoJson 内存池改用 PSRAM，避免其小分配每轮在内部堆上反复申请/释放，
 // 与 TLS 缓冲交错把内部堆切成碎块（导致握手 -17040/-32512 失败）。
@@ -217,14 +219,13 @@ static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
 }
 
 // 构建请求 body。goal 目标文本；ann 标注 JSON 或空；hint 为纠正/引导语（重试或死循环打断）；
-// last_cmd 上一步已下发指令的短描述（状态而非历史，帮助 AI 判断上一步效果）；
+// last_cmd 上一步已下发指令的短描述（含 reason，供 AI 判断上一步效果与目标位置）；
 // exec_state 执行板状态一行文本（无数据为空串）。
 // 系统提示词 + 目标 + 标注先组进 PSRAM 缓冲，再整体 JSON 转义（内含引号）。
-// 有 edited 时带编辑图；有 prev 时带上一帧，与当前帧双帧对比供运动感知。
+// 有 edited 时带编辑图；始终带当前帧（单帧决策，邻轮靠 last_cmd/状态衔接）。
 static void build_body(PsaBuf& b, const char* goal, const char* ann, const char* hint,
-                       const char* last_cmd, const char* exec_state,
+                       const char* last_cmd, const char* exec_state, unsigned last_age_s,
                        const uint8_t* frame, size_t frame_len,
-                       const uint8_t* prev, size_t prev_len,
                        bool use_edited, const uint8_t* edited, size_t edited_len) {
   PsaBuf sys;
   sys.put("你是「小车+机械臂」视觉控制大脑。画面中操作者的红色标注（方框/箭头/文字）必须优先遵循。");
@@ -234,12 +235,12 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   sys.put("上一步已下发：");
   sys.put(last_cmd && last_cmd[0] ? last_cmd : "无");
   sys.put("。每次只输出一个合法 JSON：");
-  sys.put("{\"type\":\"move\",\"params\":{\"throttle\":0.3,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 移动/转向：加 distance_cm 定距、angle_deg 定角，否则持续移动；低速优先 throttle/steering≤0.5；");
-  sys.put("或 {\"type\":\"spin\",\"params\":{\"dir\":1},\"reason\":\"..\"} 原地旋转(dir: +1右转(顺时针)/-1左转(逆时针)/0停)：保持车头朝向不变原地转动视角，是观察环境/环视四周的推荐转弯方式，须配合前轮保持直行；");
+  sys.put("{\"type\":\"move\",\"params\":{\"throttle\":0.3,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 移动/转向：离目标距离明确时务必加 distance_cm 定距（已生效、按时长近似，幅度宜小防过冲）；也要 angle_deg 定角；不加则持续移动；低速优先 throttle/steering≤0.5；");
+  sys.put("或 {\"type\":\"spin\",\"params\":{\"dir\":1,\"angle_deg\":90},\"reason\":\"..\"} 原地旋转(dir: +1右转(顺时针)/-1左转(逆时针)/0停)：保持车头朝向不变原地转动视角，是观察环境/环视四周的推荐转弯方式，须配合前轮保持直行；可选 angle_deg 定角转指定度数（已生效、近似），小幅微调或转够观察角度用；");
   sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\",\"dist_cm\":15},\"reason\":\"..\"} act 取 lift_up/lift_down/reach_forward/reach_backward/clip/release；与操作者交接物品时先停稳、伸到其手边再 release；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
   sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 保持当前所有动作不变，原地等待观察：当还在运动中没到目标、或者画面没变化、或者还没锁定目标时，用 wait；");
-  sys.put("规则：1.只输出 JSON，每次只规划一步。2.画面多轮无变化、或需要观察环境/还没锁定目标时，优先用 原地旋转(spin) 小幅环视探索视角；障碍物挡路则尝试绕行；绕行多轮仍无进展才 stop 并说明原因。3.停车信号只认明确手势：掌心正对镜头且五指张开、在镜头前持续上下/左右挥手、或人持续挡在车前，此时才 stop；人只是坐着、抬手或手指出现在画面里，不是停车信号。4.单手指向或手臂指向某一方向=操作者的方向指示，应朝该方向移动；画面中标出目标时朝标注区域移动，不要因为出现人手就停车。5.若目标是纯判断/评估类（含“判断”“是否”“能不能”“可达”“能不能到达”等），以判断优先于移动：不要朝标注区域移动，输出 stop 或 wait 并在 reason 里直接给出结论（如“该位置在对面，不可到达”）。6.目标为空或“巡视”时持续小幅原地旋转(spin)环视四周。7.reason 一句中文简要解释。");
+  sys.put("规则：1.只输出 JSON，每次只规划一步。2.画面多轮无变化、或需要观察环境/还没锁定目标时，优先用 原地旋转(spin) 小幅环视探索视角；障碍物挡路则尝试绕行；绕行多轮仍无进展才 stop 并说明原因。3.停车信号只认明确手势：掌心正对镜头且五指张开、在镜头前持续上下/左右挥手、或人持续挡在车前，此时才 stop；人只是坐着、抬手或手指出现在画面里，不是停车信号。4.单手指向或手臂指向某一方向=操作者的方向指示，应朝该方向移动；画面中标出目标时朝标注区域移动，不要因为出现人手就停车。5.若目标是纯判断/评估类（含“判断”“是否”“能不能”“可达”“能不能到达”等），以判断优先于移动：不要朝标注区域移动，输出 stop 或 wait 并在 reason 里直接给出结论（如“该位置在对面，不可到达”）。6.目标为空或“巡视”时持续小幅原地旋转(spin)环视四周。7.结合上一轮执行情况与本轮画面判断目标是否已达成或仍在视野：画面暂未出现目标时，凭上一步描述与小车当前状态推断是继续靠近还是转向搜索，勿因单帧未见就误判已完成或错过。8.reason 一句中文简要解释，尽量说明目标现状或位置（如“目标在正前方 xcm”“目标已夹住”），供下一条指令延续判断。");
   if (hint && hint[0]) { sys.put("注意："); sys.put(hint); }
 
   b.put("{\"model\":");
@@ -248,14 +249,14 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   esc_append(b, sys.p ? sys.p : "");
   // 结束 system 对象后接下一消息
   b.put("},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-  PsaBuf ut;  // user 文本：执行板状态 + 画面引导（整体转义一次）
+  PsaBuf ut;  // user 文本：执行板状态 + 上一指令时长 + 画面引导（整体转义一次）
   if (exec_state && exec_state[0]) { ut.put(exec_state); ut.put("；"); }
+  if (last_age_s > 0) {
+    char age[32]; snprintf(age, sizeof(age), "上一指令约%us前执行；", last_age_s);
+    ut.put(age);
+  }
   if (frame) {
-    if (prev) {
-      ut.put("下面先给出上一帧、再给出当前帧：请对比这两帧，判断画面中移动的人手或物体大致朝哪个方向移动、在强调或指向哪一边；若某区域有移动，据其方向回应。");
-    } else {
-      ut.put("当前画面如下。");
-    }
+    ut.put("当前画面如下：");
   } else {
     // 无摄像头降级：不让 AI 编造画面，只凭目标与状态规划保守指令
     ut.put("注意：摄像头不可用，当前无实时画面可分析，请勿假设或编造画面内容。只依据上述目标与执行板状态，稳妥地规划一步指令（优先短距离 move 或直接 stop）。");
@@ -272,7 +273,6 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
       first = false;
     };
     if (use_edited && edited) img(edited, edited_len);
-    if (prev) img(prev, prev_len);   // 上一帧在前，供对比运动
     img(frame, frame_len);
   }
   b.put("]}],\"max_tokens\":1024,\"reasoning_effort\":\"low\",\"response_format\":{\"type\":\"json_object\"}}");
@@ -352,9 +352,11 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
     if (src["angle_deg"].is<int>() && ad) p["angle_deg"] = constrain(ad, 0, 500);
     if (src["dist_cm"].is<int>() && pd) p["dist_cm"] = constrain(pd, 0, 500);
     int sd = doc["params"]["dir"] | 0;
-    int ss = doc["params"]["speed"] | 500;
+    int ss = doc["params"]["speed"] | 900;  // 原地旋转默认转速（实测 <700 拖不动，须给足）
+    int sa = doc["params"]["angle_deg"] | 0;
     p["dir"] = constrain(sd, -1, 1);     // 原地旋转方向：±1/0
     p["speed"] = constrain(ss, 0, 1000); // 原地旋转单轮 pwm
+    if (src["angle_deg"].is<int>() && sa) p["angle_deg"] = constrain(sa, 0, 500); // 定角微操
     const char* act = doc["params"]["act"] | "";
     if (act[0]) p["act"] = act;
     const char* scope = doc["params"]["scope"] | "all";
@@ -774,6 +776,8 @@ static void ai_worker(void*) {
     char err_buf[160];
     // 死循环防线状态：上一步指令短描述 / 连续相同指令计数 / 已注入引导标记。
     char last_cmd[48] = {0}, cur_cmd[48] = {0};
+    char last_disp[192] = {0};  // 发给 AI 的"上一步已下发"（指令+reason，供延续判断）
+    unsigned long last_act_ms = 0;  // 上次真正下执行/微操指令的时刻（ms），供给 AI 算"距上次决策多久"
     int stall = 0;
     bool stall_hint = false;
 
@@ -783,8 +787,6 @@ static void ai_worker(void*) {
       edited = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
       if (edited && !take_edited(edited, AI_EDITED_IMG_MAX, &edited_len)) { free(edited); edited = nullptr; }
     }
-    // 上一轮画面帧（供双帧运动感知；任务期复用，首轮为空则只发当前帧）。
-    uint8_t* prev = nullptr; size_t prev_len = 0;
     // 本轮帧的 PSRAM 副本（任务期复用）：抓帧后立即把字节拷进来并归还相机缓冲，
     // 避免 AI 在做慢速 TLS 请求期间长时间占用 fb_count=2 的缓冲池把推流饿死。
     uint8_t* cur = nullptr; size_t cur_len = 0;
@@ -824,7 +826,7 @@ static void ai_worker(void*) {
 
       // 抓帧后立即拷入 PSRAM 副本并归还相机缓冲：AI 的 HTTPS（TLS 握手+请求）
       // 慢则数秒，期间一直占着 fb 会把 fb_count=2 的缓冲池耗尽，饿死并行推流。
-      // 帧数据后续（body 组装、prev 双帧）一律用这份副本。
+      // 帧数据后续（body 组装）一律用这份副本。
       if (fb && frame_len > 0 && frame_len <= AI_EDITED_IMG_MAX) {
         if (!cur) cur = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
         if (cur) { memcpy(cur, frame, frame_len); cur_len = frame_len; }
@@ -843,8 +845,9 @@ static void ai_worker(void*) {
         PsaBuf body;
         char st[64];
         const char* stp = exec::read_state(st, sizeof(st)) ? st : "";  // 本地直驱状态（无执行板，状态本地合成）
-        build_body(body, t.text, t.ann, hint, last_cmd, stp,
-                   frame, frame_len, prev, prev_len, edited != nullptr, edited, edited_len);
+        build_body(body, t.text, t.ann, hint, last_disp, stp,
+                   last_act_ms ? (unsigned)((esp_timer_get_time() / 1000 - last_act_ms) / 1000) : 0u,
+                   frame, frame_len, edited != nullptr, edited, edited_len);
         if (!body.ok) { fail = "组装请求 body 失败"; break; }
 
         String resp;
@@ -884,8 +887,14 @@ static void ai_worker(void*) {
             got = true;
             break;
           }
-          // 校验通过 → 执行 move/arm/stop（本板直驱，不再经执行板）
+          // 校验通过 → 执行 move/arm/stop（本板直驱，不再经执行板），记录时刻供时间感知。
           exec::act(type, params);
+          last_act_ms = (unsigned long)(esp_timer_get_time() / 1000);
+          // 无里程计兜底：AI 无定距的持续 move 单次最多行驶 AI_MOVE_CAP_MS，到期由 exec 自动停轮；
+          // 带 distance_cm 的定距 move 已在 send_move 按时长近似自停，不叠加持续兜底。
+          if (!strcmp(type, "move") && !params["distance_cm"].is<int>() &&
+              fabsf(params["throttle"] | 0.0f) > 0.001f)
+            exec::set_move_cap_ms(AI_MOVE_CAP_MS);
           g_last_continuous = exec::is_continuous(type, params);
           g_last_cont_type = g_last_continuous ? (!strcmp(type, "move") ? 1 : 2) : 0;
           ai::logf("[ai] 执行 %s%s", type, g_last_continuous ? "（持续）" : "");
@@ -896,6 +905,8 @@ static void ai_worker(void*) {
           if (strcmp(cur_cmd, last_cmd)) { stall = 0; stall_hint = false; }
           else if (++stall >= 4 && !stall_hint) { stall_hint = true; Serial.println("[ai] 多轮无进展，注入引导"); }
           snprintf(last_cmd, sizeof(last_cmd), "%s", cur_cmd);
+          // 发给 AI 的"上一步已下发"：指令 + reason，替代双帧供跨轮衔接（目标位置/执行情况）。
+          snprintf(last_disp, sizeof(last_disp), "%s，原因：%.96s", cur_cmd, (cmdD["reason"] | ""));
           // stop + done:true = AI 自判任务完成：停车并结束任务（build_feedback 已带 done 上报手机端）；
           // 不带 done 的 stop 仅临时停车观察，任务继续下一轮。严格按 bool 判定，防模型输出字符串 "true"。
           if (!strcmp(type, "stop") && cmdD["done"].is<bool>() && cmdD["done"].as<bool>()) {
@@ -909,13 +920,6 @@ static void ai_worker(void*) {
           fail = verr;  // 重试一次前暂存
         }
       }
-      // 用当前帧（PSRAM 副本 cur）更新"上一帧"，供下轮双帧对比运动。相机缓冲已在上方提前归还。
-      if (frame) {
-        if (!prev) prev = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
-        if (prev && frame_len <= AI_EDITED_IMG_MAX) { memcpy(prev, frame, frame_len); prev_len = frame_len; }
-        else prev_len = 0;
-      }
-
       if (done) break;
       // 单轮模式（/ai oneshot）：一轮决策即收尾。本轮无有效输出（网络/解码/校验失败）
       // 时把原因作为 error 回报，不跳 3s 继续观察；持续指令残留由任务出口 resolve_stop 补停。
@@ -946,7 +950,8 @@ static void ai_worker(void*) {
         JsonDocument e(&g_js_alloc); e["done"] = true; String s = build_feedback(t.id, e); enqueue_result(s.c_str(), t.fn, t.ctx);
         break;
       }
-      // 周期控制：以 2000ms 为节奏，扣掉本轮已耗时（含抓帧/HTTP/校验），快路径约 3.2s 一轮
+      // 周期控制：以 AI_INTERVAL_MS 为下限节奏，扣掉本轮已耗时（含抓帧/HTTP/校验），
+      // 服务端快（单帧 ~2s）时立即进入下一轮，慢时由服务端耗时主导。
       uint64_t el = esp_timer_get_time() - step_ts;
       long rem = (long)AI_INTERVAL_MS - (long)(el / 1000);
       if (rem > 0) vTaskDelay(pdMS_TO_TICKS(rem));
@@ -954,7 +959,6 @@ static void ai_worker(void*) {
 
     if (edited) free(edited);
     if (cur) free(cur);          // 本轮帧 PSRAM 副本
-    if (prev) free(prev);        // 上一帧 PSRAM 副本
     if (t.ctx) delete (int*)t.ctx;  // 任务期 sink fd
     ai::logf("[ai] 任务结束 gen=%lu", t.generation);   // 先于注销通道，确保此行也能回推
     g_log_fn = nullptr; g_log_ctx = nullptr;  // 注销 ai_log 回推通道

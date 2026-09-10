@@ -63,18 +63,25 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   }
   const char* type = doc["type"] | "";
   JsonObject params = doc["params"].as<JsonObject>();
-  bool manual = !strcmp(type, "move") || !strcmp(type, "stop") || !strcmp(type, "arm");
+  // 手动接管类型：move/stop/arm 之外，摇杆/直控面板的直接驱动指令（drive/spin/servo/motor/
+  // arm_pose/reset）同样会接管小车运动，必须打断板载 AI 闭环，否则 AI 与手动抢控制权。
+  bool manual = !strcmp(type, "move") || !strcmp(type, "stop") || !strcmp(type, "arm") ||
+                !strcmp(type, "drive") || !strcmp(type, "spin") || !strcmp(type, "servo") ||
+                !strcmp(type, "motor") || !strcmp(type, "arm_pose") || !strcmp(type, "reset");
   if (manual) {
     // 手动高频指令：先立即打断 AI 闭环并直接驱动哪吒扩展板（电机控制优先），
     // 串口日志只在类型切换时打一行，绝不让日志阻塞控制时序。
-    // move/stop/arm 由本板直驱，不再经执行板。arm 打断只停轮子（机械臂指令即接管）。
-    ai::cancel(!strcmp(type, "arm") ? ai::StopMode::Wheels : ai::StopMode::None);
-    exec::act(type, params);
+    // move/stop/arm 由本板直驱，不再经执行板。arm/arm_pose 打断只停轮子（机械臂指令即接管）。
+    ai::cancel(!strcmp(type, "arm") || !strcmp(type, "arm_pose") ? ai::StopMode::Wheels : ai::StopMode::None);
     log_manual_throttled(type);
-    return;
+    if (!strcmp(type, "move") || !strcmp(type, "stop") || !strcmp(type, "arm")) {
+      exec::act(type, params);
+      return;
+    }
+    // drive/spin/servo/motor/arm_pose/reset 继续走下方各自分支（取消后落各自直驱逻辑）。
+  } else {
+    Serial.printf("[cmd] type=%s has_frames=%u\n", type, has_frames);
   }
-
-  Serial.printf("[cmd] type=%s has_frames=%u\n", type, has_frames);
 
   if (!strcmp(type, "config")) {
     // 配网（BLE 或 WS 同结构）：落 NVS → 在线重建 STA（不重启，BLE 保活）→ 上线后 BLE 上报 IP
@@ -208,7 +215,9 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     // 直接写原始 pwm（50..250），不过标定限位，用于探机械极限/标定；走 exec::set_servo 同步内部状态。
     int n = params["n"] | -1;
     int p = params["pwm"] | -1;
-    if (n >= 0 && n <= 3 && p >= 50 && p <= 250 && exec::set_servo((uint8_t)n, (uint16_t)p)) {
+    if (n >= 0 && n <= 3 && p >= 50 && p <= 250) {
+      exec::set_move_cap_ms(0);  // 手动接管轮子/转向：先清 AI move 兜底，防旧时限在写入窗口误停
+      exec::set_servo((uint8_t)n, (uint16_t)p);
       // 成功不回执：摇杆/按钮高频下发，状态看 exec_log 即知。
     } else {
       reply_status(doc, reply, reply_ctx, "servo: n=0转向/1左/2右/3前 pwm=50..250(可超标定限位)");
@@ -220,7 +229,9 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     // 二连杆 IK：给末端位姿(x=轴前方cm, h=地面以上cm)，联动算左右两舵机 pwm 一并下发。
     float x = params["x"] | -1.f;
     float h = params["h"] | -1.f;
-    if (x >= 0.f && h >= 0.f && exec::arm_pose(x, h)) {
+    if (x >= 0.f && h >= 0.f) {
+      exec::set_move_cap_ms(0);  // 手动接管轮子/转向：先清 AI move 兜底，防旧时限误停
+      exec::arm_pose(x, h);
       // 成功不回执：状态看 exec_log 即知。
     } else {
       reply_status(doc, reply, reply_ctx, "arm_pose: 目标不可达，需要 x=轴前方cm h=地面以上cm");
@@ -234,8 +245,9 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     int n = params["n"] | -1;
     int a = params["a"] | -1;
     int b = params["b"] | -1;
-    if (n >= 1 && n <= 4 && a >= 0 && b >= 0 && a <= 1000 && b <= 1000 &&
-        nezha::set_motor((uint8_t)n, (uint16_t)a, (uint16_t)b)) {
+    if (n >= 1 && n <= 4 && a >= 0 && b >= 0 && a <= 1000 && b <= 1000) {
+      exec::set_move_cap_ms(0);  // 手动接管轮子/转向：先清 AI move 兜底，防旧时限在写入窗口误停
+      nezha::set_motor((uint8_t)n, (uint16_t)a, (uint16_t)b);
       // 成功不回执：摇杆/按钮高频下发，状态看 exec_log 即知。
     } else {
       reply_status(doc, reply, reply_ctx, "motor: 参数需 n=1..4 a,b=0..1000");
@@ -254,6 +266,8 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     int S = spd < 0 ? -spd : spd;
     uint16_t u = (uint16_t)S;
     bool rev = spd < 0;
+    // 手动接管轮子/转向：先清 AI move 兜底，防旧时限在写入窗口误停
+    exec::set_move_cap_ms(0);
     // 轮map：M1左后 M2右后 M3右前 M4左前；左轮 a 正前，右轮 b 正前。
     // 前进：M1(S,0) M2(0,S) M3(0,S) M4(S,0)；后退：四轮 a/b 对调。
     nezha::set_motor(1, rev ? 0 : u, rev ? u : 0);

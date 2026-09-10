@@ -44,7 +44,7 @@ const _JOY_STEER := 0.8
 const _DRIVE_MAX := 1000       # 油门满量程 PWM（低速档 500 / 高速档 1000）
 const _SERVO_CENTER := 150     # 转向舵中位（/servo 1 150 = 正前）
 const _SERVO_RANGE := 30       # 转向舵单侧偏转量（右 +30→180 / 左 -30→120）
-const _SPIN_SPEED := 600       # 原地旋转模式下左右推摇杆的单轮 PWM（0..1000）
+const _SPIN_SPEED := 900       # 原地旋转模式下左右推摇杆的单轮 PWM（实测 <700 拖不动，给足）
 ## 最近一次成功连接的设备名，用于顶栏「已连接: xxx」。
 var _device_name := ""
 var _page_tween: Tween = null

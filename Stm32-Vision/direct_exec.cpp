@@ -56,6 +56,21 @@ static float plerp(const float* xs, const float* ys, int n, float x) {
 #define ARM_STEP      2
 #define ARM_CNT_PER_CM 8
 
+// AI 微操的"时长近似"换算（无里程计，只能按时长模拟距离/角度）。系数来自真机实测标定：
+// 移动 actual_cm≈v(throttle)*t_s+c(throttle)，车速对油门不敏感（≈10..12.5cm/s），高油门带起停余量；
+// 原地转角用时 ms/度 随转速骤升，转速低于拖得动线（约700）基本无法平稳转动，故带角度统一抬到可靠转速。
+#define SPIN_MIN_SPEED 800   // 低于此转速原地旋转拖不动，抬升到可靠值
+
+// 移动：v(cm/s) / 起停余量 c(cm)，按油门插值
+static const float MV_SPEED_X[] = { 0.25f, 0.5f,  1.0f };
+static const float MV_SPEED_Y[] = { 10.3f, 11.3f, 12.5f };
+static const float MV_COAST_X[] = { 0.25f, 0.5f,  1.0f };
+static const float MV_COAST_Y[] = { 0.0f,  1.7f,  1.75f };
+
+// 原地旋转：每度用时 ms/度，按转速插值
+static const float SPIN_MSDEG_X[] = { 700.0f, 800.0f, 900.0f, 1000.0f };
+static const float SPIN_MSDEG_Y[] = { 53.5f,  28.1f,  13.9f,  8.65f };
+
 // ================= 内部状态 =================
 // 当前各舵机 pwm（写板前跟踪，随指令/步进更新）
 static int16_t s_steer = STEER_CENTER;
@@ -80,6 +95,11 @@ static struct {
   int16_t budget;    // 剩余拍数，0=持续
 } s_active = { 0, 0, 0 };
 
+// AI 持续 move 的行驶截止时刻（ms），0=不限时。到期 update_tick 里自动停轮，
+// 兜底 AI 两次决策间的长时间盲走；任何新轮动作/手动接管会刷新或关闭它。
+// volatile：worker 任务 / loop(update_tick) / 命令回调跨核读写，防寄存器缓存读到旧值。
+static volatile unsigned long s_move_cap_until = 0;
+
 static void drive_motors(int spd) {
   int16_t u = spd < 0 ? (uint16_t)-spd : (uint16_t)spd;
   bool rev = spd < 0;
@@ -99,6 +119,7 @@ static void send_spin(const JsonObjectConst& p) {
   if (dir == 0) spd = 0;  // dir=0 = 停车，speed 必须连同归零，否则默认 500 会让轮子继续转
   if (spd < 0) spd = 0;
   if (spd > 1000) spd = 1000;
+  if (dir != 0 && spd < SPIN_MIN_SPEED) spd = SPIN_MIN_SPEED;  // 低于拖得动线则抬升
   s_spin = dir == 0 ? 0 : (dir > 0 ? 1 : -1);
   uint16_t u = (uint16_t)spd;
   if (dir > 0) {
@@ -109,6 +130,13 @@ static void send_spin(const JsonObjectConst& p) {
     nezha::set_motor(3, 0, u); nezha::set_motor(4, 0, u);
   }
   s_car_motion = 0;  // 原地旋转不算前进/后退
+  // 带 angle_deg = 定角微操：按时长近似自停（无里程计）；每度用时按转速插值标定表。
+  int ang = p["angle_deg"] | 0;
+  if (ang > 720) ang = 720;  // 粗钳防超长时限（手机/AI 已限 0..500，仅兜底裸前端）
+  if (dir != 0 && ang > 0) {
+    long ms = (long)(ang * plerp(SPIN_MSDEG_X, SPIN_MSDEG_Y, 4, (float)spd));
+    exec::set_move_cap_ms(ms > 0 ? (int)ms : 1);
+  }
 }
 
 static void clear_active(void) { s_active.servo = 0; s_active.budget = 0; }
@@ -137,11 +165,19 @@ void exec::init(void) {
 void exec::reset(void) {
   s_car_motion = 0;
   s_spin = 0;
+  s_move_cap_until = 0;
   clear_active();
   exec::init();
 }
 
 void exec::update_tick(void) {
+  // AI 持续/微操动作的行驶时限兜底：到期自动停轮（转向/机械臂不干预），状态复位便于 AI 看到"停止"。
+  if (s_move_cap_until != 0 && (long)(millis() - s_move_cap_until) >= 0) {
+    s_move_cap_until = 0;
+    drive_motors(0);
+    s_car_motion = 0;
+    s_spin = 0;  // 原地旋转定角到点也一并复位，避免状态误报"仍在原地转"
+  }
   if (s_active.servo == 0) return;
   if (s_active.servo == 2) {
     s_reach += ARM_STEP * s_active.dir;
@@ -206,6 +242,17 @@ static void send_move(const JsonObjectConst& p) {
     set_steer_pwm((int16_t)(STEER_CENTER + s * 30.0f));
   }
   s_spin = 0;  // 常规行驶（move）接管后清除原地旋转
+  // 带 distance_cm = 定距微操：本板无里程计，按时长近似自停。实测 actual≈v·t+c，
+  // v/c 都随油门插值标定表（对油门不敏感），时长=(cm-c)/v。
+  int cm = p["distance_cm"] | 0;
+  float a = fabsf(th); if (a > 1.0f) a = 1.0f;
+  if (cm > 0 && a > 0.001f) {
+    float v = plerp(MV_SPEED_X, MV_SPEED_Y, 3, a);
+    float c = plerp(MV_COAST_X, MV_COAST_Y, 3, a);
+    float target = cm > c ? cm - c : 0.0f;
+    long ms = (long)(target / v * 1000.0f);
+    exec::set_move_cap_ms(ms > 0 ? (int)ms : 1);
+  }
 }
 
 static void send_stop(const JsonObjectConst& p) {
@@ -267,6 +314,8 @@ bool exec::arm_pose(float x, float h) {
 }
 
 bool exec::act(const char* type, const JsonObjectConst& params) {
+  // 任何显式轮子/原地旋转指令都刷新或关闭 AI 的 move 时限，避免旧兜底在新指令后误停。
+  if (!strcmp(type, "move") || !strcmp(type, "spin") || !strcmp(type, "stop")) s_move_cap_until = 0;
   if (!strcmp(type, "move"))   { send_move(params); return true; }
   if (!strcmp(type, "spin"))   { send_spin(params); return true; }
   if (!strcmp(type, "stop"))   { send_stop(params); return true; }
@@ -294,7 +343,8 @@ bool exec::is_continuous(const char* type, const JsonObjectConst& p) {
            (fabsf(st) > 0.001f && !p["angle_deg"].is<int>());
   }
   if (!strcmp(type, "spin")) {
-    return (p["dir"] | 0) != 0;  // dir 非 0 = 持续原地旋转，需 stop 收尾
+    int d = p["dir"] | 0;
+    return d != 0 && !p["angle_deg"].is<int>();  // 带 angle 的定角=有界，不需持续收尾
   }
   if (!strcmp(type, "arm")) {
     const char* act_ = p["act"] | "";
@@ -306,6 +356,10 @@ bool exec::is_continuous(const char* type, const JsonObjectConst& p) {
 }
 
 bool exec::grip_closing() { return s_grip == GRIP_CLOSE; }
+
+void exec::set_move_cap_ms(int ms) {
+  s_move_cap_until = ms > 0 ? millis() + (unsigned long)ms : 0;
+}
 
 bool exec::light_on(const char* kind) {
   if (!strcmp(kind, "front")) return s_light_front;
