@@ -29,6 +29,14 @@ static func exec_log(on: bool) -> Dictionary:
 	# 替代旧执行板上行帧镜像。默认关，避免空闲时状态一直刷屏。
 	return {"type": "exec_log", "params": {"on": on}, "id": _new_id()}
 
+static func ai_log(on: bool) -> Dictionary:
+	# AI 调试信息回推开关（默认关）：开启后板端把关键 AI 延迟/时序日志同时推送手机（仍保留串口）。
+	return {"type": "ai_log", "params": {"on": on}, "id": _new_id()}
+
+static func get_state() -> Dictionary:
+	# 主动查询当前状态（车灯/夹爪等），用于重连后同步控制按钮。板端回 {"type":"state",params:{...}}。
+	return {"type": "get_state", "params": {}, "id": _new_id()}
+
 
 
 static func config_wifi(ssid: String, password: String) -> Dictionary:
@@ -100,7 +108,8 @@ static func help_lines() -> PackedStringArray:
 		"/clear  清空消息区(仅本机)",
 		"/stream [on|off]  图传开关",
 		"/stop [wheels|arm]  停车",
-		"/exec_log [on|off]  实时状态推送开关（默认关）",
+		"/exec_log [on|off]  实时状态推送开关（默认关)",
+		"/ai_log [on|off]  AI日志推送开关（默认关，开启后AI调试/延迟日志发手机）",
 		"/light <front|vibe|back> <0|1>  直驱灯开关(前/氛围/尾)",
 		"/reset  机械臂+转向回正",
 		"/config <WiFi名> <密码>  配网",
@@ -122,6 +131,7 @@ const COMMAND_HINTS := {
 	"/stream [on|off]": "图传开关",
 	"/stop [wheels|arm]": "停车",
 	"/exec_log [on|off]": "实时状态推送开关（默认关）",
+	"/ai_log [on|off]": "AI日志推送开关（默认关，开启后AI调试/延迟日志发手机）",
 	"/light <front|vibe|back> <0|1>": "直驱灯开关(前/氛围/尾)",
 	"/reset": "机械臂+转向回正",
 	"/config <WiFi名> <密码>": "配网",

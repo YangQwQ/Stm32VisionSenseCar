@@ -66,7 +66,12 @@ static int16_t s_grip  = GRIP_CENTER;
 // 小车行驶状态（本地合成用）：0 停 / 1 前 / 2 后
 static int s_car_motion = 0;
 static int s_steer_dir  = 0;  // 0 正前 / 1 左 / 2 右
-static int s_spin = 0;        // 原地旋转：0 无 / 1 左进右退(逆时针) / -1 右进左退(顺时针)
+static int s_spin = 0;        // 原地旋转：0 无 / 1 左进右退(右转/顺时针) / -1 左退右进(左转/逆时针)
+
+// 灯状态记忆（供 get_state 查询同步手机按钮）：仅记录是否开，开关动作由 nezha::led 落地。
+static bool s_light_front = false;
+static bool s_light_vibe  = false;
+static bool s_light_back  = false;
 
 // 连续机械臂动作：servo=0 表示无活跃动作
 static struct {
@@ -86,11 +91,12 @@ static void drive_motors(int spd) {
 }
 
 // 原地旋转（普通四轮滑移式，无需特殊轮子）：左/右侧轮反向拖胎绕中心旋转。
-// dir=+1 左进右退(逆时针) / -1 左退右进(顺时针) / 0 停；speed=单车轮 pwm 0..1000。
+// dir=+1 左进右退=右转(顺时针) / -1 左退右进=左转(逆时针) / 0 停；speed=单车轮 pwm 0..1000。
 // 车轮映射与 drive_motors 一致：左轮 a 正前、右轮 b 正前，故 dir>0 统一写 (a,0)、dir<0 统一写 (0,b)。
 static void send_spin(const JsonObjectConst& p) {
   int dir = p["dir"] | 0;
   int spd = p["speed"] | 500;
+  if (dir == 0) spd = 0;  // dir=0 = 停车，speed 必须连同归零，否则默认 500 会让轮子继续转
   if (spd < 0) spd = 0;
   if (spd > 1000) spd = 1000;
   s_spin = dir == 0 ? 0 : (dir > 0 ? 1 : -1);
@@ -268,7 +274,13 @@ bool exec::act(const char* type, const JsonObjectConst& params) {
   if (!strcmp(type, "light")) {
     const char* kind = params["kind"] | "";
     bool on = params["on"] | false;
-    return nezha::led(kind, on);
+    bool ok = nezha::led(kind, on);
+    if (ok) {
+      if (!strcmp(kind, "front")) s_light_front = on;
+      else if (!strcmp(kind, "vibe")) s_light_vibe = on;
+      else if (!strcmp(kind, "back")) s_light_back = on;
+    }
+    return ok;
   }
   if (!strcmp(type, "reset"))  { exec::reset(); return true; }
   return false;
@@ -293,8 +305,17 @@ bool exec::is_continuous(const char* type, const JsonObjectConst& p) {
   return false;
 }
 
+bool exec::grip_closing() { return s_grip == GRIP_CLOSE; }
+
+bool exec::light_on(const char* kind) {
+  if (!strcmp(kind, "front")) return s_light_front;
+  if (!strcmp(kind, "vibe"))  return s_light_vibe;
+  if (!strcmp(kind, "back"))  return s_light_back;
+  return false;
+}
+
 bool exec::read_state(char* buf, size_t cap) {
-  const char* car = s_spin != 0 ? (s_spin > 0 ? "原地左转" : "原地右转")
+  const char* car = s_spin != 0 ? (s_spin > 0 ? "原地右转" : "原地左转")
                                 : (s_car_motion == 1 ? "前进" : (s_car_motion == 2 ? "后退" : "停止"));
   const char* steer = s_steer_dir == 1 ? "左" : (s_steer_dir == 2 ? "右" : "正");
   snprintf(buf, cap, "小车:%s %s | 机械臂:左:%d 右:%d 前:%d",

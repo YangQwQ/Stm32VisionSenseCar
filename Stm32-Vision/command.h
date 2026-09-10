@@ -24,6 +24,11 @@ void set_streaming(bool on);
 bool exec_log();
 void set_exec_log(bool on);
 
+// ai_log 开关：默认关。开启后 ai_client 的关键 AI 延迟/时序日志在写串口的同时
+// 也推送手机（WS/BLE status 通道）。由 command 接收 ai_log 指令更新。
+bool ai_log();
+void set_ai_log(bool on);
+
 // 使最新 WiFi 配置生效：在线重建 STA 连接（不重启，BLE 保活）。
 // BLE 配网写 SSID/PASS 后由 ble 调用；command 的 config 分支内部亦调用。
 void apply_network();

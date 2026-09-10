@@ -14,7 +14,7 @@
 
 ## 通信架构（链路）
 
-连接策略统一收口在 `net/DeviceConn.gd`（**单一事实源**；Main / AppState 只订阅其统一信号，不在别处另写一套）。它自建并持有 BLE / WS / UDP 三个传输并派生统一 `state`；**WS 优先、BLE 兜底**（`FALLBACK_TYPES` 白名单）。信道切换：WS 上连让出 BLE 射频；WS 下连保 BLE / 双断自动重扫 → 发现最近设备自连 →「连上停扫」。`BLEClient` / `WSCarClient` / `UDPVideoClient` 只做纯传输，不做连接策略。
+连接策略统一收口在 `net/DeviceConn.gd`（**单一事实源**；Main / AppState 只订阅其统一信号，不在别处另写一套）。它自建并持有 BLE / WS / UDP 三个传输并派生统一 `state`；**WS 优先、BLE 兜底**（`BLOCKED_TYPES` 黑名单外的类型均可蓝牙，仅图传/ai 云端直连被拦）。信道切换：WS 上连让出 BLE 射频；WS 下连保 BLE / 双断自动重扫 → 发现最近设备自连 →「连上停扫」。`BLEClient` / `WSCarClient` / `UDPVideoClient` 只做纯传输，不做连接策略。
 
 | 通道 | 用途 | 实现状态 |
 |---|---|---|

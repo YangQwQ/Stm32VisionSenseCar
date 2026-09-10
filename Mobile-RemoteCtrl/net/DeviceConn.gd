@@ -2,7 +2,7 @@ extends Node
 ## 统一「设备连接层」：自建并持有 BLE / WS 两个传输，收口全部连接策略。
 ## 职责（对 Main / AppState 只暴露统一信号与门面）：
 ##   - 连接状态：派生统一 state，单一事实源
-##   - 信道选路：WS 优先、BLE 兜底（FALLBACK_TYPES 白名单）
+##   - 信道选路：WS 优先、BLE 兜底（BLOCKED_TYPES 黑名单外的类型都可蓝牙）
 ##   - 信道切换：WS 上连让出 BLE 射频；WS 下连保 BLE / 双断转恢复
 ##   - 重连：双断自动扫描 BLE → 发现最近设备 → 自连 →「连上停扫」
 ## 传输本身（BLEClient / WSCarClient）作为纯通道，不做连接策略。
@@ -182,7 +182,7 @@ func send_command(cmd: Dictionary) -> bool:
 		print("[SEND] %s via WS" % t)
 		_ws.send_command(cmd)
 		return true
-	if t in BP.FALLBACK_TYPES and _ble.is_device_connected():
+	if t not in BP.BLOCKED_TYPES and _ble.is_device_connected():
 		print("[SEND] %s via BLE" % t)
 		_ble.write_cmd(cmd)
 		return true

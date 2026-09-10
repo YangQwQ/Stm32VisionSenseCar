@@ -13,6 +13,7 @@
 #include "freertos/semphr.h"
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>  // MALLOC_CAP_SPIRAM
+#include <stdarg.h>         // vsnprintf（ai::logf）
 
 // 决策频率 / 步数上限（对慢速小车足够，节奏见架构文档）。
 #define AI_INTERVAL_MS 2500
@@ -80,6 +81,11 @@ static volatile int g_last_cont_type = 0;
 static volatile int g_stop_mode = (int)ai::StopMode::All;
 static volatile uint64_t g_last_wait_fb_ms = 0;  // wait 反馈节流时间戳
 
+// ai_log 回推 sink：worker 任务起点捕获当前回传通道（t.fn/t.ctx），供 logf 复用
+// （enqueue_result 会堆拷贝 ctx，跨任务排空安全）。
+static cmd::ReplyFn g_log_fn = nullptr;
+static void* g_log_ctx = nullptr;
+
 static void enqueue_result(const char* text, cmd::ReplyFn fn, void* ctx);
 
 // ---------------- 结果队列（worker → loop） ----------------
@@ -95,6 +101,24 @@ void enqueue_result(const char* text, cmd::ReplyFn fn, void* ctx) {
   it->fn = fn;
   it->ctx = ctx ? new int(*(int*)ctx) : nullptr;
   if (xQueueSend(g_result_q, &it, 0) != pdTRUE) { free(it->text); free(it->ctx); free(it); }
+}
+
+// AI 调试日志：始终写串口；ai_log 开关开启且任务通道在位时，同时推手机当前行。
+void ai::logf(const char* fmt, ...) {
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  buf[sizeof(buf) - 1] = 0;  // 截断防越界
+  va_end(ap);
+  Serial.printf("%s\n", buf);
+  if (!cmd::ai_log() || !g_log_fn) return;
+  JsonDocument d(&g_js_alloc);
+  d["type"] = "ai_log";
+  d["params"]["text"] = buf;
+  String s;
+  serializeJson(d, s);
+  enqueue_result(s.c_str(), g_log_fn, g_log_ctx);
 }
 
 void ai::update() {
@@ -211,7 +235,7 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   sys.put(last_cmd && last_cmd[0] ? last_cmd : "无");
   sys.put("。每次只输出一个合法 JSON：");
   sys.put("{\"type\":\"move\",\"params\":{\"throttle\":0.3,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 移动/转向：加 distance_cm 定距、angle_deg 定角，否则持续移动；低速优先 throttle/steering≤0.5；");
-  sys.put("或 {\"type\":\"spin\",\"params\":{\"dir\":1},\"reason\":\"..\"} 原地旋转(dir: +1逆时针/-1顺时针/0停)：保持车头朝向不变原地转动视角，是观察环境/环视四周的推荐转弯方式，须配合前轮保持直行；");
+  sys.put("或 {\"type\":\"spin\",\"params\":{\"dir\":1},\"reason\":\"..\"} 原地旋转(dir: +1右转(顺时针)/-1左转(逆时针)/0停)：保持车头朝向不变原地转动视角，是观察环境/环视四周的推荐转弯方式，须配合前轮保持直行；");
   sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\",\"dist_cm\":15},\"reason\":\"..\"} act 取 lift_up/lift_down/reach_forward/reach_backward/clip/release；与操作者交接物品时先停稳、伸到其手边再 release；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
   sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 保持当前所有动作不变，原地等待观察：当还在运动中没到目标、或者画面没变化、或者还没锁定目标时，用 wait；");
@@ -366,7 +390,7 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
 
   // 诊断：body 可能达数十 KB，一次 write 成败难定位。分段发，打印每段进度与耗时。
   size_t blen = strlen(body);
-  Serial.printf("[ai] body len=%u\n", (unsigned)blen);
+  ai::logf("[ai] body %u B", (unsigned)blen);
   const uint8_t* bp = (const uint8_t*)body;
   const size_t SEG = 4096;
   size_t sent = 0;
@@ -387,7 +411,7 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
     if (millis() - t_start > AI_HTTP_TIMEOUT_MS) break;
     delay(10);
   }
-  Serial.printf("[ai] body 发送完成 sent=%u/%u ~%u ms\n", (unsigned)sent, (unsigned)blen,
+  ai::logf("[ai] body 发送完成 %u/%u ~%u ms", (unsigned)sent, (unsigned)blen,
                 (unsigned)(millis() - t_start));
   if (sent < blen) return false;
 
@@ -558,7 +582,7 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
         pend = t1;                    // 缺 \r\n：首字节是下一 size 行内容，压回
       }
     }
-    Serial.printf("[ai] HTTP chunked 解码 %d B\n", (int)pb.len);
+    ai::logf("[ai] HTTP chunked 解码 %d B", (int)pb.len);
   } else if (sse) {
     // SSE（text/event-stream，未走 chunked 帧）：按行读，累积 data: 负载；
     // [DONE] 事件或连接关闭即结束。产物为拼接后的 JSON 文本，交 extract_content 解析。
@@ -585,7 +609,7 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
       if (!g_client.connected()) break;
       delay(2);
     }
-    Serial.printf("[ai] SSE 解码 %d B\n", (int)pb.len);
+    ai::logf("[ai] SSE 解码 %d B", (int)pb.len);
   } else {
     // 无 CL、无 chunked、无 SSE：裸读直到连接关闭或超时（10s 封顶），尽量救回响应体。
     unsigned long tr3 = millis();
@@ -626,15 +650,15 @@ static bool http_post(const char* url, const char* key, const char* body, String
     g_client.setTimeout(AI_HTTP_TIMEOUT_MS);
     // 诊断：TLS 握手需内部 RAM 连续块（默认 mbedTLS in/out 各 16KB），
     // 打印当前内部堆/最大连续块，便于确认是否堆耗尽/碎片化。
-    Serial.printf("[ai] TLS前 freeHeap=%u maxBlock=%u freePsram=%u\n",
+    ai::logf("[ai] TLS前 freeHeap=%u maxBlock=%u freePsram=%u",
                   ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getFreePsram());
     unsigned long t_conn = millis();
     if (!g_client.connect(host_s.c_str(), port)) { s_host = ""; Serial.println("[ai] TLS 连接失败"); return false; }
     // 诊断：握手耗时（毫秒），区分"网络慢/超时"与"阻塞卡顿"
-    Serial.printf("[ai] TLS 握手完成 ~%u ms（新建）\n", (unsigned)(millis() - t_conn));
+    ai::logf("[ai] TLS 握手完成 ~%u ms（新建）", (unsigned)(millis() - t_conn));
     s_host = host_s;
   } else {
-    Serial.println("[ai] TLS 复用（keep-alive）");
+    ai::logf("[ai] TLS 复用（keep-alive）");
   }
 
   bool reusable = true;
@@ -649,7 +673,7 @@ static bool http_post(const char* url, const char* key, const char* body, String
     g_client.setTimeout(AI_HTTP_TIMEOUT_MS);
     unsigned long t_conn = millis();
     if (g_client.connect(host_s.c_str(), port)) {
-      Serial.printf("[ai] TLS 重连完成 ~%u ms\n", (unsigned)(millis() - t_conn));
+      ai::logf("[ai] TLS 重连完成 ~%u ms", (unsigned)(millis() - t_conn));
       s_host = host_s;
       ok = http_exchange(host_s, key, path_s.c_str(), body, resp, &reusable);
     } else {
@@ -732,14 +756,16 @@ static void ai_worker(void*) {
     }
     xSemaphoreGive(g_mtx);
     if (!t.text) continue;
+    g_log_fn = t.fn;            // ai_log 回推通道：本任务周期内有效
+    g_log_ctx = t.ctx;
     g_last_continuous = false;  // 本任务尚未下发过持续指令（防上一任务残留标志误判）
     g_last_cont_type = 0;
     m_busy = true;
     // 摄像头可用性在任务起点判定（init 后即定）：不可用则整轮走无画面降级
     bool cam_ok = cam::available();
-    Serial.printf("[ai] 任务开始 gen=%lu text=%s%s\n", t.generation, t.text, cam_ok ? "" : "（无摄像头→无画面模式）");
+    ai::logf("[ai] 任务开始 gen=%lu text=%s%s", t.generation, t.text, cam_ok ? "" : "（无摄像头→无画面模式）");
     // 打印实际端点/模型，便于排查 404/401 等云端拒绝（配错路径是常见原因）
-    Serial.printf("[ai] 端点=%s 模型=%s key=%s\n", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
+    ai::logf("[ai] 端点=%s 模型=%s key=%s", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
                   cfg::ai_key().isEmpty() ? "空" : "已配置");
 
     unsigned long steps = 0;
@@ -862,7 +888,7 @@ static void ai_worker(void*) {
           exec::act(type, params);
           g_last_continuous = exec::is_continuous(type, params);
           g_last_cont_type = g_last_continuous ? (!strcmp(type, "move") ? 1 : 2) : 0;
-          Serial.printf("[ai] 执行 %s%s\n", type, g_last_continuous ? "（持续）" : "");
+          ai::logf("[ai] 执行 %s%s", type, g_last_continuous ? "（持续）" : "");
           String fb = build_feedback(t.id, cmdD);
           enqueue_result(fb.c_str(), t.fn, t.ctx);
           // 死循环防线：连续多轮下发相同指令 → 下轮注入引导语让 AI 主动变化
@@ -930,10 +956,11 @@ static void ai_worker(void*) {
     if (cur) free(cur);          // 本轮帧 PSRAM 副本
     if (prev) free(prev);        // 上一帧 PSRAM 副本
     if (t.ctx) delete (int*)t.ctx;  // 任务期 sink fd
+    ai::logf("[ai] 任务结束 gen=%lu", t.generation);   // 先于注销通道，确保此行也能回推
+    g_log_fn = nullptr; g_log_ctx = nullptr;  // 注销 ai_log 回推通道
     free(t.text); free(t.ann);
     resolve_stop();   // 统一兜底：持续指令残留即补停
     m_busy = false;
-    Serial.printf("[ai] 任务结束 gen=%lu\n", t.generation);
   }
 }
 

@@ -54,3 +54,14 @@ func _on_reset_pressed() -> void:
 
 func _on_light_toggled(on: bool, kind: String) -> void:
 	AppState.send_command(CP.light(kind, on))
+
+## 重连/查询后用板端状态同步按钮（不触发 toggled 回调，避免反向多下指令）。
+func sync_state(lights: Dictionary, grip_close: bool) -> void:
+	var map := {"front": "ForeLight", "vibe": "VibeLight", "back": "BackLight"}
+	for kind: String in map:
+		var b: Button = get_node_or_null("LightCtrl/" + map[kind])
+		if b != null:
+			b.set_pressed_no_signal(bool(lights.get(kind, false)))
+	var grip: Button = get_node_or_null("Btns/ClawClipReleaseBtn")
+	if grip != null:
+		grip.set_pressed_no_signal(grip_close)

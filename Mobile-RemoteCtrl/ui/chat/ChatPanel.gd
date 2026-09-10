@@ -56,12 +56,15 @@ func chat(who: String, msg: String) -> void:
 		_chat_log.append_text("[color=#6fc3ff]小车[/color]: %s\n" % msg)
 	elif who == "AI":
 		_chat_log.append_text("[color=#c9f7a8]AI[/color]: %s\n" % msg)
+	elif who == "AI日志":
+		_chat_log.append_text("[color=#9ad0ff]AI日志[/color]: %s\n" % msg)
 	elif who == "提示":
 		_chat_log.append_text("[color=#ffd75e]系统[/color]: %s\n" % msg)
 	elif who == "执行板":
 		_chat_log.append_text("[color=#b39ddb]执行板[/color]: %s\n" % msg)
 	else:
 		_chat_log.append_text(msg + "\n")
+	AppLog.write(who, msg)  # 聊天区出现的内容统一落盘（启动已建好文件）
 
 ## 展示一条 ai_result：{type:"ai_result", id, params:{error?, reason?, done?, command:{type,params,reason}}}。
 func show_ai_result(data: Dictionary) -> void:
@@ -347,6 +350,13 @@ func _handle_slash(text: String) -> void:
 				var ea: String = pieces[1].strip_edges().to_lower()
 				el_on = ea == "on" or ea == "1" or ea == "true"
 			cmd = CP.exec_log(el_on)
+		"/ai_log":
+			# AI 调试/延迟日志回推开关（默认关）：/ai_log [on|off]
+			var al_on := true
+			if pieces.size() > 1:
+				var aa: String = pieces[1].strip_edges().to_lower()
+				al_on = aa == "on" or aa == "1" or aa == "true"
+			cmd = CP.ai_log(al_on)
 		"/light":
 			# 直驱灯光：/light <front|vibe|back> <0|1>
 			var lt_kind := "front"

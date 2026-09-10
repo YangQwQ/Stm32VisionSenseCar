@@ -22,6 +22,10 @@ bool set_servo(uint8_t logical, uint16_t pwm);
 bool arm_pose(float x, float h);
 // 该指令是否为"持续型"（持续直驱需要配 stop 收尾）。
 bool is_continuous(const char* type, const JsonObjectConst& params);
+// 夹爪当前是否处于夹紧态（供 get_state 同步手机按钮）。
+bool grip_closing();
+// 某路灯当前是否开启（kind=front/vibe/back；供 get_state 同步手机按钮）。
+bool light_on(const char* kind);
 // 本地合成状态文本，写不进内容即返回 false。
 bool read_state(char* buf, size_t cap);
 

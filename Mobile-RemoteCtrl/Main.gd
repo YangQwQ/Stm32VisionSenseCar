@@ -385,9 +385,21 @@ func _wait_gatt_ready() -> void:
 
 # ============================== WS / 视频 ==============================
 
+## get_state 回传处理：同步直控按钮（灯/夹爪）。WS 与 BLE 通道共用。
+func _apply_state(data: Dictionary) -> void:
+	var st: Variant = data.get("params")
+	if not (st is Dictionary):
+		return
+	var stm := st as Dictionary
+	var lights: Variant = stm.get("lights")
+	if lights is Dictionary:
+		$BodyControl/CtrlArea.call("sync_state", lights, bool(stm.get("grip_close", false)))
+
 func _on_ws_connected() -> void:
 	_chat_panel.chat("板", "WS 已连接")
 	_update_status()
+	# 连上后主动拉一次当前状态，同步直控面板按钮（灯/夹爪），避免重连后状态不一致。
+	AppState.send_command(CP.get_state())
 	# WS 建立即进入 WS_ONLY（让出 BLE 射频）由 DeviceConn 在内部处理。
 	# 重连/复线后按图传开关当前状态重发一次开启指令：断连期间开关仍保持「开」而板子画面已断，
 	# 若不重发需要用户手动再拨一次。UDP VideoClient 每次重连需换新端口并随指令重新上报。
@@ -415,6 +427,21 @@ func _on_ws_text(data: Dictionary) -> void:
 		return
 	if t == "ai_result":
 		_chat_panel.show_ai_result(data)
+		return
+	if t == "ai_log":
+		# 板端 AI 调试/延迟日志回推（/ai_log on 开启）：展示并落盘（chat() 统一写日志）。
+		var alt: Variant = data.get("params")
+		var line := ""
+		if alt is Dictionary:
+			var tv: Variant = (alt as Dictionary).get("text")
+			if tv is String:
+				line = tv as String
+		if line != "":
+			_chat_panel.chat("AI日志", line)
+		return
+	if t == "state":
+		# get_state 回传（WS 通道）：同步直控按钮。
+		_apply_state(data)
 		return
 	if t == "exec_status":
 		# 执行板日志镜像：板子把执行板上行帧转发过来（状态帧已解码成可读文本 text）。
@@ -542,14 +569,14 @@ func _update_joystick() -> void:
 				AppState.send_command(CP.servo(0, _SERVO_CENTER))
 			return
 	# 直接驱动（绕过执行板）：油门 → 全车 drive；左右 → 转向舵（逻辑 0），
-	# 原地旋转模式下改为原地旋转(向右推=顺时针 dir=-1 / 向左推=逆时针 dir=+1)。
+	# 原地旋转模式下改为原地旋转(向右推=右转 / 向左推=左转)。
 	var drive_spd := int(round(absf(throttle) * _DRIVE_MAX))
 	if throttle < 0:
 		drive_spd = -drive_spd
 	AppState.send_command(CP.drive(clampi(drive_spd, -1000, 1000)))
 	if _spin_mode_btn.button_pressed:
 		if absf(steering) >= _JOY_DEADZONE:
-			AppState.send_command(CP.spin(-1 if steering > 0 else 1, _SPIN_SPEED))
+			AppState.send_command(CP.spin(1 if steering > 0 else -1, _SPIN_SPEED))
 	else:
 		AppState.send_command(CP.servo(0, clampi(
 			_SERVO_CENTER + int(round(steering / _JOY_STEER * _SERVO_RANGE)), 50, 250)))

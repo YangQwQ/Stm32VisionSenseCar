@@ -11,6 +11,7 @@
 
 static bool g_streaming = false;         // 图传开关全局状态（WS 推流任务读取）
 static bool g_exec_log = false;          // exec_log 开关（默认关；开启后周期性推本地状态）
+static bool g_ai_log = false;            // ai_log 开关（默认关；开启后 AI 调试信息同时推往手机）
 
 static bool has_id(const JsonDocument& doc) {
   return doc["id"].is<int>() || doc["id"].is<long>();
@@ -123,6 +124,32 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     bool on = params["on"] | false;
     set_exec_log(on);
     reply_status(doc, reply, reply_ctx, on ? "状态实时推送已开启" : "状态实时推送已关闭");
+    return;
+  }
+
+  if (!strcmp(type, "ai_log")) {
+    // AI 调试信息回推开关（默认关）：开启后 ai_client 的关键延迟/时序日志同时发手机
+    // （仍保留串口）。便于板子装上车后现场看握手/发包延迟。
+    bool on = params["on"] | false;
+    set_ai_log(on);
+    reply_status(doc, reply, reply_ctx, on ? "AI日志推送已开启" : "AI日志推送已关闭");
+    return;
+  }
+
+  if (!strcmp(type, "get_state")) {
+    // 主动查询当前状态（供手机重连后同步控制按钮）：回结构化灯/夹爪状态。
+    JsonDocument out;
+    out["type"] = "state";
+    JsonObject params = out["params"].to<JsonObject>();
+    JsonObject lights = params["lights"].to<JsonObject>();
+    lights["front"] = exec::light_on("front");
+    lights["vibe"]  = exec::light_on("vibe");
+    lights["back"]  = exec::light_on("back");
+    params["grip_close"] = exec::grip_closing();
+    if (has_id(doc)) out["id"] = doc["id"].as<long>();
+    String s;
+    serializeJson(out, s);
+    if (reply) { reply(reply_ctx, s.c_str()); }
     return;
   }
 
@@ -268,3 +295,7 @@ void cmd::set_streaming(bool on) { g_streaming = on; }
 bool cmd::exec_log() { return g_exec_log; }
 
 void cmd::set_exec_log(bool on) { g_exec_log = on; }
+
+bool cmd::ai_log() { return g_ai_log; }
+
+void cmd::set_ai_log(bool on) { g_ai_log = on; }

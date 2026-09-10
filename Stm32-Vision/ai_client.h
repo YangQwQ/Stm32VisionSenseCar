@@ -26,6 +26,10 @@ enum class StopMode : uint8_t { None, Wheels, All };
 void cancel(StopMode m = StopMode::All);  // 中止当前任务（新目标 / 手动指令 / ai_cancel）
 bool busy();                              // 是否有任务进行中（BLE status.ai_busy 用）
 
+// AI 调试日志：始终写串口；ai_log 开关开启且任务回传通道在位时，同时把该行
+// 以 {"type":"ai_log","text":..} 推送当前手机（复用 ai_result 的回传队列）。
+void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
 // 暂存一张编辑图（WS 二进制上行，裸 JPEG，覆盖式）。TTL 见常量。
 void set_edited_image(const uint8_t* data, size_t len);
 
