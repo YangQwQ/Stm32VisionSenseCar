@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本文档基准：仓库 HEAD `07aa659`（2026-09-09）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `9917330`（2026-09-10）。只覆盖已提交内容；未提交改动不收录。
 
 本项目维护指南，供后续编码助手 / 会话快速对齐上下文。
 
@@ -8,9 +8,9 @@
 
 - **Godot 4.7.1 mono（mobile，竖屏** **`window/handheld/orientation=1` = Portrait）+ GDScript**，目标平台 Android。（旧文档误写“横向”；project.godot 与 AndroidManifest 均为 portrait。）
 
-- 一条 **STM32 执行板（电机控制，`../Stm32-Executor`）** + 独立 **ESP32-S3-CAM 视觉/控制大脑板（`../Stm32-Vision`）** 的小车，经 UART 串接。
+- 一台 **ESP32-S3-CAM 视觉/控制大脑板（`../Stm32-Vision`）** 的小车 App。⚠️ **原 STM32 执行板（`../Stm32-Executor`）已裁撤**：板子经软件 I2C 直驱哪吒扩展板，手机侧不感知该差异（词表结构不变）。
 
-- 完整架构设计原见 `.trae/documents/ctrl-app-architecture-and-ui-plan.md`（该文件未随本仓库收录）；跨子板总览见仓库根 `../CLAUDE.md`。
+- 跨子板总览见仓库根 `../CLAUDE.md`。
 
 ## 通信架构（链路）
 
@@ -19,24 +19,25 @@
 | 通道 | 用途 | 实现状态 |
 |---|---|---|
 | BLE（GATT） | 配网 + 兜底控制 + status | GDBLE 接通（`BLEClient.gd` → `addons/gdble` + 协议表 `BleProfile.gd`）；板侧 GATT Server VisionS3 已烧录（联调中） |
-| WiFi WebSocket（端口 81） | 指令/状态/消息（**文本 JSON**）+ snapshot 单帧 | 真实（`WSCarClient.gd`；图传已不走 WS） |
+| WiFi WebSocket（端口 81） | 指令 / 状态 / 消息 / `ai_result`（**文本 JSON**） | 真实（`WSCarClient.gd`；图传已不走 WS） |
 | WiFi UDP | 图传 JPEG 分片（低延迟；缺片/超时自愈） | 真实（`UDPVideoClient.gd`，分片协议与板侧 `udp_send_frame` 对齐） |
 | 云端多模态 AI | DIRECT：板子直调云端，手机只下发 `ai_goal` | 桩（`AIClient.gd`；不经手机侧） |
 
-- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。词表：`move / stop / arm / snapshot / stream / exec_forward / config_wifi / ping / ai_goal / ai_cancel`（`stream` 携带 `udp_port` / `src_ip`，图传走 UDP）。
-- **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）；手机中转（RELAY）已移除。
+- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move / stop / arm / light / reset / stream / exec_log / config / ping / ai_goal / ai_oneshot / ai_cancel`，另含调试直驱 `servo / motor / drive / arm_pose`。（`snapshot`、`exec_forward` 已移除。）
+- **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）；手机中转（RELAY）已移除。`ai_oneshot` = 只执行一轮决策即收尾。
 
 ## 目录结构
 
 ```
 res://
-  Main.tscn / Main.gd          # App 壳：统一聊天入口（/ 指令 + 纯文本 ai_goal）、连接状态、布局
+  Main.tscn / Main.gd          # App 壳：连接编排、摇杆映射、图传开关、连接状态、布局
+  ui/chat/ChatPanel.gd         # 聊天/指令区：消息日志、指令提示、附件列表、指令解析与发送
   state/AppState.gd            # autoload 全局状态（连接引用 + send_command 统一出口：WS 优先、BLE 兜底）
   animation/AnimationManager.gd # autoload 通用动画（淡入+缩放滑入/滑出、上下浮动）
   net/
     DeviceConn.gd              # 统一连接层：持有 BLE/WS/UDP，收敛状态与重连策略（单一事实源）
     proto/CommandProto.gd      # 统一命令词表（static）
-    ws/WSCarClient.gd          # WS 传输（文本 JSON：指令/状态/snapshot 单帧）
+    ws/WSCarClient.gd          # WS 传输（文本 JSON：指令/状态/ai_result）
     ble/BLEClient.gd           # BLE GATT 客户端（GDBLE 运行时：扫描/连接/读写/配网/status）
     ble/BleProfile.gd          # 协议常量表（UUID/广播名/兜底白名单，与固件 ble.cpp 逐字 mirror）
     video/UDPVideoClient.gd    # UDP 图传接收：JPEG 分片重组 → frame_received
@@ -44,10 +45,11 @@ res://
   addons/
     gdble/                     # GDBLE 插件运行时（*.aar + libgdble.so，编译产物）
     gdble_export/              # 导出插件（Android libraries + manifest 注入）
-  .trae/documents/             # 架构设计文档（未随本仓库收录）
   ui/
     control/Joystick.gd + DirectControl.gd  # 复用虚拟摇杆 / 直控面板（脚本建树，无 tscn）
     video/VideoView.gd         # 图传显示（脚本建树）
+    chat/ChatPanel.gd          # 聊天区视图（脚本建树）
+    bluetooth/BTDeviceListItem.tscn+.gd  # 蓝牙设备列表项
     editor/ImageEditor.tscn+.gd + EditorCanvas.gd  # 图片标注（框/箭头/文字）
     provision/WifiConfigPopup.gd  # 配网弹窗（脚本建树）
 ```
@@ -72,6 +74,8 @@ res://
 
 - 组件独立成场景+脚本，动画统一走 `AnimationManager`。
 
+- 摇杆油门满量程 `Main.gd` 的 `_DRIVE_MAX`；直接驱动时油门 → 全车 `drive`，左右 → 转向舵。
+
 ## 构建环境
 
 - Android SDK / NDK：`D:\AndroidSDK`（platforms android-36，build-tools 36.1/37，NDK 30.0.15729638，platform-tools）。
@@ -93,3 +97,5 @@ res://
 ## 后续待办（不在当前阶段）
 
 - BLE（已解决，2026-09-05）：真机“刷新恒 0 设备”根因不是 gdble 扫描——btleplug Java `onScanResult` 正常大量回调、gdble 返回 25+ 周边设备，是 `BLEClient.gd:_labels` 对 `"name": null` 的设备字典做 `var name: String = d.get("name","")` 赋值，取到 Nil 触发运行时错误中断函数，`address` 兜底永远走不到、结果恒 `[]`。已改为显式判 null（name 为 null 时回退 address）。配网 GATT 两侧代码已接（见下）。
+
+- **遗留命名**：板侧本地直驱状态（`exec_status`）在 `Main.gd` / `ChatPanel.gd` 中仍以 `"执行板"` 作为消息来源标签显示；执行板已裁撤，该标签属历史命名，如需改为「状态」需同步两处。
