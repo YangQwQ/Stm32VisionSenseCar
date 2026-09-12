@@ -9,6 +9,7 @@ extends VBoxContainer
 ## 与 Main 的交互：图传开关等旁路动作经 stream_requested 信号交给 Main 统一处理。
 
 signal stream_requested(on: bool)
+signal grid_requested(on: bool)
 
 const CP := preload("res://net/proto/CommandProto.gd")
 const MAX_IMAGES := 3
@@ -342,6 +343,15 @@ func _handle_slash(text: String) -> void:
 				on = arg != "off" and arg != "0" and arg != "false"
 			chat("本机", text)
 			stream_requested.emit(on)  # 统一出口：Main 同步开关并起停 UDP 接收
+			return
+		"/grid":
+			# 图传标定网格叠加开关（本地显示层，不下发板子）：/grid [on|off]
+			var g_on := true
+			if pieces.size() > 1:
+				var ga: String = pieces[1].strip_edges().to_lower()
+				g_on = ga != "off" and ga != "0" and ga != "false"
+			chat("本机", text)
+			grid_requested.emit(g_on)
 			return
 		"/exec_log":
 			# 本地直驱状态实时推送开关（默认关）：/exec_log [on|off]

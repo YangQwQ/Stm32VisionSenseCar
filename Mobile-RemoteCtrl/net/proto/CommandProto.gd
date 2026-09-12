@@ -10,7 +10,7 @@ static func stop(scope: String = "all") -> Dictionary:
 	return {"type": "stop", "params": {"scope": scope}, "id": _new_id()}
 
 static func arm(act: String, duration_ms: int = 0) -> Dictionary:
-	# act: lift_up / lift_down / clip / release / reach_forward / reach_backward
+	# act: lift_up / lift_down / clip / release / reach_forward / reach_backward / home(收臂回平台)
 	# duration_ms == 0 表示持续移动，直到收到 stop(scope="arm")
 	return {"type": "arm", "params": {"act": act, "duration_ms": duration_ms}, "id": _new_id()}
 
@@ -115,6 +115,7 @@ static func help_lines() -> PackedStringArray:
 		"/ping [IP|域名]  连通性测试（不带参数=测小车）",
 		"/clear  清空消息区(仅本机)",
 		"/stream [on|off]  图传开关",
+		"/grid [on|off]  图传叠加标定网格（本地，不下发板子）",
 		"/stop [wheels|arm]  停车",
 		"/exec_log [on|off]  实时状态推送开关（默认关)",
 		"/ai_log [on|off]  AI日志推送开关（默认关，开启后AI调试/延迟日志发手机）",
@@ -138,6 +139,7 @@ const COMMAND_HINTS := {
 	"/ping [IP|域名]": "连通性测试（不带参数=测小车）",
 	"/clear": "清空消息区(仅本机)",
 	"/stream [on|off]": "图传开关",
+	"/grid [on|off]": "图传叠加标定网格（本地，不下发板子）",
 	"/stop [wheels|arm]": "停车",
 	"/exec_log [on|off]": "实时状态推送开关（默认关）",
 	"/ai_log [on|off]": "AI日志推送开关（默认关，开启后AI调试/延迟日志发手机）",

@@ -535,6 +535,10 @@ func _on_chat_stream_requested(on: bool) -> void:
 	_stream_toggle.set_pressed_no_signal(on)
 	_apply_stream(on)
 
+## 图传标定网格叠加（/grid 本地开关，配合单应标定测量）。
+func _on_chat_grid_requested(on: bool) -> void:
+	_video.call("show_grid", on)
+
 # ============================== 手动控制 ==============================
 
 func _process(_delta: float) -> void:

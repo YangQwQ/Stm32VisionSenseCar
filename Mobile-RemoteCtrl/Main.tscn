@@ -5,6 +5,7 @@
 [ext_resource type="Texture2D" uid="uid://bx6teaav65tma" path="res://res/scan_devices.png" id="5_j4qnp"]
 [ext_resource type="Script" uid="uid://ccoaatpwj6ivp" path="res://ui/chat/ChatPanel.gd" id="5_kjvhd"]
 [ext_resource type="Script" uid="uid://c7y01patjmc1s" path="res://ui/video/VideoView.gd" id="5_trn2v"]
+[ext_resource type="Script" path="res://ui/video/GridOverlay.gd" id="13_grid"]
 [ext_resource type="Script" uid="uid://dmgue5hwo2dt3" path="res://ui/control/DirectControl.gd" id="6_03owx"]
 [ext_resource type="Texture2D" uid="uid://cojg54jdu10rk" path="res://res/delete.png" id="6_sc1dx"]
 [ext_resource type="Texture2D" uid="uid://btk412diyh6ht" path="res://res/device.png" id="7_20pc6"]
@@ -958,6 +959,15 @@ text = "未连接 / 无信号"
 horizontal_alignment = 1
 vertical_alignment = 1
 
+[node name="Overlay" type="Control" parent="BodyControl/Video" unique_id=480602809]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("13_grid")
+
 [node name="VidControls" type="HBoxContainer" parent="BodyControl" unique_id=1105787060]
 layout_mode = 2
 theme_override_constants/separation = 12
@@ -1594,6 +1604,7 @@ layout_mode = 1
 [connection signal="toggled" from="BodyBTScan/RefreshBtn" to="." method="_on_refresh_toggled"]
 [connection signal="toggled" from="BodyControl/VidControls/StreamToggle" to="." method="_on_stream_toggled"]
 [connection signal="pressed" from="BodyControl/VidControls/AnnotateBtn" to="." method="_on_annotate_pressed"]
+[connection signal="grid_requested" from="BodyControl/ChatPanel" to="." method="_on_chat_grid_requested"]
 [connection signal="stream_requested" from="BodyControl/ChatPanel" to="." method="_on_chat_stream_requested"]
 [connection signal="text_changed" from="BodyControl/ChatPanel/InputRow/MessageInput" to="BodyControl/ChatPanel" method="_on_input_text_changed"]
 [connection signal="text_submitted" from="BodyControl/ChatPanel/InputRow/MessageInput" to="BodyControl/ChatPanel" method="_on_send_pressed"]
