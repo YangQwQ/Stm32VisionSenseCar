@@ -1,6 +1,6 @@
 # CLAUDE.md（仓库根 · 总览与索引）
 
-> 本文档基准：仓库 HEAD `9917330`（2026-09-10）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `6d1e3bf`（2026-09-12）。只覆盖已提交内容；未提交改动不收录。
 
 本仓库是「视觉控制小车」协作工程的**容器仓库**，现收拢两块子工程：
 
@@ -19,7 +19,7 @@
 
 - **大脑板既是视觉大脑也是执行器**：`command` 收到手动指令后直接调 `exec::act`，不再有中间板。
 - **词表 JSON 只由手机 App 持有**（`net/proto/CommandProto.gd`）；`词表 → 哪吒 I2C 命令` 的翻译在大脑板 `command` + `direct_exec` 一侧。
-- 当前状态：BLE 配网、WS 指令/状态、UDP 图传、软件 I2C 直驱（舵机/电机/灯）均已接通；板载 DIRECT AI（`ai_goal`/`ai_oneshot`）已实现并按任务闭环调用 `exec`；手机端云端 AI（`AIClient.gd`）仍为桩（DIRECT 不经过手机侧）。
+- 当前状态：BLE 配网、WS 指令/状态、UDP 图传、软件 I2C 直驱（舵机/电机/灯，含**原地旋转**与按实测时长近似的**定距/定角**）均已接通；板载 DIRECT AI（`ai_goal`/`ai_oneshot`）已实现并按任务闭环调用 `exec`，其侧维护画面单应标定 + 物体空间记忆 + 车姿态累积，并按需携带上一帧做运动对比；手机端云端 AI（`AIClient.gd`）仍为桩（DIRECT 不经过手机侧）。
 
 ## 各子工程文件索引（简）
 
@@ -30,17 +30,17 @@
 | 文件 | 作用 |
 |---|---|
 | `Stm32-Vision.ino` | 入口（setup 按序初始化，loop 调各模块 update + `exec::update_tick`） |
-| `camera(.h/.cpp)` `camera_pins.h` | 摄像头初始化 + JPEG 双缓冲抓帧；引脚定义唯一配置点在 `camera.h` 顶部选 `CAMERA_MODEL_*` |
+| `camera(.h/.cpp)` `camera_pins.h` | 摄像头初始化 + JPEG 双缓冲抓帧（图传与 AI 并发取帧，抓帧模式 `WHEN_EMPTY`；画面已在 init 回正）；引脚定义唯一配置点在 `camera.h` 顶部选 `CAMERA_MODEL_*` |
 | `camera_index.h` | Web 前端页面（源自例程，现基本不用） |
 | `config(.h/.cpp)` | WiFi / AI 接口参数，NVS 持久化 |
 | `wifi_net(.h/.cpp)` | STA 连接 + 断线重连（namespace `net`，勿改回 `network`） |
-| `direct_exec(.h/.cpp)` | **执行器直驱层**：move/stop/arm/light/reset 落地到哪吒板；机械臂二连杆 IK；本地合成状态文本 |
+| `direct_exec(.h/.cpp)` | **执行器直驱层**：move/stop/arm/arm_pose/light/reset/spin 落地到哪吒板；机械臂二连杆 IK + 连续动作步进 + `home` 收臂；定距/定角到点自停；本地合成状态文本（含正运动学末端位置） |
 | `nezha_direct(.h/.cpp)` | 哪吒扩展板软 I2C 驱动（舵机 / 电机 / 灯），协议与硬件一致 |
-| `command(.h/.cpp)` | 统一词表 JSON 分发（与传输解耦）；`ai_goal` 触发 `ai::set_goal` 闭环 |
+| `command(.h/.cpp)` | 统一词表 JSON 分发（与传输解耦）；手动指令先 `ai::cancel` 打断 AI 再落地；`ai_goal` 触发 `ai::set_goal` 闭环；`exec_log`/`ai_log` 开关、`get_state` 查询回包 |
 | `ping_svc(.h/.cpp)` | `/ping <目标>` 异步 ICMP 探测（无目标则就地回 pong） |
 | `ble(.h/.cpp)` | BLE GATT Server：配网 + 兜底控制 + status 通知（广播名 VisionS3） |
-| `app_httpd.cpp` | HTTP（MJPEG/拍照/LED）+ WS（端口 81 文本 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报 |
-| `ai_client(.h/.cpp)` | 板载多模态 AI（DIRECT 直调云端，任务级闭环：move/arm/stop/wait、双帧运动感知、PSRAM 分配 + keep-alive TLS） |
+| `app_httpd.cpp` | HTTP（MJPEG/拍照/LED）+ WS（端口 81 文本 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（`ws_stream` 任务栈 8192） |
+| `ai_client(.h/.cpp)` | 板载多模态 AI（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait；HTTPClient + keep-alive TLS 复用重试、PSRAM 缓冲；单应标定 + 空间记忆 + 车姿态；默认单帧、按 `carry_prev` 附带上一帧；WS 文本出口做 UTF-8 消毒防手机端 1007 断链） |
 | `partitions.csv` | 分区表（3MB APP，需 `huge_app`） |
 
 ### Mobile-RemoteCtrl/ — 手机遥控 App（Godot 工程）
@@ -49,16 +49,17 @@
 
 | 路径 | 内容 |
 |---|---|
-| `Main.tscn/.gd` | App 壳（连接编排、摇杆映射、图传开关） |
-| `ui/chat/ChatPanel.gd` | 聊天/指令区（消息日志、指令提示、附件列表、指令解析） |
+| `Main.tscn/.gd` | App 壳（连接编排、摇杆映射、图传开关、「关于」页设置项：自连 / 禁用自动 WS / 原地旋转模式） |
+| `ui/chat/ChatPanel.gd` | 聊天/指令区（消息日志、指令提示、附件列表、指令解析、`/move` `/spin` `/grid` `/ai_log` 等本地指令） |
 | `state/AppState.gd` (+LocalStore) | autoload 全局状态 + send_command 统一出口 |
+| `state/AppLog.gd` | autoload 本地日志落盘（每次启动截断重写 `user://logs/app.log`） |
 | `net/proto/CommandProto.gd` | **统一命令词表**（static） |
 | `net/DeviceConn.gd` | **统一连接层**：自建并持有 BLE/WS/UDP，收敛状态与重连策略（单一事实源；Main/AppState 只订阅其信号） |
 | `net/ws/WSCarClient.gd` | WS 传输（端口 81 文本 JSON：指令/状态；视频已走 UDP） |
-| `net/ble/BLEClient.gd` + `BleProfile.gd` | BLE GATT 客户端；协议常量表（与大脑板 ble.cpp **逐字 mirror**） |
+| `net/ble/BLEClient.gd` + `BleProfile.gd` | BLE GATT 客户端；协议常量表 + BLE 可发类型**黑名单**（仅图传/云端 AI 直连被拦，其余类型均可走蓝牙兜底） |
 | `net/video/UDPVideoClient.gd` | UDP 图传接收（JPEG 分片重组 → 上抛 frame_received） |
 | `net/ai/AIClient.gd` | 云端 AI 桩（DIRECT 不经手机侧） |
-| `ui/` | 摇杆 / 图传 / 图片标注 / 配网弹窗 / 直控面板 |
+| `ui/` | 摇杆 / 图传（含 `ui/video/GridOverlay.gd` 的 `/grid` 标定网格叠加）/ 图片标注 / 配网弹窗 / 直控面板 |
 | `addons/gdble*` | GDBLE 蓝牙运行时（含导出插件） |
 
 ## 硬件基线（BOM 速查）
@@ -68,13 +69,13 @@
 - **大脑板**：ESP32-S3-CAM（N16R8）+ **OV3660** 摄像头；既跑视觉/网络/AI，也直接输出哪吒 I2C 命令。
 - **驱动板**：哪吒（NeZha）扩展板，I2C 从机地址 `0x80`；**大脑板软件 I2C 直连**（SCL=GPIO47 / SDA=GPIO14），无 MCU 中转。
 - **执行机构**：4× N20 直流电机（四轮，**无编码器**）+ 4× MG90S 舵机（Servo1 转向 / Servo2 移爪 / Servo3 夹爪 / Servo4 抬落）。
-- ⚠️ 因电机无编码器，**直驱下没有里程计**：`distance_cm` / `angle_deg` 等定距定角参数被忽略（仅 `arm` 的 `dist_cm` 按拍数近似）。
+- ⚠️ 因电机无编码器，**直驱下没有里程计**：`move` 的 `distance_cm` 与 `spin` 的 `angle_deg` 不做闭环，按**实测标定表的时长近似**到点自停（粗用，非精确）；`arm` 的 `dist_cm` 按拍数近似。
 
 ## 跨子工程同步点（铁律）
 
 改协议/常量前**必须**先读两份子 CLAUDE.md 的「协议参考」/「通信协议速查」，并同步相关侧：
 
-1. **词表 JSON**（type / params 字段）：只由手机 `net/proto/CommandProto.gd` 定义 ↔ 大脑板 `command.cpp` 的 `type` 分支 + `direct_exec.cpp` 的 params 解析，**两侧逐字对应**。改一侧必改另一侧。
+1. **词表 JSON**（type / params 字段）：只由手机 `net/proto/CommandProto.gd` 定义 ↔ 大脑板 `command.cpp` 的 `type` 分支 + `direct_exec.cpp` 的 params 解析，**两侧逐字对应**。改一侧必改另一侧。现行类型：`move`（可选 `distance_cm` 定距，时长近似）/ `stop` / `arm`（act 含 `home`）/ `spin`（可选 `angle_deg` 定角）/ `light` / `reset` / `stream` / `exec_log` / `ai_log` / `get_state` / `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel` + 调试直驱 `servo` / `motor` / `drive` / `arm_pose`。⚠️ 已知不符：`CommandProto.arm()` 发 `duration_ms` 而板端只读 `dist_cm`（该 builder 目前无调用方，启用前须统一）。
 2. **BLE UUID / 广播名（VisionS3）**：手机 `net/ble/BleProfile.gd` ↔ 大脑板 `ble.cpp`，逐字 mirror。
 3. **哪吒 I2C 命令表**（从机 `0x80`、舵机/电机/灯光 cmd 字节）：现只有大脑板 `nezha_direct.cpp` 一处实现，无对侧；改动须对照哪吒扩展板硬件协议，别单方面改字节。
 4. 各子 CLAUDE.md 中还有各自的坑（如大脑板 `namespace net` 勿改回 `network`、esp32 勿回退 2.x / 勿用 esp32cam 目标等），改动前读。
@@ -85,6 +86,7 @@
 
 - 手机端 = 本仓库的 `Mobile-RemoteCtrl/`（即外部路径里的 `Ctrl-App`）；
 - 架构文档（`vision-control-architecture.md`）**不在本仓库内**，如缺失且需要，找作者或按两份子 CLAUDE.md 的协议节反推。注意该文档早于执行板裁撤，其中的 UART 帧协议节已失效。
+- `.trae/`（mbedTLS 重编流程 + `documents/` 设计笔记）**被 `.gitignore` 排除、不在版本库内**：本地工作区有，clone 后不会有。`Stm32-Vision/CLAUDE.md` 的构建要点引用它，属仓库外资料。
 
 ## 仓库级约定
 

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本文档基准：仓库 HEAD `9917330`（2026-09-10）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `6d1e3bf`（2026-09-12）。只覆盖已提交内容；未提交改动不收录。
 
 本项目维护指南，供后续编码助手 / 会话快速对齐上下文。
 
@@ -23,23 +23,27 @@
 | WiFi UDP | 图传 JPEG 分片（低延迟；缺片/超时自愈） | 真实（`UDPVideoClient.gd`，分片协议与板侧 `udp_send_frame` 对齐） |
 | 云端多模态 AI | DIRECT：板子直调云端，手机只下发 `ai_goal` | 桩（`AIClient.gd`；不经手机侧） |
 
-- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move / stop / arm / light / reset / stream / exec_log / config / ping / ai_goal / ai_oneshot / ai_cancel`，另含调试直驱 `servo / motor / drive / arm_pose`。（`snapshot`、`exec_forward` 已移除。）
+- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `home` 收臂回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角）/ `light` / `reset` / `stream` / `exec_log` / `ai_log` / `get_state` / `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel`，另含调试直驱 `servo / motor / drive / arm_pose`。（`snapshot`、`exec_forward` 已移除。）
 - **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）；手机中转（RELAY）已移除。`ai_oneshot` = 只执行一轮决策即收尾。
+- **定距 / 定角**：`move` 的 `distance_cm`、`spin` 的 `angle_deg` 由板端按**时长近似**到点自停（无里程计，靠实测标定表插值），非闭环，供微操与标定粗用；不带则持续动作，靠 `stop` 收尾。
+- **调试与本地指令**：`/move <油门 -100..100> <cm>`、`/spin <dir> [speed] [angle]` 经词表下发；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点。
+- **重连同步**：WS 连上后主动发一次 `get_state`，板端回 `type:"state"`，`Main.gd._apply_state` → `DirectControl.sync_state` 同步灯光/夹爪按钮（`set_pressed_no_signal`，不回灌指令）。
 
 ## 目录结构
 
 ```
 res://
-  Main.tscn / Main.gd          # App 壳：连接编排、摇杆映射、图传开关、连接状态、布局
+  Main.tscn / Main.gd          # App 壳：连接编排、摇杆映射、图传开关、连接状态、布局；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）
   ui/chat/ChatPanel.gd         # 聊天/指令区：消息日志、指令提示、附件列表、指令解析与发送
   state/AppState.gd            # autoload 全局状态（连接引用 + send_command 统一出口：WS 优先、BLE 兜底）
+  state/AppLog.gd              # autoload 本地日志落盘：每次启动截断重写 user://logs/app.log，聊天区每行统一写入
   animation/AnimationManager.gd # autoload 通用动画（淡入+缩放滑入/滑出、上下浮动）
   net/
     DeviceConn.gd              # 统一连接层：持有 BLE/WS/UDP，收敛状态与重连策略（单一事实源）
     proto/CommandProto.gd      # 统一命令词表（static）
     ws/WSCarClient.gd          # WS 传输（文本 JSON：指令/状态/ai_result）
     ble/BLEClient.gd           # BLE GATT 客户端（GDBLE 运行时：扫描/连接/读写/配网/status）
-    ble/BleProfile.gd          # 协议常量表（UUID/广播名/兜底白名单，与固件 ble.cpp 逐字 mirror）
+    ble/BleProfile.gd          # 协议常量表（UUID/广播名/BLE 黑名单 BLOCKED_TYPES，与固件 ble.cpp 逐字 mirror）
     video/UDPVideoClient.gd    # UDP 图传接收：JPEG 分片重组 → frame_received
     ai/AIClient.gd             # 云端 AI 桩（DIRECT 不经手机侧，未接）
   addons/
@@ -47,7 +51,7 @@ res://
     gdble_export/              # 导出插件（Android libraries + manifest 注入）
   ui/
     control/Joystick.gd + DirectControl.gd  # 复用虚拟摇杆 / 直控面板（脚本建树，无 tscn）
-    video/VideoView.gd         # 图传显示（脚本建树）
+    video/VideoView.gd         # 图传显示（脚本建树）；子节点 Overlay = GridOverlay.gd（/grid 标定网格）
     chat/ChatPanel.gd          # 聊天区视图（脚本建树）
     bluetooth/BTDeviceListItem.tscn+.gd  # 蓝牙设备列表项
     editor/ImageEditor.tscn+.gd + EditorCanvas.gd  # 图片标注（框/箭头/文字）
@@ -76,6 +80,8 @@ res://
 
 - 摇杆油门满量程 `Main.gd` 的 `_DRIVE_MAX`；直接驱动时油门 → 全车 `drive`，左右 → 转向舵。
 
+- **摇杆两套转向行为**（「关于」页 `SpinMode` 设置项切换，经 `LocalStore` 持久化）：关 = 左右推杆发 `servo`（转向舵，需前轮回正）；开 = 发 `spin` 原地旋转（左右推杆按 `_SPIN_SPEED` 定速，速度低于实测拖动线会拖不动），松手发 `spin(0)` 停。
+
 ## 构建环境
 
 - Android SDK / NDK：`D:\AndroidSDK`（platforms android-36，build-tools 36.1/37，NDK 30.0.15729638，platform-tools）。
@@ -99,3 +105,5 @@ res://
 - BLE（已解决，2026-09-05）：真机“刷新恒 0 设备”根因不是 gdble 扫描——btleplug Java `onScanResult` 正常大量回调、gdble 返回 25+ 周边设备，是 `BLEClient.gd:_labels` 对 `"name": null` 的设备字典做 `var name: String = d.get("name","")` 赋值，取到 Nil 触发运行时错误中断函数，`address` 兜底永远走不到、结果恒 `[]`。已改为显式判 null（name 为 null 时回退 address）。配网 GATT 两侧代码已接（见下）。
 
 - **遗留命名**：板侧本地直驱状态（`exec_status`）在 `Main.gd` / `ChatPanel.gd` 中仍以 `"执行板"` 作为消息来源标签显示；执行板已裁撤，该标签属历史命名，如需改为「状态」需同步两处。
+
+- **遗留字段不符**：`CommandProto.arm()` 发 `params.duration_ms`，而板端 `direct_exec.cpp` 的 `arm` 只读 `params.dist_cm`（`duration_ms` 被忽略，等同无定距的持续动作）——违反「词表两侧逐字对应」。目前该 builder 无调用方（UI 走 `DirectControl.gd` 只发 `act`，持续动作靠 `stop` 收尾），启用前需先在两侧统一字段名。

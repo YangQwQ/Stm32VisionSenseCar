@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本文档基准：仓库 HEAD `9917330`（2026-09-10）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `6d1e3bf`（2026-09-12）。只覆盖已提交内容；未提交改动不收录。
 
 本文件为当前项目（ESP32-S3-CAM / OV3660 摄像头板）的 AI 助手工作指南。
 
@@ -10,7 +10,7 @@
 
 ### 工作模式
 
-1. **WiFi 直连 AI 模式**：板子经 WiFi 直调多模态 AI 接口，上传画面 → 解析返回控制指令 → **本板直接执行**（`exec::act`）。✅ 已实现（DIRECT：`ai_goal` → `ai_client` 迭代闭环，真机联调中）。
+1. **WiFi 直连 AI 模式**：板子经 WiFi 直调多模态 AI 接口，上传画面 → 解析返回控制指令 → **本板直接执行**（`exec::act`）。✅ 已实现（DIRECT：`ai_goal` → `ai_client` 迭代闭环，真机联调中）。AI 侧另维护**画面标定（单应）+ 物体空间记忆 + 车姿态累积**并把结果换算成当前车头局部系喂回模型；是否携带上一帧做运动对比由模型用 `carry_prev` 自行决定。云端持续无有效响应会逐轮退避、超限即中止任务并回报手机。
 2. **蓝牙配置模式**：BLE（GATT Server，广播名 VisionS3）接收配置（WiFi 账号密码 / AI 接口等）→ 存 NVS → **在线重建 STA 生效，不整板重启**（BLE 保活，手机无需重连）。✅ 已实现。**生命周期**：手机在 WS 连上后断开本机 BLE 让出射频（WS_ONLY）；广播开关由 `ble::set_transmission` 统一控制——仅当**真在推帧**（UDP 图传 / MJPEG）时停广播让 WiFi 独占射频；WS 指令/状态通道在位时不关广播，保持可发现（手机随时可重连/兜底，`onDisconnect` 尊重该状态）。
 3. **手机中转模式（已弃用）**：App 中转调 AI 的 RELAY 已在手机端移除（2026-09）。现行 **DIRECT**：手机只下发 `ai_goal` 目标文本/区域 → 板子 `ai_client` 直调云端 AI 执行闭环并回 `ai_result`；手机端云端 AI（`AIClient.gd`）仍为桩（DIRECT 不经手机侧）。
 
@@ -25,18 +25,18 @@
 | 文件 | 作用 |
 | --- | --- |
 | `Stm32-Vision.ino` | 入口：setup 按 cfg→ble→exec→cam→net→web→ai 初始化；loop 调各模块 update + `exec::update_tick()` |
-| `camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`；画质参数（分辨率/JPEG 质量）集中在 `camera.cpp` `init()` 顶部，推流帧率在 `app_httpd.cpp`（`WS_STREAM_FPS`，图传走 UDP） |
+| `camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`；抓帧模式 `CAMERA_GRAB_WHEN_EMPTY`——图传与 AI 是两个并发取帧方，用 `LATEST` 会与之抢缓冲导致取帧卡死）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`；画质参数（分辨率/JPEG 质量）与画面回正（`vflip`/`hmirror`，使所见即真实方位）集中在 `camera.cpp` `init()` 顶部，推流帧率在 `app_httpd.cpp`（`WS_STREAM_FPS`，图传走 UDP） |
 | `camera_pins.h` | 各摄像头型号 GPIO 引脚定义（按 `CAMERA_MODEL_*` 分支） |
 | `camera_index.h` | Web 前端页面（HTML/JS 内嵌数组，源自例程，现基本不用） |
 | `config.h/.cpp` | WiFi / AI 接口配置，NVS 持久化（不再写死 ssid/password）。⚠️ 遗留：`cfg::uart_baud()` 键仍在但已无调用方（UART 链路裁撤后的残留） |
 | `wifi_net.h/.cpp` | STA 连接 + 断线重连 + 在线换网 `net::reconnect`（namespace `net`）。⚠️ 勿改回 `network`：会与核心库 `Network.h` 在 Windows 大小写不敏感 FS 上遮蔽冲突 |
 | `nezha_direct.h/.cpp` | 哪吒扩展板软 I2C 直驱底座：`set_servo(ch,pwm)` / `set_motor(ch,a,b)` / `led(kind,on)`；从机 `0x80`，协议与哪吒硬件一致 |
-| `direct_exec.h/.cpp` | **执行层**（替代原执行板）：`act()` 分发 move/stop/arm/light/reset、连续机械臂动作步进 `update_tick()`、二连杆 IK `arm_pose()`、本地合成状态 `read_state()`、持续型判定 `is_continuous()` |
-| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal` 触发板载 AI；`exec_log` 开关控制状态推送 |
-| `ai_client.h/.cpp` | 板载多模态 AI HTTP 调用（DIRECT 直调云端，任务级闭环：move/arm/stop/wait、双帧运动感知、PSRAM 分配 + keep-alive TLS），动作最终走 `exec::act` |
+| `direct_exec.h/.cpp` | **执行层**（替代原执行板）：`act()` 分发 move/stop/arm/arm_pose/light/reset/spin、连续机械臂动作步进 `update_tick()`（兼管定距/定角到点自停）、二连杆 IK `arm_pose()`、本地合成状态 `read_state()`（含末端前/高与爪限位）、持续型判定 `is_continuous()` |
+| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；手动指令先 `ai::cancel` 打断 AI 闭环再落地；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal` 触发板载 AI；`exec_log` 控制状态周期推送、`ai_log` 把 AI 日志经回传通道上抛；`get_state` 回灯/夹爪当前态 |
+| `ai_client.h/.cpp` | 板载多模态 AI HTTP 调用（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait，动作最终走 `exec::act`）：HTTPClient + keep-alive TLS 复用与失败重试、PSRAM 缓冲；画面单应标定 + 物体空间记忆 + 车姿态累积，换算到车头局部系后喂回模型；默认单帧，仅当上轮 `carry_prev:true` 才附带上一帧做运动对比；WS 文本出口统一过 `sanitize_ws_utf8` 消毒（云端偶发残缺 UTF-8，原样进 TEXT 帧会让手机端以 `1007` 断链）；发往云端的长字符串按 UTF-8 边界截断（截半个中文字节会被判 400）；服务端持续无有效响应则逐轮退避，超限中止任务并回报手机 |
 | `ping_svc.h/.cpp` | `/ping <目标>` 异步 ICMP echo（esp_ping），结果经 cmd 回复通道回报；无目标仍由 command 就地回 `pong` |
 | `ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知；广播开关随 `set_transmission`（真在推帧即停）（UUID 见下「协议参考」）|
-| `app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（默认关，`exec_log` 开启后约 400ms 一条）。人脸检测/识别已停用（宏置 0） |
+| `app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（默认关，`exec_log` 开启后约 400ms 一条；状态缓冲须容下含抓手前端的整行，改状态行时同步核对）。`ws_stream` 任务栈 8192（推流 + 状态上报共用）。人脸检测/识别已停用（宏置 0） |
 | `partitions.csv` | 分区表：app0 约 3.8MB，需选带 3MB+ APP 空间的开发板分区选项 |
 
 ## 直驱执行层要点（`exec` / `nezha`）
@@ -44,10 +44,12 @@
 - **接线**：哪吒 SCL ← GPIO47，SDA ← GPIO14；I2C 速率 ≤200kHz，软 I2C 开漏实现（原执行板的 PB6/PB7 须脱离总线）。
 - **物理映射**：四轮 M1左后 / M2右后 / M3右前 / M4左前（左轮 `a` 正前、右轮 `b` 正前）；舵机 Servo1 转向 / Servo2 移爪 / Servo3 夹爪 / Servo4 抬落。
 - **标定限位**（`direct_exec.cpp` 顶部宏，实测）：转向 150/120/180；移爪中位 200（120..250）；夹爪紧 50 / 松 140；抬落中位 180（115..250）。
-- **连续动作**：`lift_up/down`、`reach_forward/backward` 为持续型——`update_tick()` 每拍按 `ARM_STEP_CM`(0.25cm) 沿目标轴步进并保持另一维（reach 保持高度 h、lift 保持 x），经 `arm_pose` 反解联动双舵机下发；到可达域边界/机械限位（末端无实际移动）自动停，收到 `stop(scope="arm")` 或离散动作时清除；`clip/release` 为离散置端。
+- **连续动作**：`lift_up/down`、`reach_forward/backward` 为持续型——`update_tick()` 每拍按 `ARM_STEP_CM`(0.06cm) 沿目标轴步进并保持另一维（reach 保持高度 h、lift 保持 x），经 `arm_pose` 反解联动双舵机下发；到可达域边界/机械限位（末端无实际移动）自动停，收到 `stop(scope="arm")` 或离散动作时清除；`clip/release` 为离散置端，`home` 收臂回平台位。
 - **二连杆 IK**：`arm_pose(x,h)`（x=轴前方 cm，h=地面以上 cm）反解 α/β 后查标定表联动左右两舵机；L1=L2=7.5cm、肩轴离地 9.5cm、可达半径 4..15cm。
-- **无里程计**：电机无编码器，`move` 的 `distance_cm` / `angle_deg` 被忽略（`is_continuous` 判据里保留这两个字段，仅用于区分是否配 `stop`）；`arm` 的 `dist_cm` 按每 cm ≈ `ARM_CNT_PER_CM` 拍近似。
-- **手动指令优先**：`command` 收到 move/stop/arm 先 `ai::cancel(...)` 打断 AI 闭环再 `exec::act`（arm 打断只停轮子）。
+- **无里程计（电机无编码器）**：定距/定角不做闭环，一律按**实测标定表的时长近似**到点自停——`move` 带 `distance_cm` 时按 `MV_SPEED_X/Y`（油门→cm/s）与 `MV_COAST_X/Y`（起停余量）换算时长（需 `cm>0` 且油门非零）；`spin` 带 `angle_deg` 时按 `SPIN_MSDEG_X/Y` 换算；`arm` 的 `dist_cm` 按每 cm ≈ `ARM_CNT_PER_CM` 拍近似。不带定距/定角即为持续动作，靠 `stop` 收尾；AI 侧对无 `distance_cm` 的持续 move 另设 `AI_MOVE_CAP_MS` 上限兜底。
+- **原地旋转**：`spin` 的 `dir` = `+1` 右转（顺时针，左轮进/右轮退）/ `-1` 左转 / `0` 停（显式写 0 速度）；`dir≠0` 时转速低于 `SPIN_MIN_SPEED` 会被抬高（低于实测拖动线拖不动）。`move` 与 `stop` 都会清掉旋转状态。
+- **状态行**：`read_state()` 合成 `小车:<速度> <动作> | 抓手:前Xcm 高Ycm 爪:<合/开/中><限位提示>`，末端位置由正运动学算出（不再有「左:.. 右:..」的旧格式）。
+- **手动指令优先**：`move/stop/arm/drive/spin/servo/motor/arm_pose/reset` 视为手动接管，先 `ai::cancel` 再落地；`arm`/`arm_pose` 只停轮子（`StopMode::Wheels`），其余类型用户指令已覆盖故不补停。手动路径同时清掉上一轮遗留的定距/定角时限，避免旧时限在新指令之后误停。
 
 ## 构建要点
 
@@ -60,22 +62,24 @@
   当前已核准的 IDE 板子配置的对应 fqbn：
   `arduino-cli compile --fqbn "esp32:esp32s3:esp32s3:FlashSize=16M,FlashMode=dio,PartitionScheme=huge_app,DebugLevel=debug,PSRAM=opi,EraseFlash=none" .`
   （arduino-cli 位于 `D:\Program Files\Arduino IDE\resources\app\lib\backend\resources`，即 IDE 内置同版、缓存目录同源。若某次 IDE 把 DebugLevel 调回 none/其它，命令行同步改回，避免不共享缓存。）
-- ⚠️ mbedTLS 握手内存优化依赖自定义核心库：`Arduino15\packages\esp32\tools\esp32s3-libs\3.3.11` 已按 IDF `defconfig` 重编替换，含三处配置：SSLin/out 缓冲 `CONFIG_MBEDTLS_SSL_IN/OUT_CONTENT_LEN=8192`（规避内部堆碎片导致的握手失败 `-32512`/`-17040`）；`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（定义 `MBEDTLS_PLATFORM_MEMORY`，激活 `ai::init()` 的 `mbedtls_platform_set_calloc_free` PSRAM hook，把 TLS 缓冲搬去 PSRAM，规避内部堆碎片导致的 AI 请求 `-3`）；lwIP TCP 缓冲 32768/16384。替换时勿用官方同名库覆盖。重编流程与配置见 [`../.trae/README.md`](../.trae/README.md)。链接补丁 `sections.ld` 亦在该目录下，**升级核心版本后需重打**。
+- ⚠️ mbedTLS 握手内存优化依赖自定义核心库：`Arduino15\packages\esp32\tools\esp32s3-libs\3.3.11` 已按 IDF `defconfig` 重编替换，含三处配置：SSLin/out 缓冲 `CONFIG_MBEDTLS_SSL_IN/OUT_CONTENT_LEN=8192`（规避内部堆碎片导致的握手失败 `-32512`/`-17040`）；`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（mbedTLS 缓冲改走 PSRAM，规避内部堆碎片导致的 AI 请求 `-3`）；lwIP TCP 缓冲 32768/16384。替换时勿用官方同名库覆盖。重编流程与配置见 `.trae/README.md`，链接补丁 `sections.ld` 亦在该目录下，**升级核心版本后需重打**。
+  - ⚠️ 该目录 `.trae/` 已列入 `.gitignore`、不在版本库内（属仓库外资料，缺失时找作者）。
+  - ⚠️ `ai_client.cpp` 里的 `ai_tls_calloc` / `ai_tls_free` 是同一思路的**预留实现，当前并未接线**：全仓库没有任何 `mbedtls_platform_set_calloc_free` 调用点，两者不会被 mbedTLS 使用。上面那条 PSRAM 效果来自核心库的 `EXTERNAL_MEM_ALLOC` 配置本身；改这两个函数不影响 TLS 分配。
 - ⚠️ 实测：即使 fqbn 完全一致，**IDE 验证 ↔ 命令行切换仍常各自全量重编**（esp32 core 整包重编，5–10 分钟）；想省时间就让「主编译入口」固定在一侧，别频繁来回。**改/增/删源文件后首次编译若报多定义或「多个文件 -o」错，删 `C:\Users\Yang\AppData\Local\arduino\sketches\` 下本 sketch 缓存目录再编**。
 - 依赖库：**ArduinoJson v7（Benoit Blanchon）**，装在用户 sketchbook `D:\Documents\Arduino\libraries\ArduinoJson`。⚠️ sketch 内 `libraries/ArduinoJson` 子目录 **Arduino 不会自动扫描**，属冗余副本，勿依赖（可删）。
 - 分区：**PartitionScheme=huge_app**（3MB APP、无 OTA），已含在上方完整 fqbn 内；真机烧录同此方案。依赖库与编译缓存目录同 IDE（`%LOCALAPPDATA%\arduino\sketches\<sketch哈希>\`）。
 
-## 实现进度（2026-09-10）
+## 实现进度（2026-09-12）
 
 目标板为 **ESP32-S3-CAM**（esp32:esp32s3:esp32s3 + 16M flash / opi psram + huge_app）。OV3660 摄像头与图传真机联调正常：
 
-- `camera` ✅ 真机验证：OV3660 识别正常（默认倒置/饱和偏高已在 init 回正），JPEG 抓帧与 UDP 图传工作
+- `camera` ✅ 真机验证：OV3660 识别正常（默认倒置/镜像已在 init 回正），JPEG 抓帧与 UDP 图传工作；图传与 AI 并发取帧用 `CAMERA_GRAB_WHEN_EMPTY`
 - `config` / `wifi_net` / `ble` ✅ 真机可用：BLE 配网、图传链路已联调
-- `nezha` / `direct_exec` ✅ 真机可用：软件 I2C 直驱四轮（前后/转向）、机械臂三舵机、三路灯光；机械臂标定完成
+- `nezha` / `direct_exec` ✅ 真机可用：软件 I2C 直驱四轮（前后/转向/**原地旋转**）、机械臂三舵机、三路灯光；机械臂标定完成
 - `command` / `app_httpd`（web_server）✅ 编译通过，词表分发与 WS/UDP 链路接通
-- `ai_client`（板载多模态 AI HTTP 调用）✅ 已实现（DIRECT 直调云端，任务级闭环；动作走 `exec`），真机联调中
+- `ai_client`（板载多模态 AI HTTP 调用）✅ 已实现（DIRECT 直调云端，任务级闭环；动作走 `exec`），真机联调中：画面单应标定、物体空间记忆、按需携带上一帧均已接入
 
-> 待联调项：机械臂 `dist_cm` 的拍数近似（`ARM_CNT_PER_CM`）未实测校准。
+> 待实测校准：机械臂 `dist_cm` 的拍数近似（`ARM_CNT_PER_CM`）、以及 `move`/`spin` 定距定角的时长表（`MV_*` / `SPIN_MSDEG_*`）。
 
 ## 协议参考
 
@@ -83,14 +87,17 @@
 
 | type | params | 落点 |
 | --- | --- | --- |
-| `move` | `throttle`(-1..1) `steering`(-1..1) | 四轮 PWM（×1000）/ 转向舵 150±30 |
+| `move` | `throttle`(-1..1) `steering`(-1..1)、可选 `distance_cm` | 四轮 PWM（×1000）/ 转向舵 150±30；带 `distance_cm` 按标定表换算时长到点自停 |
 | `stop` | `scope` = all/wheels/arm | 停轮 或 清连续机械臂动作 |
-| `arm` | `act` = lift_up/lift_down/reach_forward/reach_backward/clip/release、可选 `dist_cm` | 舵机 2/3/4 |
+| `spin` | `dir` = `+1`右转/`-1`左转/`0`停、`speed`(0..1000)、可选 `angle_deg` | 左右轮反向 PWM（原地旋转）；带 `angle_deg` 到时自停 |
+| `arm` | `act` = lift_up/lift_down/reach_forward/reach_backward/clip/release/**home**、可选 `dist_cm` | 舵机 2/3/4（home = 收臂回平台位） |
 | `light` | `kind` = front/vibe/back，`on` | 哪吒灯命令字节 |
 | `reset` | — | 四舵机回中 + 电机 0 |
 | `servo` / `motor` / `drive` / `arm_pose` | 见 `command.cpp` | 调试直驱（绕过上层语义） |
 | `stream` | `on`、可选 `udp_port` `src_ip` | 图传开关（UDP 目标由板子据此建立） |
 | `exec_log` | `on` | 状态周期推送开关（默认关） |
+| `ai_log` | `on` | AI 内部日志经任务回传通道上抛（默认关；无 AI 任务运行时无输出） |
+| `get_state` | — | 回 `{"type":"state"}`，含灯光与夹爪当前态（手机重连后同步按钮用） |
 | `config` | `ssid` `password` | NVS + 在线换网 |
 | `ping` | 可选 `target` | 无目标回 `pong`；有目标走 `ping_svc` |
 | `ai_goal` / `ai_oneshot` / `ai_cancel` | `message`、可选 `annotation` `use_image` | `ai_client` DIRECT 闭环 |
