@@ -28,7 +28,7 @@
 
 namespace cam {
 
-// 初始化摄像头（JPEG 输出，双缓冲 + GRAB_LATEST）
+// 初始化摄像头（JPEG 输出，双缓冲 + WHEN_EMPTY：图传与 AI 并发抓帧不死锁）
 bool init();
 
 // 取一帧（同步接口），使用后必须调用 return_frame() 归还缓冲

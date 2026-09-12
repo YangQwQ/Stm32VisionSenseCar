@@ -431,7 +431,7 @@ static void ws_stream_task(void *arg)
         if (has_client && cmd::exec_log() &&
             (int32_t)(now - s_last_status_ms) >= (int32_t)400) {
             s_last_status_ms = now;
-            char st[64];
+            char st[96];  // 状态含抓手前端 XZ，需足量避免截断
             if (exec::read_state(st, sizeof(st))) {
                 JsonDocument sdoc;
                 sdoc["type"] = "exec_status";
@@ -1752,7 +1752,7 @@ void startCameraServer()
         httpd_register_uri_handler(stream_httpd, &stream_uri);
 #ifdef CONFIG_HTTPD_WS_SUPPORT
         httpd_register_uri_handler(stream_httpd, &ws_uri);
-        xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 4096, NULL, 5, NULL, 1);
+        xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 8192, NULL, 5, NULL, 1);
 #endif
     }
 }

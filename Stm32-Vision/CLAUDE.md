@@ -44,7 +44,7 @@
 - **接线**：哪吒 SCL ← GPIO47，SDA ← GPIO14；I2C 速率 ≤200kHz，软 I2C 开漏实现（原执行板的 PB6/PB7 须脱离总线）。
 - **物理映射**：四轮 M1左后 / M2右后 / M3右前 / M4左前（左轮 `a` 正前、右轮 `b` 正前）；舵机 Servo1 转向 / Servo2 移爪 / Servo3 夹爪 / Servo4 抬落。
 - **标定限位**（`direct_exec.cpp` 顶部宏，实测）：转向 150/120/180；移爪中位 200（120..250）；夹爪紧 50 / 松 140；抬落中位 180（115..250）。
-- **连续动作**：`lift_up/down`、`reach_forward/backward` 为持续型——`update_tick()` 每拍按 `ARM_STEP` 步进并在限位钳制，收到 `stop(scope="arm")` 或离散动作时清除；`clip/release` 为离散置端。
+- **连续动作**：`lift_up/down`、`reach_forward/backward` 为持续型——`update_tick()` 每拍按 `ARM_STEP_CM`(0.25cm) 沿目标轴步进并保持另一维（reach 保持高度 h、lift 保持 x），经 `arm_pose` 反解联动双舵机下发；到可达域边界/机械限位（末端无实际移动）自动停，收到 `stop(scope="arm")` 或离散动作时清除；`clip/release` 为离散置端。
 - **二连杆 IK**：`arm_pose(x,h)`（x=轴前方 cm，h=地面以上 cm）反解 α/β 后查标定表联动左右两舵机；L1=L2=7.5cm、肩轴离地 9.5cm、可达半径 4..15cm。
 - **无里程计**：电机无编码器，`move` 的 `distance_cm` / `angle_deg` 被忽略（`is_continuous` 判据里保留这两个字段，仅用于区分是否配 `stop`）；`arm` 的 `dist_cm` 按每 cm ≈ `ARM_CNT_PER_CM` 拍近似。
 - **手动指令优先**：`command` 收到 move/stop/arm 先 `ai::cancel(...)` 打断 AI 闭环再 `exec::act`（arm 打断只停轮子）。
@@ -60,7 +60,7 @@
   当前已核准的 IDE 板子配置的对应 fqbn：
   `arduino-cli compile --fqbn "esp32:esp32s3:esp32s3:FlashSize=16M,FlashMode=dio,PartitionScheme=huge_app,DebugLevel=debug,PSRAM=opi,EraseFlash=none" .`
   （arduino-cli 位于 `D:\Program Files\Arduino IDE\resources\app\lib\backend\resources`，即 IDE 内置同版、缓存目录同源。若某次 IDE 把 DebugLevel 调回 none/其它，命令行同步改回，避免不共享缓存。）
-- ⚠️ mbedTLS 握手内存优化依赖自定义核心库：`Arduino15\packages\esp32\tools\esp32s3-libs\3.3.11` 已被按 IDF `defconfig` `CONFIG_MBEDTLS_SSL_IN/OUT_CONTENT_LEN=8192` 重编替换，以规避内部堆碎片导致的 TLS 握手失败（`-32512`/`-17040`）；替换时勿用官方同名库覆盖。重编流程见 [`../.trae/README.md`](../.trae/README.md)。链接补丁 `sections.ld` 亦在该目录下，**升级核心版本后需重打**。
+- ⚠️ mbedTLS 握手内存优化依赖自定义核心库：`Arduino15\packages\esp32\tools\esp32s3-libs\3.3.11` 已按 IDF `defconfig` 重编替换，含三处配置：SSLin/out 缓冲 `CONFIG_MBEDTLS_SSL_IN/OUT_CONTENT_LEN=8192`（规避内部堆碎片导致的握手失败 `-32512`/`-17040`）；`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（定义 `MBEDTLS_PLATFORM_MEMORY`，激活 `ai::init()` 的 `mbedtls_platform_set_calloc_free` PSRAM hook，把 TLS 缓冲搬去 PSRAM，规避内部堆碎片导致的 AI 请求 `-3`）；lwIP TCP 缓冲 32768/16384。替换时勿用官方同名库覆盖。重编流程与配置见 [`../.trae/README.md`](../.trae/README.md)。链接补丁 `sections.ld` 亦在该目录下，**升级核心版本后需重打**。
 - ⚠️ 实测：即使 fqbn 完全一致，**IDE 验证 ↔ 命令行切换仍常各自全量重编**（esp32 core 整包重编，5–10 分钟）；想省时间就让「主编译入口」固定在一侧，别频繁来回。**改/增/删源文件后首次编译若报多定义或「多个文件 -o」错，删 `C:\Users\Yang\AppData\Local\arduino\sketches\` 下本 sketch 缓存目录再编**。
 - 依赖库：**ArduinoJson v7（Benoit Blanchon）**，装在用户 sketchbook `D:\Documents\Arduino\libraries\ArduinoJson`。⚠️ sketch 内 `libraries/ArduinoJson` 子目录 **Arduino 不会自动扫描**，属冗余副本，勿依赖（可删）。
 - 分区：**PartitionScheme=huge_app**（3MB APP、无 OTA），已含在上方完整 fqbn 内；真机烧录同此方案。依赖库与编译缓存目录同 IDE（`%LOCALAPPDATA%\arduino\sketches\<sketch哈希>\`）。

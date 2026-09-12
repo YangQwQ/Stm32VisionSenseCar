@@ -34,7 +34,10 @@ bool init() {
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_VGA;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  // 图传 ws_stream_task 与 AI ai_worker 两个消费者并发抓帧：GRAB_LATEST 只认"最新帧"，
+  // 在双缓冲下遇到多消费者会反复交出同一旧缓冲、并把 DMA 生产端卡死（图传冻结 + AI 反复收到同一张图）。
+  // WHEN_EMPTY 双缓冲轮流交出，及时归还即不死锁，两者各取新鲜且不同的帧。
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 14;
   config.fb_count = 2;
@@ -68,7 +71,8 @@ bool init() {
 #endif
 
 #if defined(CAMERA_MODEL_ESP32S3_EYE)
-  s->set_vflip(s, 1);
+  s->set_vflip(s, 0);
+  s->set_hmirror(s, 1);
 #endif
 
   s_ready = true;

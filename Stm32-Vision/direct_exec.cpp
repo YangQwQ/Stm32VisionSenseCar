@@ -32,6 +32,42 @@ static float plerp(const float* xs, const float* ys, int n, float x) {
   return ys[n-1];
 }
 
+// 反查表：已知 pwm 求对应角度。ys（PWM）可为升序（BETA）或降序（ALPHA：α 越大 PWM 越小）。
+// 旧版只按升序逻辑查，对降序表把所有中间值塌到端点 → 状态里高/前中间不变、抬落方向颠倒。
+static float inv_plerp(const float* xs, const float* ys, int n, float y) {
+  if (ys[0] <= ys[n - 1]) {                  // 升序
+    if (y <= ys[0]) return xs[0];
+    for (int i = 1; i < n; i++) {
+      if (y <= ys[i]) {
+        float t = (y - ys[i-1]) / (ys[i] - ys[i-1]);
+        return xs[i-1] + t * (xs[i] - xs[i-1]);
+      }
+    }
+    return xs[n-1];
+  } else {                                   // 降序（如 ALPHA_PWM）
+    if (y >= ys[0]) return xs[0];
+    for (int i = 1; i < n; i++) {
+      if (y >= ys[i]) {
+        float t = (y - ys[i-1]) / (ys[i] - ys[i-1]);
+        return xs[i-1] + t * (xs[i] - xs[i-1]);
+      }
+    }
+    return xs[n-1];
+  }
+}
+
+// 机械臂末端前端坐标（前向运动学）：由当前左右舵机 pwm 反解 α/β，得末端相对轴(前方cm, 向上cm)。
+// 挖斗式两连杆：第一节 A 与水平夹角 α，A 与 B 内夹 β（在关节处靠反向折叠）；
+// 由 arm_pose 反解验证得 tip = A头 − L2·e^{i(α+β)}（A头=L1·e^{iα}）。
+static void arm_fk(int16_t reach_pwm, int16_t lift_pwm, float* x_out, float* h_out) {
+  float a = inv_plerp(ALPHA_X, ALPHA_PWM, 4, (float)lift_pwm) * PI / 180.0f;
+  float b = inv_plerp(BETA_X,  BETA_PWM,  4, (float)reach_pwm) * PI / 180.0f;
+  float x = IK_L1 * cosf(a) - IK_L2 * cosf(a + b);   // 轴前方 cm
+  float z = IK_L1 * sinf(a) - IK_L2 * sinf(a + b);   // 相对轴，向上+
+  *x_out = x;
+  *h_out = z + AXIS_H;                                // 离地高度 cm
+}
+
 // ================= 舵机限位 / 回中（移植自执行板官方机械臂驱动，勿随意改） =================
 // 大圣机械臂(有方NeZha)三舵机：Servo2=左舵机(前后移爪) Servo3=前舵机(夹爪) Servo4=右舵机(抬落)。
 // 每个舵机为一个独立自由度，非左右联动；正负方向见各舵机注释。
@@ -52,9 +88,14 @@ static float plerp(const float* xs, const float* ys, int n, float x) {
 #define LIFT_CENTER   180
 #define LIFT_LO       115
 #define LIFT_HI       250
-// 连续动作每节拍步进；dist_cm 仅近似（无里程计），每 cm 约 8 拍
-#define ARM_STEP      2
-#define ARM_CNT_PER_CM 8
+// 连续动作每拍末端步进（联动模式）：loop 约 10ms 一拍 → 0.06cm/拍 ≈ 6cm/s 末端速度，
+// 过快（原 0.25cm/拍=25cm/s）机械臂会抖、AI 难以精确到位。约 16 拍/cm
+#define ARM_STEP_CM    0.06f
+#define ARM_CNT_PER_CM 16
+// home 折叠姿态（查 IK 标定表）：右舵机 α=90°（第一节竖直）→ 130；左舵机 β 最小（第二节折回）→ 130。
+// 区别于 reset 回中（臂仍前伸、盲区大），折叠态摄像头最高、视野最大。
+#define HOME_LIFT_PWM  130
+#define HOME_REACH_PWM 130
 
 // AI 微操的"时长近似"换算（无里程计，只能按时长模拟距离/角度）。系数来自真机实测标定：
 // 移动 actual_cm≈v(throttle)*t_s+c(throttle)，车速对油门不敏感（≈10..12.5cm/s），高油门带起停余量；
@@ -88,12 +129,13 @@ static bool s_light_front = false;
 static bool s_light_vibe  = false;
 static bool s_light_back  = false;
 
-// 连续机械臂动作：servo=0 表示无活跃动作
+// 连续机械臂动作（联动模式）：axis=-1 表示无活跃动作。
+// 前伸/缩回、抬/落都按"保持另一维"的末端位姿轨迹联动双舵机，而非单舵机步进。
 static struct {
-  uint8_t servo;     // 2 移爪 / 4 抬落
-  int16_t dir;       // 每拍伺服增量（+/-）
-  int16_t budget;    // 剩余拍数，0=持续
-} s_active = { 0, 0, 0 };
+  int8_t axis;     // -1 无 / 0 联动前伸(x) / 1 联动抬落(h)
+  int16_t dir;     // 每拍目标位姿增量方向（+/-）
+  int16_t budget;  // 剩余拍数，0=持续
+} s_active = { -1, 0, 0 };
 
 // AI 持续 move 的行驶截止时刻（ms），0=不限时。到期 update_tick 里自动停轮，
 // 兜底 AI 两次决策间的长时间盲走；任何新轮动作/手动接管会刷新或关闭它。
@@ -139,7 +181,7 @@ static void send_spin(const JsonObjectConst& p) {
   }
 }
 
-static void clear_active(void) { s_active.servo = 0; s_active.budget = 0; }
+static void clear_active(void) { s_active.axis = -1; s_active.budget = 0; }
 
 static void write_steer(void) { nezha::set_servo(1, (uint16_t)s_steer); }
 static void write_reach(void) { nezha::set_servo(2, (uint16_t)s_reach); }
@@ -178,25 +220,26 @@ void exec::update_tick(void) {
     s_car_motion = 0;
     s_spin = 0;  // 原地旋转定角到点也一并复位，避免状态误报"仍在原地转"
   }
-  if (s_active.servo == 0) return;
-  if (s_active.servo == 2) {
-    s_reach += ARM_STEP * s_active.dir;
-    if (s_reach < REACH_LO) s_reach = REACH_LO;
-    if (s_reach > REACH_HI) s_reach = REACH_HI;
-    write_reach();
-  } else if (s_active.servo == 4) {
-    s_lift += ARM_STEP * s_active.dir;
-    if (s_lift < LIFT_LO) s_lift = LIFT_LO;
-    if (s_lift > LIFT_HI) s_lift = LIFT_HI;
-    write_lift();
-  }
+  if (s_active.axis < 0) return;
+  // 联动步进：读当前末端 fk，沿目标轴步进 0.25cm、保持另一维，反解联动双舵机下发。
+  // 这样 reach 保持高度平移、lift 保持 x 升降，而不是单舵机造成的 x/h 同时漂移。
+  float fx = 0, fh = 0;
+  arm_fk(s_reach, s_lift, &fx, &fh);
+  float tx = fx, th = fh;
+  if (s_active.axis == 0) tx += ARM_STEP_CM * s_active.dir;   // 前伸/缩回：x 变，h 不变
+  else                    th += ARM_STEP_CM * s_active.dir;   // 抬/落：h 变，x 不变
+  if (!exec::arm_pose(tx, th)) { clear_active(); return; }    // 超出可达域：到边即停
+  // 机械限位/反解 clamp 导致末端没实际移动时停止，避免持续空转
+  float nx = 0, nh = 0;
+  arm_fk(s_reach, s_lift, &nx, &nh);
+  if (fabsf(nx - fx) < 0.005f && fabsf(nh - fh) < 0.005f) { clear_active(); return; }
   if (s_active.budget > 0) {
     if (--s_active.budget <= 0) clear_active();
   }
 }
 
-static void setup_active(uint8_t servo, int16_t dir, bool has_dist, int16_t dist) {
-  s_active.servo = servo;
+static void setup_active(int8_t axis, int16_t dir, bool has_dist, int16_t dist) {
+  s_active.axis = axis;
   s_active.dir = dir;
   s_active.budget = has_dist ? (int16_t)(dist * ARM_CNT_PER_CM) : 0;
 }
@@ -207,19 +250,26 @@ static void send_arm(const JsonObjectConst& p) {
   int16_t dist = (int16_t)((int)(p["dist_cm"] | 0));
 
   if (!strcmp(act_, "lift_up") || !strcmp(act_, "lift_down")) {
-    // 抬落：lift_up = 抬（pwm 降向 LIFT_LO）；lift_down = 落（pwm 升）。
-    int16_t dir = !strcmp(act_, "lift_up") ? -1 : +1;
-    setup_active(4, dir, has_dist, dist);
+    // 抬落（联动 h 轴）：lift_up = 末端升高（h+）；lift_down = 降低（h-），保持 x 不变。
+    int16_t dir = !strcmp(act_, "lift_up") ? +1 : -1;
+    setup_active(1, dir, has_dist, dist);
   } else if (!strcmp(act_, "reach_forward") || !strcmp(act_, "reach_backward")) {
-    // 移爪：forward = 伸（pwm 增）；backward = 缩（pwm 减）。
+    // 移爪（联动 x 轴）：forward = 前伸（x+）；backward = 缩回（x-），保持高度 h 不变。
     int16_t dir = !strcmp(act_, "reach_forward") ? +1 : -1;
-    setup_active(2, dir, has_dist, dist);
+    setup_active(0, dir, has_dist, dist);
   } else if (!strcmp(act_, "clip")) {
     clear_active();
     s_grip = GRIP_CLOSE; write_grip();
   } else if (!strcmp(act_, "release")) {
     clear_active();
     s_grip = GRIP_HI; write_grip();
+  } else if (!strcmp(act_, "home")) {
+    // 收臂折叠回平台（一次性离散）：右舵机 α=90° 竖直、左舵机 β 最小折回、夹爪回中；
+    // 摄像头到最高位扩大视野、避开盲区。不动车轮（区别于 reset 的全停）。
+    clear_active();
+    s_lift  = HOME_LIFT_PWM;  write_lift();
+    s_reach = HOME_REACH_PWM; write_reach();
+    s_grip  = GRIP_CENTER;    write_grip();
   }
 }
 
@@ -320,6 +370,10 @@ bool exec::act(const char* type, const JsonObjectConst& params) {
   if (!strcmp(type, "spin"))   { send_spin(params); return true; }
   if (!strcmp(type, "stop"))   { send_stop(params); return true; }
   if (!strcmp(type, "arm"))    { send_arm(params);  return true; }
+  if (!strcmp(type, "arm_pose")) {
+    // AI/手动指定位姿：x=轴前方 cm，h=夹爪中心离地高度 cm；不可达返回 false（不动）。
+    return arm_pose(params["x"] | 0.0f, params["h"] | 0.0f);
+  }
   if (!strcmp(type, "light")) {
     const char* kind = params["kind"] | "";
     bool on = params["on"] | false;
@@ -372,7 +426,20 @@ bool exec::read_state(char* buf, size_t cap) {
   const char* car = s_spin != 0 ? (s_spin > 0 ? "原地右转" : "原地左转")
                                 : (s_car_motion == 1 ? "前进" : (s_car_motion == 2 ? "后退" : "停止"));
   const char* steer = s_steer_dir == 1 ? "左" : (s_steer_dir == 2 ? "右" : "正");
-  snprintf(buf, cap, "小车:%s %s | 机械臂:左:%d 右:%d 前:%d",
-    car, steer, (int)s_reach, (int)s_lift, (int)s_grip);
+  // 夹爪状态文本化：合/开/中按当前 pwm 区间。注意"合"仅代表伺服闭合到位，不代表夹住物体
+  // （AI 曾把"紧"误判为已夹住导致假成功）。
+  const char* grip = s_grip <= GRIP_CLOSE + 5 ? "合" : (s_grip >= GRIP_HI - 5 ? "开" : "中");
+  // 机械臂到限位提示：告诉 AI 继续同向动作不会再有变化（需反向或调整姿态）。
+  char lim[32] = {0};
+  if (s_reach >= REACH_HI - 2) snprintf(lim, sizeof(lim), " 移爪到顶");
+  else if (s_reach <= REACH_LO + 2) snprintf(lim, sizeof(lim), " 移爪缩到底");
+  if (s_lift >= LIFT_HI - 2) snprintf(lim + strlen(lim), sizeof(lim) - strlen(lim), " 抬落最低");
+  else if (s_lift <= LIFT_LO + 2) snprintf(lim + strlen(lim), sizeof(lim) - strlen(lim), " 抬到顶");
+  // 末端前端坐标（前向运动学）：让 AI 知道夹爪现在伸到多前、多高，判断还能往哪移/当前高度。
+  float fk_x = 0, fk_h = 0;
+  arm_fk(s_reach, s_lift, &fk_x, &fk_h);
+  if (fk_x < 0) fk_x = 0;
+  snprintf(buf, cap, "小车:%s %s | 抓手:前%.0fcm 高%.0fcm 爪:%s%s",
+    car, steer, fk_x, fk_h, grip, lim);
   return buf[0] != '\0';
 }

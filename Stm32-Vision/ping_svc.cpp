@@ -144,7 +144,8 @@ bool start(const char* target, int count, cmd::ReplyFn reply, void* reply_ctx) {
     free(j);
     return false;
   }
-  if (xTaskCreatePinnedToCore(session_task, "ping_svc", 4096, j, 2, nullptr, 1) != pdPASS) {
+  // lwIP DNS 解析 + esp_ping 会话深调用，debug 断言吃栈更多，给足 16384 防栈溢出崩溃
+  if (xTaskCreatePinnedToCore(session_task, "ping_svc", 16384, j, 2, nullptr, 1) != pdPASS) {
     if (j->ctx) delete (int*)j->ctx;
     vSemaphoreDelete(j->done);
     free(j);
