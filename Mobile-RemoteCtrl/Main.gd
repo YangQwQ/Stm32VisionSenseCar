@@ -57,8 +57,6 @@ var _pending_addr := ""
 var _pending_name := ""
 var _pending_provision := {}
 var _pending_ai := {}
-## 启动自连的待匹配地址（小写）。扫描中发现该地址即自动连接；轮结束仍未出现则提示手动连。
-var _startup_connect_addr := ""
 ## 边扫边显示用：本趟已展示的 address 去重表 + "未发现设备"占位 Label。
 var _device_seen: Dictionary = {}
 var _empty_hint: Label = null
@@ -68,6 +66,7 @@ func _ready() -> void:
 	DeviceConn.scan_finished.connect(_on_scan_finished)
 	DeviceConn.device_found.connect(_on_device_found)
 	DeviceConn.scan_started.connect(_on_device_scan_started)
+	DeviceConn.auto_scan_requested.connect(_start_scan.bind(true))
 	DeviceConn.device_connected.connect(_on_device_connected)
 	DeviceConn.device_disconnected.connect(_on_device_disconnected)
 	DeviceConn.ws_connected.connect(_on_ws_connected)
@@ -150,8 +149,8 @@ func _on_disable_ws_toggled(on: bool) -> void:
 func _on_spin_mode_toggle(on: bool) -> void:
 	Store.set_spin_mode(on)
 
-## 启动（或开启自连开关）时重连上次设备。Android 栈要求设备必须先被扫描到才能连接，
-## 故这里先扫描、等 `_on_device_found` 中目标地址出现再连（不能像 RECOVERY 那样按地址直连）。
+## 启动（或开启自连开关）时重连上次设备。由 DeviceConn.prepare_auto_scan(true) 内部门控
+## 「启动自连」开关并解析目标；这里仅读上次设备拿提示文案。
 func _try_startup_connect() -> void:
 	if DeviceConn.get_ble_state() == "unavailable":
 		return
@@ -162,11 +161,8 @@ func _try_startup_connect() -> void:
 	var addr: String = str(last.get("address", ""))
 	if addr.is_empty():
 		return
-	_startup_connect_addr = addr.to_lower()
-	_pending_addr = addr
-	_pending_name = str(last.get("name", addr))
-	_chat_panel.chat("提示", "启动自连：扫描并连接 %s …" % _pending_name)
-	DeviceConn.scan()
+	_chat_panel.chat("提示", "启动自连：扫描并连接 %s …" % str(last.get("name", addr)))
+	DeviceConn.prepare_auto_scan(true)   # 首扫：内部门控 Store.get_auto_conn()
 
 ## 轮询等待蓝牙适配器进入可用状态（Android 含运行时授权弹窗）。超时或不可用则放弃。
 func _await_ble_ready() -> bool:
@@ -206,10 +202,6 @@ func _on_scan_finished(devices: Array) -> void:
 		_add_device_card(nm, addr)
 	if _device_seen.is_empty():
 		_show_empty_hint()
-	# 启动自连兜底：整轮扫描没出现目标地址则提示，等待用户手动连接。
-	if _startup_connect_addr != "":
-		_startup_connect_addr = ""
-		_chat_panel.chat("提示", "未扫描到上次设备 %s，请手动连接" % _pending_name)
 
 ## 扫描中逐台发现（device_found）：去重后立刻补一张卡片，实现"边扫边显示"。
 func _on_device_found(device: Dictionary) -> void:
@@ -225,11 +217,6 @@ func _on_device_found(device: Dictionary) -> void:
 		nm = addr
 	_device_seen[addr.to_lower()] = nm
 	_add_device_card(nm, addr)
-	# 启动自连：发现目标地址即在卡片弹出同时自动连接（清空待匹配防重复）。
-	if _startup_connect_addr != "" and addr.to_lower() == _startup_connect_addr:
-		_startup_connect_addr = ""
-		_chat_panel.chat("提示", "启动自连：发现 %s，正在连接…" % nm)
-		DeviceConn.connect_device(addr, nm)
 
 func _add_device_card(name: String, address: String) -> void:
 	if _empty_hint != null:
@@ -327,13 +314,22 @@ func _on_ble_status(data: Dictionary) -> void:
 		_chat_panel.chat("板", txt)
 	_update_status()
 
+## 统一扫描入口。auto=true（启动/恢复）：清列表 + 同步自动目标名；
+## auto=false（手动）：清列表 + 打断自动重连 + 复位连接占位 + 开扫。
+func _start_scan(auto: bool) -> void:
+	_clear_device_list()
+	if auto:
+		_pending_name = DeviceConn.auto_target_name()   # 顶栏 "连接中: xxx"
+	else:
+		DeviceConn.cancel_auto_reconnect()
+		_pending_addr = ""
+		_pending_name = ""
+	DeviceConn.scan()
+
 func _on_refresh_toggled(pressed_on: bool) -> void:
-	# toggle 按下 → 打断启动自连、清空旧列表，交由 DeviceConn 统一开扫（scan_started 会按上按钮+动画）；
-	# 松开 → 统一停扫（恢复扫描也会一并打断）。
+	# toggle 按下 → 统一入口（清列表 + 打断自动重连 + 开扫），松开 → 统一停扫（恢复扫描一并打断）。
 	if pressed_on:
-		_cancel_startup_connect()
-		_clear_device_list()
-		DeviceConn.scan()
+		_start_scan(false)
 	else:
 		DeviceConn.stop_scan()
 
@@ -341,13 +337,6 @@ func _on_refresh_toggled(pressed_on: bool) -> void:
 func _on_device_scan_started() -> void:
 	_refresh_btn.set_pressed_no_signal(true)
 	_start_scan_animation()
-
-## 手动按扫描按钮：打断启动自连（清掉待匹配地址与提示名），之后按普通手动扫描流程走，
-## 不再对扫到的目标做自动连接、也不再在整轮没出现时弹"请手动连接"。
-func _cancel_startup_connect() -> void:
-	_startup_connect_addr = ""
-	_pending_addr = ""
-	_pending_name = ""
 
 ## 扫描旋转动画：先左旋两圈、再右旋两圈，往复循环；松开/结束由 _stop 复位。
 func _start_scan_animation() -> void:

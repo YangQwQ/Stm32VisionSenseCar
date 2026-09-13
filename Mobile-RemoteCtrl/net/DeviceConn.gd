@@ -25,6 +25,8 @@ signal ws_disconnected(reason: String)
 signal device_found(device: Dictionary)
 signal scan_finished(devices: Array)
 signal scan_started()
+## 自动（启动/恢复）扫描请求：由 Main 接 _start_scan(true)。
+signal auto_scan_requested()
 signal status_received(data: Dictionary)
 signal text_received(data: Dictionary)
 signal frame_received(img: Image)
@@ -150,6 +152,36 @@ func connect_device(address: String, display_name: String = "") -> bool:
 
 func disconnect_device() -> void:
 	_ble.disconnect_device()
+
+## 自动连目标名（供 Main 在 _start_scan(true) 时同步 "连接中: xxx" 显示）。
+func auto_target_name() -> String:
+	return _auto_target_name
+
+## 统一自动扫描入口。first=true=启动首扫（门控「启动自连」开关）；false=后续/恢复（无条件取最近设备）。
+func prepare_auto_scan(first: bool) -> void:
+	if is_online():
+		return
+	if not first and _recovery_active:
+		return                      # 已在恢复中：周期重扫由 _process 走 _run_recovery_scan
+	if first and not Store.get_auto_conn():
+		return                      # 首扫门控：开关未开 → 不开扫、不带目标
+	var last: Dictionary = Store.get_last_device()
+	var addr: String = str(last.get("address", ""))
+	if addr.is_empty():
+		return                      # 无最近设备，交给用户手动扫
+	_recovery_active = true
+	_auto_target_addr = addr.to_lower()
+	_auto_target_name = str(last.get("name", addr))
+	_pending_target_addr = ""
+	print("[DeviceConn] 自动扫描最近设备 %s" % _auto_target_name)
+	_run_recovery_scan()
+
+## 手动打断自动连接（替换 Main 旧 _cancel_startup_connect）。只清逻辑态，不停传输扫描——
+## 紧随其后的 DeviceConn.scan() 走 _restart_scan 机制重开一轮。
+func cancel_auto_reconnect() -> void:
+	_recovery_active = false
+	_pending_target_addr = ""
+	_auto_target_addr = ""
 
 func provision(ssid: String, password: String) -> bool:
 	return _ble.provision(ssid, password)
@@ -321,17 +353,7 @@ func _on_ws_reconnect_failed(fails: int) -> void:
 # ============================== 双断恢复（自动扫描重连 + 连上停扫） ==============================
 
 func _maybe_recover() -> void:
-	if is_online() or _recovery_active:
-		return   # 任一信道还活着或已在恢复：不重复触发
-	var last: Dictionary = Store.get_last_device()
-	var addr: String = str(last.get("address", ""))
-	if addr.is_empty():
-		return   # 无最近设备，留给用户手动扫描
-	_recovery_active = true
-	_auto_target_addr = addr.to_lower()
-	_auto_target_name = str(last.get("name", addr))
-	print("[DeviceConn] 双断恢复：扫描最近设备 %s" % _auto_target_name)
-	_run_recovery_scan()
+	prepare_auto_scan(false)   # 非首扫：无条件把最近设备作为自动连目标
 
 func _process(delta: float) -> void:
 	if not _recovery_active:
@@ -367,4 +389,4 @@ func _process(delta: float) -> void:
 func _run_recovery_scan() -> void:
 	_last_scan_ms = Time.get_ticks_msec()
 	_rescan_cd_ms = _RESCAN_INTERVAL * 1000.0
-	_ble.scan()
+	auto_scan_requested.emit()   # Main 接到后 _start_scan(true) → 清列表 → DeviceConn.scan()
