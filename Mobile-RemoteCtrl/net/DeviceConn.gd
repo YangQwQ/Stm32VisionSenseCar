@@ -1,21 +1,21 @@
 extends Node
-## 统一「设备连接层」：自建并持有 BLE / WS 两个传输，收口全部连接策略。
-## 职责（对 Main / AppState 只暴露统一信号与门面）：
+## 统一「设备连接层」：自建并持有 BLE / WS / UDP 三个传输，收口全部连接策略。
+## 职责（对 Main 只暴露统一信号与门面）：
 ##   - 连接状态：派生统一 state，单一事实源
 ##   - 信道选路：WS 优先、BLE 兜底（BLOCKED_TYPES 黑名单外的类型都可蓝牙）
 ##   - 信道切换：WS 上连让出 BLE 射频；WS 下连保 BLE / 双断转恢复
 ##   - 重连：双断自动扫描 BLE → 发现最近设备 → 自连 →「连上停扫」
-## 传输本身（BLEClient / WSCarClient）作为纯通道，不做连接策略。
+## 传输本身（BLEClient / WSCarClient / UDPVideoClient）作为纯通道，不做连接策略。
 
 const BP := preload("res://net/ble/BleProfile.gd")
 const BLE_SCRIPT := preload("res://net/ble/BLEClient.gd")
 const WS_SCRIPT := preload("res://net/ws/WSCarClient.gd")
 const UDP_SCRIPT := preload("res://net/video/UDPVideoClient.gd")
 
-## WS 连续重连失败达该次（WSCarClient 每 3s 一次 ≈ 9s）→ 停掉 WS 自旋、转 BLE 恢复。
+## WS 连续重连失败达阈值 → 停掉 WS 自旋、转 BLE 恢复。
 const WS_FAIL_LIMIT := 3
 
-# --- 对外统一信号（Main / AppState 只订阅这些） ---
+# --- 对外统一信号（Main 只订阅这些） ---
 ## 语义明确：device_* 是 BLE 物理链路，ws_* 是 WS 链路，state_changed 是统一状态。
 signal state_changed(state: String)
 signal device_connected(address: String, name: String)
@@ -41,6 +41,9 @@ var _state := "off"          # off / unavailable / idle / scanning / connecting 
 var _channel := Channel.NONE # 当前主信道
 var _device_addr := ""
 var _device_name := ""
+
+## 最新一帧图传画面，供编辑/框选与截图用。
+var current_image: Image = null
 
 # --- 双断恢复 ---
 var _recovery_active := false
@@ -377,7 +380,7 @@ func _process(delta: float) -> void:
 		return   # connecting/scanning：等在目标上，不重扫
 	if _ble.get_ble_state() == "scanning":
 		# 扫描进行中：不攒冷却，等这轮自然结束（给手动按钮留出可打断的间隙）。
-		# 兜底：若 gdble 漏发 scan_stopped 使状态长期卡在 scanning，超过阈值强制停扫，交给下轮重扫自愈。
+		# 兜底：gdble 漏发 scan_stopped 使状态卡在 scanning 超阈值时强制停扫，下轮重扫自愈。
 		if Time.get_ticks_msec() - _last_scan_ms > _SCAN_WATCHDOG_MS:
 			_ble.stop_scan()
 		return

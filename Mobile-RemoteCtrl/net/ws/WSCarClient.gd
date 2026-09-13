@@ -46,8 +46,7 @@ func connect_car(target_url: String = "") -> void:
 	var want := url
 	if target_url != "":
 		want = target_url
-	# 已在连接中或已连接同一地址：一律去重，避免 BLE 反复上报 IP 触发 tear down 重连（Bug4/5：
-	# 板子反复调试 → BLE 每次连上都上报 IP → 若每次都重建 WS 会话，表现为"刚连上就被踢掉又恢复"）。
+	# 已在连接中或已连接同一地址：去重，避免 BLE 反复上报 IP 触发重建重连。
 	if _peer != null and want.to_lower() == url.to_lower() \
 			and _state in ["connecting", "connected"]:
 		_auto = true

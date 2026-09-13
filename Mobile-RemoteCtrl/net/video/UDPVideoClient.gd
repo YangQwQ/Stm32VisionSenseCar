@@ -1,9 +1,8 @@
 extends Node
 ## UDP 图传接收端：用 Godot 内置 PacketPeerUDP 收板子推送的 JPEG 分片，重组整帧后发 frame_received。
-## 图传视频帧现走 UDP（更稳的低延迟）；WS 仅保留控制/指令与 snapshot 单帧。
 ## 分片协议与板子 app_httpd.cpp 的 udp_send_frame 对齐：每数据报 14B 大端头 +
 ## [magic(2) frame_id(4) seq(2) count(2) total(4)] + ≤1400B JPEG 负载。
-## 重组策略：按 frame_id 缓存分片，count 片齐则解码上抛；缺片/UDP 丢包则等下一帧（自愈），
+## 重组策略：按 frame_id 缓存分片，count 片齐则解码上抛；缺片/丢包等下一帧（自愈），
 ## 超过 _TIMEOUT_MS 无新分片即丢弃半帧。
 
 signal frame_received(img: Image)

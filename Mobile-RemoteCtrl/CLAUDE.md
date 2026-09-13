@@ -6,54 +6,54 @@
 
 ## 项目性质
 
-- **Godot 4.7.1 mono（mobile，竖屏** **`window/handheld/orientation=1` = Portrait）+ GDScript**，目标平台 Android。（旧文档误写“横向”；project.godot 与 AndroidManifest 均为 portrait。）
+- **Godot 4.7.1 mono（mobile，竖屏** **`window/handheld/orientation=1` = Portrait）+ GDScript**，目标平台 Android（project.godot 与 AndroidManifest 均为 portrait）。
 
-- 一台 **ESP32-S3-CAM 视觉/控制大脑板（`../Stm32-Vision`）** 的小车 App。⚠️ **原 STM32 执行板（`../Stm32-Executor`）已裁撤**：板子经软件 I2C 直驱哪吒扩展板，手机侧不感知该差异（词表结构不变）。
+- 一台 **ESP32-S3-CAM 视觉/控制大脑板（`../Stm32-Vision`）** 的小车 App。板子经软件 I2C 直驱哪吒扩展板，手机侧只发词表指令、不感知直驱细节。
 
 - 跨子板总览见仓库根 `../CLAUDE.md`。
 
 ## 通信架构（链路）
 
-连接策略统一收口在 `net/DeviceConn.gd`（**单一事实源**；Main / AppState 只订阅其统一信号，不在别处另写一套）。它自建并持有 BLE / WS / UDP 三个传输并派生统一 `state`；**WS 优先、BLE 兜底**（`BLOCKED_TYPES` 黑名单外的类型均可蓝牙，仅图传/ai 云端直连被拦）。信道切换：WS 上连让出 BLE 射频；WS 下连保 BLE / 双断自动重扫 → 发现最近设备自连 →「连上停扫」。`BLEClient` / `WSCarClient` / `UDPVideoClient` 只做纯传输，不做连接策略。
+连接策略统一收口在 `net/DeviceConn.gd`（**单一事实源**；Main 只订阅其统一信号，不在别处另写一套）。它自建并持有 BLE / WS / UDP 三个传输并派生统一 `state`；**WS 优先、BLE 兜底**（`BLOCKED_TYPES` 黑名单外的类型均可蓝牙，仅图传/ai 云端直连被拦）。信道切换：WS 上连让出 BLE 射频；WS 下连保 BLE / 双断自动重扫 → 发现最近设备自连 →「连上停扫」。`BLEClient` / `WSCarClient` / `UDPVideoClient` 只做纯传输，不做连接策略。
 
 | 通道 | 用途 | 实现状态 |
 |---|---|---|
 | BLE（GATT） | 配网 + 兜底控制 + status | GDBLE 接通（`BLEClient.gd` → `addons/gdble` + 协议表 `BleProfile.gd`）；板侧 GATT Server VisionS3 已烧录（联调中） |
 | WiFi WebSocket（端口 81） | 指令 / 状态 / 消息 / `ai_result`（**文本 JSON**） | 真实（`WSCarClient.gd`；图传已不走 WS） |
 | WiFi UDP | 图传 JPEG 分片（低延迟；缺片/超时自愈） | 真实（`UDPVideoClient.gd`，分片协议与板侧 `udp_send_frame` 对齐） |
-| 云端多模态 AI | DIRECT：板子直调云端，手机只下发 `ai_goal` | 桩（`AIClient.gd`；不经手机侧） |
+| 云端多模态 AI | DIRECT：板子直调云端，手机只下发 `ai_goal` | DIRECT（不经手机侧） |
 
-- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `home` 收臂回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角）/ `light` / `reset` / `stream` / `exec_log` / `ai_log` / `get_state` / `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel`，另含调试直驱 `servo / motor / drive / arm_pose`。（`snapshot`、`exec_forward` 已移除。）
-- **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）；手机中转（RELAY）已移除。`ai_oneshot` = 只执行一轮决策即收尾。
+- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `fold` 收臂折叠回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角）/ `light` / `reset` / `stream` / `exec_log` / `ai_log` / `get_state` / `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel`，另含调试直驱 `servo / motor / drive / arm_pose`。
+- **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）。`ai_oneshot` = 只执行一轮决策即收尾。
 - **定距 / 定角**：`move` 的 `distance_cm`、`spin` 的 `angle_deg` 由板端按**时长近似**到点自停（无里程计，靠实测标定表插值），非闭环，供微操与标定粗用；不带则持续动作，靠 `stop` 收尾。
-- **调试与本地指令**：`/move <油门 -100..100> <cm>`、`/spin <dir> [speed] [angle]` 经词表下发；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点。
+- **调试与本地指令**：移动/直驱按族收敛——`/move rotate|spin|fore|back|arm`（转向舵三档 / 原地旋转 / 定距前进后退 / 机械臂位姿）与 `/drive motor|servo`（单轮电机或 n=0 全车 / 直驱舵机）经词表下发；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点。
 - **重连同步**：WS 连上后主动发一次 `get_state`，板端回 `type:"state"`，`Main.gd._apply_state` → `DirectControl.sync_state` 同步灯光/夹爪按钮（`set_pressed_no_signal`，不回灌指令）。
 
 ## 目录结构
 
 ```
 res://
-  Main.tscn / Main.gd          # App 壳：连接编排、摇杆映射、图传开关、连接状态、布局；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）
-  ui/chat/ChatPanel.gd         # 聊天/指令区：消息日志、指令提示、附件列表、指令解析与发送
-  state/AppState.gd            # autoload 全局状态（连接引用 + send_command 统一出口：WS 优先、BLE 兜底）
+  Main.tscn / Main.gd          # App 壳：连接编排、页面切换、摇杆映射、图传开关、连接状态；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）
+  state/LocalStore.gd          # autoload 本地持久化（last_device / wifi / ai 配置 / 设置项）
   state/AppLog.gd              # autoload 本地日志落盘：每次启动截断重写 user://logs/app.log，聊天区每行统一写入
   animation/AnimationManager.gd # autoload 通用动画（淡入+缩放滑入/滑出、上下浮动）
   net/
-    DeviceConn.gd              # 统一连接层：持有 BLE/WS/UDP，收敛状态与重连策略（单一事实源）
+    DeviceConn.gd              # 统一连接层（单一事实源）：持有 BLE/WS/UDP、send_command 统一出口、最新帧 current_image
     proto/CommandProto.gd      # 统一命令词表（static）
     ws/WSCarClient.gd          # WS 传输（文本 JSON：指令/状态/ai_result）
     ble/BLEClient.gd           # BLE GATT 客户端（GDBLE 运行时：扫描/连接/读写/配网/status）
     ble/BleProfile.gd          # 协议常量表（UUID/广播名/BLE 黑名单 BLOCKED_TYPES，与固件 ble.cpp 逐字 mirror）
     video/UDPVideoClient.gd    # UDP 图传接收：JPEG 分片重组 → frame_received
-    ai/AIClient.gd             # 云端 AI 桩（DIRECT 不经手机侧，未接）
   addons/
     gdble/                     # GDBLE 插件运行时（*.aar + libgdble.so，编译产物）
     gdble_export/              # 导出插件（Android libraries + manifest 注入）
   ui/
     control/Joystick.gd + DirectControl.gd  # 复用虚拟摇杆 / 直控面板（脚本建树，无 tscn）
     video/VideoView.gd         # 图传显示（脚本建树）；子节点 Overlay = GridOverlay.gd（/grid 标定网格）
-    chat/ChatPanel.gd          # 聊天区视图（脚本建树）
+    chat/ChatPanel.gd          # 聊天区视图（脚本建树）；指令解析收口在 SlashCommands.gd
+    chat/SlashCommands.gd      # /指令 解析器（文本 → 词表指令/本地动作，纯解析，无副作用）
     bluetooth/BTDeviceListItem.tscn+.gd  # 蓝牙设备列表项
+    bluetooth/ScanPanel.gd     # 蓝牙扫描页（设备列表/刷新动画/空提示，挂 BodyBTScan 节点）
     editor/ImageEditor.tscn+.gd + EditorCanvas.gd  # 图片标注（框/箭头/文字）
     provision/WifiConfigPopup.gd  # 配网弹窗（脚本建树）
 ```
@@ -104,6 +104,6 @@ res://
 
 - BLE（已解决，2026-09-05）：真机“刷新恒 0 设备”根因不是 gdble 扫描——btleplug Java `onScanResult` 正常大量回调、gdble 返回 25+ 周边设备，是 `BLEClient.gd:_labels` 对 `"name": null` 的设备字典做 `var name: String = d.get("name","")` 赋值，取到 Nil 触发运行时错误中断函数，`address` 兜底永远走不到、结果恒 `[]`。已改为显式判 null（name 为 null 时回退 address）。配网 GATT 两侧代码已接（见下）。
 
-- **遗留命名**：板侧本地直驱状态（`exec_status`）在 `Main.gd` / `ChatPanel.gd` 中仍以 `"执行板"` 作为消息来源标签显示；执行板已裁撤，该标签属历史命名，如需改为「状态」需同步两处。
+- **遗留命名**：板侧本地直驱状态（`exec_status`）在 `Main.gd` / `ChatPanel.gd` 中仍以 `"执行板"` 作为消息来源标签显示，如需改为「状态」需同步两处。
 
 - **遗留字段不符**：`CommandProto.arm()` 发 `params.duration_ms`，而板端 `direct_exec.cpp` 的 `arm` 只读 `params.dist_cm`（`duration_ms` 被忽略，等同无定距的持续动作）——违反「词表两侧逐字对应」。目前该 builder 无调用方（UI 走 `DirectControl.gd` 只发 `act`，持续动作靠 `stop` 收尾），启用前需先在两侧统一字段名。

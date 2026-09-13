@@ -2,7 +2,7 @@ extends Panel
 
 const CP := preload("res://net/proto/CommandProto.gd")
 
-# 爪控经 AppState.send_command 统一发送：WS 优先、BLE 兜底（不再只认 WS）。
+# 爪控经 DeviceConn.send_command 统一发送：WS 优先、BLE 兜底（不再只认 WS）。
 
 # 持续型（按住动、松开停）：升降 / 移爪。
 const _HOLD_ACTIONS := {
@@ -20,7 +20,7 @@ func _ready() -> void:
 		btn.button_down.connect(_on_hold_down.bind(act))
 		btn.button_up.connect(_on_hold_up)
 
-	# 夹取/松夹合一：toggle → true 夹、false 松（离散，松开不补 stop）。
+	# 夹取/松夹合一：toggle 按下夹、松开松（离散动作，不补 stop）。
 	var grip: Button = get_node("Btns/ClawClipReleaseBtn")
 	grip.toggled.connect(_on_grip_toggled)
 
@@ -38,22 +38,22 @@ func _ready() -> void:
 var _hold_act := ""
 
 func _on_hold_down(act: String) -> void:
-	AppState.send_command(CP.arm(act))
+	DeviceConn.send_command(CP.arm(act))
 	_hold_act = act
 
 func _on_hold_up() -> void:
 	if not _hold_act.is_empty():
-		AppState.send_command(CP.stop("arm"))
+		DeviceConn.send_command(CP.stop("arm"))
 	_hold_act = ""
 
 func _on_grip_toggled(on: bool) -> void:
-	AppState.send_command(CP.arm("clip" if on else "release"))
+	DeviceConn.send_command(CP.arm("clip" if on else "release"))
 
 func _on_reset_pressed() -> void:
-	AppState.send_command(CP.reset())
+	DeviceConn.send_command(CP.reset())
 
 func _on_light_toggled(on: bool, kind: String) -> void:
-	AppState.send_command(CP.light(kind, on))
+	DeviceConn.send_command(CP.light(kind, on))
 
 ## 重连/查询后用板端状态同步按钮（不触发 toggled 回调，避免反向多下指令）。
 func sync_state(lights: Dictionary, grip_close: bool) -> void:

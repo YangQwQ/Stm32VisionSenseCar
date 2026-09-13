@@ -1,6 +1,7 @@
 [gd_scene format=3 uid="uid://djeb0cuoeaeet"]
 
 [ext_resource type="Script" uid="uid://d1tmutexp2vuy" path="res://Main.gd" id="1_main"]
+[ext_resource type="Script" path="res://ui/bluetooth/ScanPanel.gd" id="14_scan"]
 [ext_resource type="Texture2D" uid="uid://dcyjjrs18hhhd" path="res://res/bg.jpg" id="2_trn2v"]
 [ext_resource type="Texture2D" uid="uid://bx6teaav65tma" path="res://res/scan_devices.png" id="5_j4qnp"]
 [ext_resource type="Script" uid="uid://ccoaatpwj6ivp" path="res://ui/chat/ChatPanel.gd" id="5_kjvhd"]
@@ -876,6 +877,7 @@ offset_bottom = 2950.0
 offset_transform_enabled = true
 offset_transform_visual_only = false
 theme_override_constants/separation = 16
+script = ExtResource("14_scan")
 
 [node name="DeviceList" type="ScrollContainer" parent="BodyBTScan" unique_id=486688192]
 layout_mode = 2

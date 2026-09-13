@@ -1,10 +1,9 @@
 extends Control
-## App 壳：组装子视图，维护连接对象与交互。
-## 传输语义（与用户确认）：/ 前缀=指令；纯文本=AI 目标（DIRECT ai_goal）。
-## 所有指令经 AppState.send_command：WS 优先、BLE 兜底。
+## App 壳：组装子视图，维护连接编排与交互。
+## 传输语义：/ 前缀=指令；纯文本=AI 目标（DIRECT ai_goal）。
+## 所有指令经 DeviceConn.send_command：WS 优先、BLE 兜底。
 
 const CP := preload("res://net/proto/CommandProto.gd")
-const BT_ITEM := preload("res://ui/bluetooth/BTDeviceListItem.tscn")
 
 @onready var _video: Control = $BodyControl/Video
 @onready var _joystick: VirtualJoystick = $BodyControl/CtrlArea/Joystick
@@ -12,8 +11,7 @@ const BT_ITEM := preload("res://ui/bluetooth/BTDeviceListItem.tscn")
 @onready var _editor: Control = $ImageEditor
 var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 
-@onready var _refresh_btn: Button = $BodyBTScan/RefreshBtn
-@onready var _device_vbox: VBoxContainer = $BodyBTScan/DeviceList/VBox
+@onready var _scan_panel: Control = $BodyBTScan
 @onready var _ble_dot: Label = $TopBar/HBox/VBoxContainer/BleStat/BleDot
 @onready var _ble_stat: Label = $TopBar/HBox/VBoxContainer/BleStat
 @onready var _ws_dot: Label = $TopBar/HBox/VBoxContainer/WsStat/WsDot
@@ -23,7 +21,6 @@ var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 @onready var _chat_panel = $BodyControl/ChatPanel
 @onready var _stream_toggle: CheckButton = $BodyControl/VidControls/StreamToggle
 
-@onready var _body_bt: Control = $BodyBTScan
 @onready var _body_ctrl: Control = $BodyControl
 @onready var _body_about: Control = $BodyAbout
 @onready var _auto_conn_btn: CheckButton = $BodyAbout/Options/AutoConnOnStart
@@ -42,24 +39,20 @@ const _JOY_SLOW := 0.5
 const _JOY_FAST := 1.0
 const _JOY_FAST_THRESH := 0.7
 const _JOY_STEER := 0.8
-## 直接驱动（绕过执行板）时的摇杆映射参数。
-const _DRIVE_MAX := 1000       # 油门满量程 PWM（低速档 500 / 高速档 1000）
-const _SERVO_CENTER := 150     # 转向舵中位（/servo 1 150 = 正前）
-const _SERVO_RANGE := 30       # 转向舵单侧偏转量（右 +30→180 / 左 -30→120）
-const _SPIN_SPEED := 900       # 原地旋转模式下左右推摇杆的单轮 PWM（实测 <700 拖不动，给足）
+## 直接驱动时的摇杆映射参数。
+const _DRIVE_MAX := 1000       # 油门满量程 PWM
+const _SERVO_CENTER := 150     # 转向舵中位
+const _SERVO_RANGE := 30       # 转向舵单侧偏转量
+const _SPIN_SPEED := 900       # 原地旋转模式下左右推摇杆的单轮 PWM
 ## 最近一次成功连接的设备名，用于顶栏「已连接: xxx」。
 var _device_name := ""
 var _page_tween: Tween = null
 const _PAGE_DURATION := 0.28
-## 刷新扫描动画 tween；待配网设备 + 待下发 WiFi。
-var _refresh_tween: Tween = null
+## 待配网设备 + 待下发 WiFi/AI（设备卡片 → 连接窗口 → 确认）。
 var _pending_addr := ""
 var _pending_name := ""
 var _pending_provision := {}
 var _pending_ai := {}
-## 边扫边显示用：本趟已展示的 address 去重表 + "未发现设备"占位 Label。
-var _device_seen: Dictionary = {}
-var _empty_hint: Label = null
 
 func _ready() -> void:
 	# 只对统一设备连接层 DeviceConn 说话：连接其统一信号（传输事件由 DeviceConn 收口）。
@@ -75,6 +68,8 @@ func _ready() -> void:
 	DeviceConn.text_received.connect(_on_ws_text)
 	DeviceConn.frame_received.connect(_on_frame)
 	DeviceConn.state_changed.connect(_on_ble_state)
+	# 扫描页设备卡片被选中 → 走连接编排。
+	_scan_panel.device_selected.connect(_on_device_item_selected)
 	# /append：聊天区发起的"从图库选图"由 Main 弹出系统文件选择器并打开标注编辑器。
 	_chat_panel.image_pick_requested.connect(_on_chat_image_pick_requested)
 
@@ -84,8 +79,8 @@ func _ready() -> void:
 	_nav_about.toggled.connect(_on_nav_toggled.bind(2))
 
 	_request_ble_permissions()
-	# WS 由 BLE 会话驱动（DeviceConn 已在连接态上收自动连 WS）：不在启动时自连/心跳，
-	# 等设备连接 / 板子上报 IP（DeviceConn._on_ble_status）再连。
+	# WS 由 BLE 会话驱动（DeviceConn 在连接态自动连 WS）：不在启动时自连/心跳，
+	# 等设备连接 / 板子上报 IP 再连。
 	_update_status()
 	# 设置项：读取本地配置并同步两个开关状态；开启启动自连时按最近设备重连。
 	_auto_conn_btn.set_pressed_no_signal(Store.get_auto_conn())
@@ -96,19 +91,15 @@ func _ready() -> void:
 		_nav_ctrl.button_pressed = true
 		_try_startup_connect()
 
-# Android 运行时权限：BLE 扫描/连接 + 定位。声明在 export_presets（BLUETOOTH_* 等），
-# 这里启动即申请，新装手机首次打开会弹窗，无需 adb pm grant。
-# 注：ACCESS_FINE_LOCATION 要 toggle=true 与 custom_permissions 双声明，才会额外带一条
-# 无 maxSdkVersion 的声明（toggle 单独那条被写死 maxSdk=30，API>=31 实为未声明）。MIUI 门禁认
-# FINE，无 cap 条存在即可弹窗授权，见 CLAUDE.md「已知坑」。无需 apktool / pm grant。
+## Android 运行时权限：BLE 扫描/连接 + 定位，启动即申请（声明见 export_presets）。
 func _request_ble_permissions() -> void:
 	if OS.get_name() != "Android":
 		return
 	for p: String in [
-			"android.permission.BLUETOOTH_SCAN",
-			"android.permission.BLUETOOTH_CONNECT",
-			"android.permission.ACCESS_FINE_LOCATION",
-		]:
+		"android.permission.BLUETOOTH_SCAN",
+		"android.permission.BLUETOOTH_CONNECT",
+		"android.permission.ACCESS_FINE_LOCATION",
+	]:
 		if not OS.get_granted_permissions().has(p):
 			OS.request_permission(p)
 
@@ -125,10 +116,10 @@ func _switch_page(page: int) -> void:
 	if _page_tween != null:
 		_page_tween.kill()
 	var tween = create_tween().set_parallel(true).set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
-	tween.tween_property(_body_bt, "offset_transform_position", Vector2(-20 * page, 0), _PAGE_DURATION)
+	tween.tween_property(_scan_panel, "offset_transform_position", Vector2(-20 * page, 0), _PAGE_DURATION)
 	tween.tween_property(_body_ctrl, "offset_transform_position", Vector2(-20 * page + 20, 0), _PAGE_DURATION)
 	tween.tween_property(_body_about, "offset_transform_position", Vector2(-20 * page + 40, 0), _PAGE_DURATION)
-	tween.tween_property(_body_bt, "offset_transform_position_ratio", Vector2(0 - page, 0), _PAGE_DURATION)
+	tween.tween_property(_scan_panel, "offset_transform_position_ratio", Vector2(0 - page, 0), _PAGE_DURATION)
 	tween.tween_property(_body_ctrl, "offset_transform_position_ratio", Vector2(1 - page, 0), _PAGE_DURATION)
 	tween.tween_property(_body_about, "offset_transform_position_ratio", Vector2(2 - page, 0), _PAGE_DURATION)
 	_page_tween = tween
@@ -149,8 +140,8 @@ func _on_disable_ws_toggled(on: bool) -> void:
 func _on_spin_mode_toggle(on: bool) -> void:
 	Store.set_spin_mode(on)
 
-## 启动（或开启自连开关）时重连上次设备。由 DeviceConn.prepare_auto_scan(true) 内部门控
-## 「启动自连」开关并解析目标；这里仅读上次设备拿提示文案。
+## 启动（或开启自连开关）时重连上次设备。实际扫描由 DeviceConn.prepare_auto_scan(true)
+## 内部门控「启动自连」并解析目标；这里仅读上次设备拿提示文案。
 func _try_startup_connect() -> void:
 	if DeviceConn.get_ble_state() == "unavailable":
 		return
@@ -166,7 +157,7 @@ func _try_startup_connect() -> void:
 
 ## 轮询等待蓝牙适配器进入可用状态（Android 含运行时授权弹窗）。超时或不可用则放弃。
 func _await_ble_ready() -> bool:
-	for i in 600:  # 至多约 10s
+	for i in 600:  # 轮询等待，带超时上限
 		var s: String = DeviceConn.get_ble_state()
 		if s in ["idle", "scanning", "connecting", "connected"]:
 			return true
@@ -178,74 +169,17 @@ func _await_ble_ready() -> bool:
 func _on_ble_state(_s: String) -> void:
 	_update_status()
 
+## 扫描结束：列表收尾（复位/补漏/空提示）交给扫描页，本处只做权限提示。
 func _on_scan_finished(devices: Array) -> void:
-	# 扫描结束：复位刷新按钮（取消按下态 + 停止旋转动画）
-	if _refresh_btn.button_pressed:
-		_refresh_btn.set_pressed_no_signal(false)
-	_stop_scan_animation()
-	# 设备在扫描中已逐台加进列表（边扫边显示），这里兜底补漏（按地址去重），并处理"整轮一个都没发现"。
-	for d: Variant in devices:
-		if not (d is Dictionary):
-			continue
-		var dd: Dictionary = d as Dictionary
-		var raw_addr: Variant = dd.get("address")
-		if not (raw_addr is String) or (raw_addr as String).is_empty():
-			continue
-		var addr: String = raw_addr as String
-		# 去重 key 统一小写：gdble 个别调用对地址大小写不一致，避免同一设备以不同 case 重复入列
-		if _device_seen.has(addr.to_lower()):
-			continue
-		var nm: String = str(dd.get("name", addr))
-		if nm.is_empty():
-			nm = addr
-		_device_seen[addr.to_lower()] = nm
-		_add_device_card(nm, addr)
-	if _device_seen.is_empty():
-		_show_empty_hint()
-
-## 扫描中逐台发现（device_found）：去重后立刻补一张卡片，实现"边扫边显示"。
-func _on_device_found(device: Dictionary) -> void:
-	var raw_addr: Variant = device.get("address")
-	if not (raw_addr is String) or (raw_addr as String).is_empty():
-		return
-	var addr: String = raw_addr as String
-	# 去重 key 统一小写（同 scan_finished）
-	if _device_seen.has(addr.to_lower()):
-		return
-	var nm: String = str(device.get("name", addr))
-	if nm.is_empty():
-		nm = addr
-	_device_seen[addr.to_lower()] = nm
-	_add_device_card(nm, addr)
-
-func _add_device_card(name: String, address: String) -> void:
-	if _empty_hint != null:
-		_empty_hint.queue_free()
-		_empty_hint = null
-	var item: Node = BT_ITEM.instantiate()
-	item.call("setup", name, address)
-	item.connect("selected", Callable(self, "_on_device_item_selected"))
-	_device_vbox.add_child(item)
-
-func _show_empty_hint() -> void:
-	if _empty_hint != null:
-		return
-	var hint := Label.new()
-	hint.text = "未发现设备，点击刷新"
-	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint.add_theme_font_size_override("font_size", 36)
-	hint.add_theme_color_override("font_color", Color(0.6, 0.64, 0.72, 1))
-	hint.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	_device_vbox.add_child(hint)
-	_empty_hint = hint
-	if OS.get_name() == "Android" and not OS.get_granted_permissions().has("android.permission.BLUETOOTH_SCAN"):
+	var empty: bool = _scan_panel.call("on_scan_finished", devices)
+	# 整轮空列表且 Android 未授权：提示用户（权限交叉逻辑留在编排层）。
+	if empty and OS.get_name() == "Android" \
+			and not OS.get_granted_permissions().has("android.permission.BLUETOOTH_SCAN"):
 		_chat_panel.chat("提示", "未授予蓝牙/附近设备权限，扫描不到设备——请到系统设置允许本 App 权限后刷新")
 
-func _clear_device_list() -> void:
-	for child: Node in _device_vbox.get_children():
-		child.queue_free()
-	_empty_hint = null
-	_device_seen.clear()
+## 扫描中逐台发现：交给扫描页"边扫边显示"。
+func _on_device_found(device: Dictionary) -> void:
+	_scan_panel.call("on_device_found", device)
 
 func _on_device_item_selected(name: String, address: String) -> void:
 	# 点击设备卡片：暂存目标，弹出配网/连接窗口（连接 + 可选下发 WiFi/AI，推荐用已存配置）
@@ -267,10 +201,9 @@ func _on_device_connected(_address: String, name: String) -> void:
 	var ai: Dictionary = _pending_ai
 	_pending_provision = {}
 	_pending_ai = {}
-	# Bug1：BLE 连上后拉一次状态，同步 LED/夹爪 + AI 运行态（覆盖纯蓝牙控制、无 WS 场景）。
-	# WS 连上时 _on_ws_connected 也会补发 get_state，二者幂等无副作用。
+	# 连上后拉一次状态，同步灯/夹爪 + AI 运行态（覆盖纯蓝牙、无 WS 场景；与 _on_ws_connected 幂等）。
 	await _wait_gatt_ready()
-	AppState.send_command(CP.get_state())
+	DeviceConn.send_command(CP.get_state())
 	if not wifi.is_empty():
 		if DeviceConn.provision(str(wifi.get("ssid", "")), str(wifi.get("password", ""))):
 			_chat_panel.chat("提示", "已下发 WiFi: %s | 板子可能重启，稍后会自动重连" % str(wifi.get("ssid", "")))
@@ -289,9 +222,7 @@ func _on_device_disconnected(reason: String) -> void:
 	_chat_panel.chat("提示", "设备已断开: %s" % reason)
 
 func _on_ble_status(data: Dictionary) -> void:
-	# 板子 BLE status：含 reply 时展示（如配网/指令应答）；自动连 WS 由 AppState 处理。
-	# 板子 reply 可能是词表应答 JSON（{"type":status,pong,"params":{reason}}），解析出可读文本。
-	# 也可能是纯文本（如 "WiFi ..."）——用 JSON.new().parse() 拿错误码而不是 parse_string 打 C++ 错误。
+	# 板子 BLE status：reply 为词表应答 JSON（status/pong/params.reason）时解析出可读文本，否则原样展示。
 	var reply: Variant = data.get("reply")
 	if reply is String and not (reply as String).is_empty():
 		var txt: String = reply as String
@@ -317,7 +248,7 @@ func _on_ble_status(data: Dictionary) -> void:
 ## 统一扫描入口。auto=true（启动/恢复）：清列表 + 同步自动目标名；
 ## auto=false（手动）：清列表 + 打断自动重连 + 复位连接占位 + 开扫。
 func _start_scan(auto: bool) -> void:
-	_clear_device_list()
+	_scan_panel.call("clear")
 	if auto:
 		_pending_name = DeviceConn.auto_target_name()   # 顶栏 "连接中: xxx"
 	else:
@@ -335,26 +266,7 @@ func _on_refresh_toggled(pressed_on: bool) -> void:
 
 ## 任何一次扫描（手动 / 双断恢复）都由 DeviceConn 的上报驱动同一套扫描按钮 + 动画，保证统一、可打断。
 func _on_device_scan_started() -> void:
-	_refresh_btn.set_pressed_no_signal(true)
-	_start_scan_animation()
-
-## 扫描旋转动画：先左旋两圈、再右旋两圈，往复循环；松开/结束由 _stop 复位。
-func _start_scan_animation() -> void:
-	if _refresh_tween != null:
-		_refresh_tween.kill()
-	_refresh_btn.offset_transform_rotation = 0.0
-	var tw := create_tween().set_loops()
-	tw.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_IN_OUT)
-	tw.tween_property(_refresh_btn, "offset_transform_rotation", -TAU * 2.0, 1.5)
-	tw.tween_property(_refresh_btn, "offset_transform_rotation", TAU * 2.0, 1.5)
-	_refresh_tween = tw
-
-func _stop_scan_animation() -> void:
-	if _refresh_tween != null:
-		_refresh_tween.kill()
-		_refresh_tween = null
-	create_tween().tween_property(_refresh_btn, "offset_transform_rotation", 0.0, 0.3)\
-		.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
+	_scan_panel.call("show_scanning")
 
 func _on_provision_pressed() -> void:
 	_wifi_popup.call("popup")
@@ -395,8 +307,7 @@ func _apply_state(data: Dictionary) -> void:
 	var lights: Variant = stm.get("lights")
 	if lights is Dictionary:
 		$BodyControl/CtrlArea.call("sync_state", lights, bool(stm.get("grip_close", false)))
-	# Bug1：连接成功后 get_state 回传 ai_busy，用板端真实 AI 运行态纠正本地「中止/发送」按钮，
-	# 覆盖任务失败/掉线等本地漏更新场景（done 未及时回传）。
+	# get_state 回传 ai_busy：用板端真实运行态纠正本地「中止/发送」按钮。
 	var ai_busy: Variant = stm.get("ai_busy")
 	if ai_busy is bool:
 		_chat_panel.set_ai_running(ai_busy as bool)
@@ -405,10 +316,9 @@ func _on_ws_connected() -> void:
 	_chat_panel.chat("板", "WS 已连接")
 	_update_status()
 	# 连上后主动拉一次当前状态，同步直控面板按钮（灯/夹爪），避免重连后状态不一致。
-	AppState.send_command(CP.get_state())
+	DeviceConn.send_command(CP.get_state())
 	# WS 建立即进入 WS_ONLY（让出 BLE 射频）由 DeviceConn 在内部处理。
-	# 重连/复线后按图传开关当前状态重发一次开启指令：断连期间开关仍保持「开」而板子画面已断，
-	# 若不重发需要用户手动再拨一次。UDP VideoClient 每次重连需换新端口并随指令重新上报。
+	# 重连后按图传开关当前状态重发开启指令：断连期间开关保持「开」但板子画面已断，需重发恢复。
 	if _stream_toggle.button_pressed:
 		_apply_stream(true)
 
@@ -424,7 +334,7 @@ func _on_ws_disconnected(reason: String) -> void:
 
 func _on_frame(img: Image) -> void:
 	_video.call("set_frame", img)
-	AppState.current_image = img
+	DeviceConn.current_image = img
 
 func _on_ws_text(data: Dictionary) -> void:
 	var t: String = str(data.get("type", ""))
@@ -496,12 +406,12 @@ func _apply_stream(on: bool) -> void:
 		port = DeviceConn.start_video()
 		if port < 0:
 			_chat_panel.chat("提示", "UDP 图传初始化失败")
-	AppState.send_command(CP.stream(on, port if port > 0 else 0, _my_ipv4()))
+	DeviceConn.send_command(CP.stream(on, port if port > 0 else 0, _my_ipv4()))
 	_video.visible = on
 
 ## 取手机非回环 IPv4 本机地址（板端建 UDP 会话用，见 CommandProto.stream）。
-## 优先挑与板子（WS 对端）同网段的地址：手机可能带 VPN/虚拟网卡（如 tun0 172.19.0.1），
-## 若直接取首个非回环地址，可能把隧道 IP 报给板子，板端 UDP 发到该地址不可达 → 手机收不到画面。
+## 优先挑与板子（WS 对端）同网段的地址：手机可能带 VPN/虚拟网卡，直接取首个非回环地址
+## 可能把隧道 IP 报给板子，板端 UDP 发到该地址不可达 → 手机收不到画面。
 func _my_ipv4() -> String:
 	var host: String = DeviceConn.board_ip()
 	for a in IP.get_local_addresses():
@@ -534,7 +444,7 @@ func _on_annotate_pressed() -> void:
 	_editor.call("open", tex)
 
 ## /append：打开系统文件选择器选一张图片（懒建 FileDialog）。
-## 选择后压缩到 ~20KB、用现有标注编辑器标注，采用后进入附件列表（Main.tscn 已连 image_sent）。
+## 选择后压缩到目标大小、用现有标注编辑器标注，采用后进入附件列表（Main.tscn 已连 image_sent）。
 func _on_chat_image_pick_requested() -> void:
 	if _pick_dialog == null:
 		_pick_dialog = FileDialog.new()
@@ -555,14 +465,14 @@ func _on_pick_file(path: String) -> void:
 	if img.load(path) != OK:
 		_chat_panel.chat("提示", "图片读取失败: %s" % path)
 		return
-	img = _compress_to_target(img, 20480)  # 压缩到 ~20KB，避免把大图发给板端/AI
+	img = _compress_to_target(img, 20480)  # 压缩到目标大小，避免把大图发给板端/AI
 	if img == null:
-		_chat_panel.chat("提示", "图片压缩失败（未能压到 20KB 内）")
+		_chat_panel.chat("提示", "图片压缩失败（未能压到目标大小内）")
 		return
 	_editor.call("open", ImageTexture.create_from_image(img))
 
 ## 把图压到 ≤ max_bytes（JPEG）：先降质量，仍超则等比缩宽后再降质，返回压缩后 Image。
-## 0=用原宽（仅降质）；宽度从大到小、质量从高到低，命中 ≤max_bytes 即返回（尽量清晰）。
+## 0=用原宽（仅降质）；宽度从大到小、质量从高到低，命中即返回（尽量清晰）。
 func _compress_to_target(img: Image, max_bytes: int) -> Image:
 	var widths := [0, 1600, 1280, 1024, 800, 640, 480, 360]
 	var qualities := [0.88, 0.76, 0.64, 0.52, 0.40, 0.30]
@@ -622,29 +532,28 @@ func _update_joystick() -> void:
 	# 摇杆操作 = 手动接管：打断板端 AI 闭环，聊天发送按钮恢复「发送」
 	_chat_panel.set_ai_running(false)
 	if cmd == Vector2.ZERO:
-			# 松手/居中：停四轮；原地旋转模式下停旋转（复位自转态），否则转向回正
-			AppState.send_command(CP.drive(0))
-			if spin_mode:
-				AppState.send_command(CP.spin(0))
-				_last_spin_active = false
-			else:
-				AppState.send_command(CP.servo(0, _SERVO_CENTER))
-			return
-	# 直接驱动（绕过执行板）：油门 → 全车 drive；左右 → 转向舵（逻辑 0），
-	# 原地旋转模式下改为原地旋转(向右推=右转 / 向左推=左转)。
+		# 松手/居中：停四轮；原地旋转模式下停旋转（复位自转态），否则转向回正
+		DeviceConn.send_command(CP.drive(0))
+		if spin_mode:
+			DeviceConn.send_command(CP.spin(0))
+			_last_spin_active = false
+		else:
+			DeviceConn.send_command(CP.servo(0, _SERVO_CENTER))
+		return
+	# 直接驱动：油门 → 全车 drive；左右 → 转向舵；原地旋转模式下左右推改为原地旋转。
 	var drive_spd := int(round(absf(throttle) * _DRIVE_MAX))
 	if throttle < 0:
 		drive_spd = -drive_spd
-	AppState.send_command(CP.drive(clampi(drive_spd, -1000, 1000)))
+	DeviceConn.send_command(CP.drive(clampi(drive_spd, -1000, 1000)))
 	if spin_mode:
 		# 原地旋转模式：仅纯左右（非斜向）才自转；斜向/前进时若此前在转则补停残余自转。
 		var want_spin: bool = (not diagonal) and absf(steering) >= _JOY_DEADZONE
 		var want_dir: int = 1 if steering > 0 else -1
 		if want_spin != _last_spin_active:
-			AppState.send_command(CP.spin(want_dir if want_spin else 0, _SPIN_SPEED))
+			DeviceConn.send_command(CP.spin(want_dir if want_spin else 0, _SPIN_SPEED))
 			_last_spin_active = want_spin
 	else:
-		AppState.send_command(CP.servo(0, clampi(
+		DeviceConn.send_command(CP.servo(0, clampi(
 			_SERVO_CENTER + int(round(steering / _JOY_STEER * _SERVO_RANGE)), 50, 250)))
 
 func _on_joystick_pressed(_v: Variant = null) -> void:
@@ -657,11 +566,11 @@ func _on_joystick_release(_v: Variant = null) -> void:
 	_last_joy_cmd = Vector2.ZERO
 	_last_spin_active = false
 	_chat_panel.set_ai_running(false)
-	AppState.send_command(CP.drive(0))
+	DeviceConn.send_command(CP.drive(0))
 	if _spin_mode_btn.button_pressed:
-		AppState.send_command(CP.spin(0))
+		DeviceConn.send_command(CP.spin(0))
 	else:
-		AppState.send_command(CP.servo(1, _SERVO_CENTER))
+		DeviceConn.send_command(CP.servo(1, _SERVO_CENTER))
 
 # ============================== 状态 ==============================
 
@@ -674,9 +583,7 @@ func _update_status() -> void:
 	_ws_dot.modulate = Color.GREEN if online else Color(1, 1, 1, 0.3)
 	_ble_stat.text = "BLE:%s" % ble
 	_ws_stat.text = "WS:%s" % ("已连接" if online else "未连接")
-	# 顶栏大字：连接中 / 已连接 / 未连接 三态反馈。
-	# 连接判定：WS 在线优先（WS_ONLY 模式下 BLE 已让出射频、主动断开），故只要 WS 连着就算已连接，
-	# 即使 BLE 断开也不显示"未连接"；BLE 断开会先看 WS——WS 也没连才落到"设备未连接"。
+	# 顶栏大字三态：WS 在线优先判定（WS_ONLY 下 BLE 已让出射频），WS 连着即算已连接。
 	var ble_ok: bool = DeviceConn.is_device_connected()
 	if online:
 		_conn_stat.text = ("已连接: %s" % _device_name) if _device_name != "" else "已连接(WS)"

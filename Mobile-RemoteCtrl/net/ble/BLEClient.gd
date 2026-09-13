@@ -171,8 +171,7 @@ func _on_scan_stopped() -> void:
 		_restart_scan = false
 		_start_real_scan()
 		return
-	# 设备连接生命周期优先：扫描收尾不回写 idle，避免把已建立的链接状态"降级"成 idle
-	#（此前扫到设备连上后，残留扫描结束会把状态打回 idle，而板与链接其实都还活着）。
+	# 设备连接生命周期优先：扫描收尾不回写 idle，避免把已建立连接降级。
 	if _state in ["connecting", "connected"]:
 		return
 	_set_state("idle")
@@ -275,7 +274,7 @@ func disconnect_device() -> void:
 	_teardown_device()
 
 ## 恢复路径专用：按已记录地址直接重连（MAC 稳定，无需先扫描）。本质同 connect_device，
-## 供 AppState 在 WS 恢复/兜底时把 BLE 重新拉起来。
+## 供 DeviceConn 在 WS 恢复/兜底时把 BLE 重新拉起来。
 func connect_saved(address: String, display_name: String = "") -> bool:
 	if address.is_empty():
 		return false
@@ -412,8 +411,8 @@ const _DEV_SIGNALS := {
 	"operation_failed": "_on_operation_failed",
 }
 
-## 幂等连信号：handler 已挂则跳过。BleDevice 覆盖了 Object 的 is_connected/disconnect（0 参 GATT 方法），
-## 信号不能按 Object 语义断开；改在连接前查 get_signal_connection_list 判重，避免 1337 与重复回调。
+## 幂等连信号：handler 已挂则跳过（BleDevice 覆盖了 Object 的 is_connected/disconnect，
+## 信号不能按 Object 语义断开；改在连接前查 get_signal_connection_list 判重）。
 func _connect_if_absent(sig: String, handler: Callable) -> void:
 	if _dev == null or not is_instance_valid(_dev):
 		return

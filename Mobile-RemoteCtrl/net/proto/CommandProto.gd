@@ -25,8 +25,7 @@ static func stream(on: bool, udp_port: int = 0, src_ip: String = "") -> Dictiona
 	return {"type": "stream", "params": params, "id": _new_id()}
 
 static func exec_log(on: bool) -> Dictionary:
-	# 本地直驱状态实时推送开关（默认关）：开启后板端周期性推送 exec_status（视觉板合成的小车/机械臂状态），
-	# 替代旧执行板上行帧镜像。默认关，避免空闲时状态一直刷屏。
+	# 本地直驱状态实时推送开关（默认关）：开启后板端周期性推送 exec_status（视觉板合成状态）。
 	return {"type": "exec_log", "params": {"on": on}, "id": _new_id()}
 
 static func ai_log(on: bool) -> Dictionary:
@@ -132,19 +131,18 @@ const COMMAND_HINTS := {
 	"/exec_log [on|off]": "实时状态推送开关（默认关）",
 	"/ai_log [on|off]": "AI日志推送开关（默认关，开启后AI调试/延迟日志发手机）",
 	"/light <front|vibe|back> <0|1>": "直驱灯开关(前/氛围/尾)",
-	"/reset": "机械臂+转向回正",
 	"/config <WiFi名> <密码>": "配网",
 	"/ai [goal|oneshot|cancel] <目标>": "AI 目标 / 单轮 / 取消",
 	"/snapshot": "保存当前图传画面(本地)",
 	"/append": "从图库选一张图，标注后作为附件",
 	"/ws [connect [IP]|disconnect|status]": "WS 手动连接/断开/状态",
 	"/connect <IP>": "不经蓝牙直连 WS",
-	"/servo <n=0转向/1左/2右/3前> <pwm=50..250>": "直驱舵机(可超标定限位)",
-	"/arm_pose <x> <h>": "机械臂末端到指定位姿(车头系前方cm, 离地高度cm; 不限范围, 不可达板端拦截)",
-	"/motor <n> <a> <b>": "直驱单轮电机(绕过执行板)",
-	"/drive <speed>": "一键全车前进/后退/停(绕过执行板)",
-"/move <油门 -100..100> <距离cm>": "定距移动测试(时长近似到点自停)",
-"/spin <dir> [speed] [angle]": "原地转向(第三参=定角测试)",
+	"/move rotate <dir=-1/0/1>": "转向舵三档(左/回正/右)",
+	"/move spin <角度> [speed]": "原地旋转(正=右转, 负=左转; 0=停; 板端时长近似到点自停)",
+	"/move fore|back <距离cm> [油门%]": "定距前进/后退(时长近似到点自停)",
+	"/move arm <x> <h>": "机械臂末端到指定位姿(车头系前方cm, 离地高度cm)",
+	"/drive motor <n=1..4|0=all> <pwm>": "直驱单轮电机(n=0 全车drive)",
+	"/drive servo <n=0转向/1左/2右/3前> <pwm=50..250>": "直驱舵机(可超标定限位)",
 	}
 
 ## 指令提示最多展示条数（超出截断，避免挡住聊天区）。
@@ -170,7 +168,7 @@ static func command_hints(text: String) -> PackedStringArray:
 	return out
 
 static func raw(type: String, params: Dictionary = {}) -> Dictionary:
-	# 通用出口：给聊天 / 解析到未预置 builder 的词表指令透传用
+	# 通用出口：未预置 builder 的词表指令透传用。
 	return {"type": type, "params": params, "id": _new_id()}
 
 static func encode(cmd: Dictionary) -> String:

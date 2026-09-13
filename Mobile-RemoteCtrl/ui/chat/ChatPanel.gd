@@ -2,10 +2,8 @@ extends VBoxContainer
 ## 聊天区视图：消息日志、指令提示、待上传图片列表、输入发送。
 ## 职责（Main 只做连接编排，聊天区逻辑全部收口在此）：
 ##   - 消息日志展示（chat）
-##   - 指令提示（最多 MAX_HINTS 条，只按空格前的指令词匹配）
-##   - 附件列表（编辑图最多 3 张，超限自动顶掉最早一张；删除走 delBtn）
-##   - 附件与指令提示共用底部区域：有图时优先显示图片，指令提示隐藏
-##   - 指令解析（/ai、/ping、/ws、/connect 等）与发送
+##   - 指令提示与附件列表（共用底部区域：有图优先显示图片）
+##   - 指令解析经 SlashCommands 完成，本类只做发送与本地副作用
 ## 与 Main 的交互：图传开关等旁路动作经 stream_requested 信号交给 Main 统一处理。
 
 signal stream_requested(on: bool)
@@ -14,6 +12,7 @@ signal grid_requested(on: bool)
 signal image_pick_requested()
 
 const CP := preload("res://net/proto/CommandProto.gd")
+const SC := preload("res://ui/chat/SlashCommands.gd")
 const MAX_IMAGES := 3
 
 ## 底部面板（TabContainer）两种内容各自需要的面板高度（anchored 于 ChatLog 底部）。
@@ -43,7 +42,7 @@ var _history_idx: int = -1
 var _draft: String = ""
 
 func _ready() -> void:
-	# 删除按钮在脚本里连接（tscn 里逐个连太啰嗦）。
+	# 删除按钮在脚本里连接（tscn 逐个连太啰嗦）。
 	for i in _panels.size():
 		_panels[i].get_node("delBtn").pressed.connect(_on_del_pressed.bind(i))
 	set_process_input(true)
@@ -157,7 +156,7 @@ func _on_del_pressed(index: int) -> void:
 ## 保存当前图传画面（/snapshot，本地操作，不下发板子）。
 ## 优先写相册 Pictures 目录；失败或 Android 分区存储限制时兜底写应用 user:// 目录。
 func _snapshot() -> void:
-	var img: Image = AppState.current_image
+	var img: Image = DeviceConn.current_image
 	if img == null or img.is_empty():
 		chat("提示", "暂无可保存的画面（先开启图传、等画面出现）")
 		return
@@ -207,7 +206,7 @@ func _on_send_pressed(_new_text: String = "") -> void:
 		else:
 			_send_during_ai(text)
 		return
-	# 非 AI 态：Button 用 toggle_mode 承载，这里按下后立即复位按下态，假装普通按钮（Bug2）。
+	# 非 AI 态：Button 用 toggle_mode 承载，按下后立即复位按下态（假装普通按钮）。
 	_send_btn.set_pressed_no_signal(false)
 	if text.is_empty() and _attachments.is_empty():
 		return
@@ -242,21 +241,14 @@ func _send_during_ai(text: String) -> void:
 	_refresh_bottom()
 	_refresh_send_btn()
 	if text.begins_with("/"):
-		# 指令原样下发：手动直驱类（/move /stop 等）板端会接管打断 AI，属预期；旁路类不打断。
+		# 手动接管类指令会打断 AI（SlashCommands 已标注 interrupts_ai），分发时同步复位按钮。
 		_handle_slash(text)
-		# 手动接管类指令已令板端取消 AI，但旁路类不打断。这里把接管类本地同步复位「中止」，
-		# 避免板端已停任务、手机按钮却残留「中止」（接管后被中断的任务不会回补 done）。
-		var verb := text.get_slice(" ", 0).to_lower()
-		if verb in ["/move", "/drive", "/spin", "/servo", "/motor", "/arm",
-					"/arm_pose", "/reset", "/stop", "/cancel", "/stopai"]:
-			set_ai_running(false)
 		return
 	chat("本机", "插话·%s" % text)
-	if not AppState.send_command(CP.ai_chat(text)):
+	if not DeviceConn.send_command(CP.ai_chat(text)):
 		chat("提示", "插话未发送（当前离线）")
 
-## 切换 AI 执行中状态。Main 摇杆手动接管 / 板端 done / 连接同步都会调用。
-## Bug1：连接成功后经 get_state.ai_busy 同步板端真实运行态，以此纠正本地按钮。
+## 切换 AI 执行中状态：Main 摇杆手动接管 / 板端 done / get_state.ai_busy 同步都会调用。
 func set_ai_running(run: bool) -> void:
 	_ai_running = run
 	_refresh_send_btn()
@@ -279,14 +271,14 @@ func _refresh_send_btn() -> void:
 ## 中止 AI：打断进行中的任务并急停（板端 ai_cancel 打断闭环并补停残留持续指令）。
 func _abort_ai() -> void:
 	chat("本机", "/ai cancel（中止）")
-	if not AppState.send_command(CP.ai_cancel()):
+	if not DeviceConn.send_command(CP.ai_cancel()):
 		chat("提示", "中止指令未发送(当前离线)")
 	set_ai_running(false)
 
 func _send_ai_goal(text: String) -> void:
 	chat("本机", text)
 	var cmd: Dictionary = CP.ai_goal(text)
-	if not AppState.send_command(cmd):
+	if not DeviceConn.send_command(cmd):
 		chat("提示", "目标未发送：AI 目标走 WiFi（当前离线）")
 		return
 	set_ai_running(true)
@@ -297,7 +289,7 @@ func _send_image_goal(items: Array, message: String) -> void:
 		return
 	var ann: Dictionary = (items[0] as Dictionary).get("annotation", {})
 	var cmd: Dictionary = CP.ai_goal(message, ann, true)
-	if not AppState.send_command(cmd):
+	if not DeviceConn.send_command(cmd):
 		chat("提示", "AI 目标未发送（WS 掉线？）")
 		return
 	set_ai_running(true)
@@ -325,7 +317,7 @@ func _send_ai_with_images(items: Array, text: String) -> void:
 				chat("提示", "用法: /ai goal <目标文本>")
 				return
 			cmd = CP.ai_goal(msg, ann, true)
-	if not AppState.send_command(cmd):
+	if not DeviceConn.send_command(cmd):
 		chat("提示", "AI 指令未发送（WS 掉线？）")
 		return
 	set_ai_running(mode != "cancel")
@@ -334,7 +326,7 @@ func _send_ai_with_images(items: Array, text: String) -> void:
 func _upload_images(items: Array) -> bool:
 	for it in items:
 		var img: Image = (it as Dictionary).get("image", null)
-		if img == null or not AppState.send_image(img):
+		if img == null or not DeviceConn.send_image(img):
 			chat("提示", "编辑图未发送: 需先连上 WS 图传")
 			return false
 	return true
@@ -387,227 +379,58 @@ func _input(event: InputEvent) -> void:
 
 # ============================== 指令 ==============================
 
+## 指令分发：SlashCommands 解析 → 词表指令发送 / 本地动作执行。
 func _handle_slash(text: String) -> void:
-	var pieces := text.split(" ", true, 1)  # 最多拆一次，保住剩余文本原样
-	var verb: String = pieces[0].to_lower()
-	var cmd: Dictionary = {}
-	match verb:
-		"/ping":
-			var target := pieces[1].strip_edges() if pieces.size() > 1 else ""
-			cmd = CP.ping(target)
-		"/help", "/h", "?":
-			_show_help()
-			return
-		"/clear":
-			# 仅本地清理聊天区，不下发板子。
-			_chat_log.clear()
-			return
-		"/stream":
-			var on := true
-			if pieces.size() > 1:
-				var arg: String = pieces[1].strip_edges().to_lower()
-				on = arg != "off" and arg != "0" and arg != "false"
-			chat("本机", text)
-			stream_requested.emit(on)  # 统一出口：Main 同步开关并起停 UDP 接收
-			return
-		"/grid":
-			# 图传标定网格叠加开关（本地显示层，不下发板子）：/grid [on|off]
-			var g_on := true
-			if pieces.size() > 1:
-				var ga: String = pieces[1].strip_edges().to_lower()
-				g_on = ga != "off" and ga != "0" and ga != "false"
-			chat("本机", text)
-			grid_requested.emit(g_on)
-			return
-		"/snapshot":
-			# 保存当前图传画面到相册/应用目录（本地，不下发板子）。
-			chat("本机", text)
-			_snapshot()
-			return
-		"/append", "/append_image", "/append image":
-			# 从系统图库选一张图 → 打开标注编辑器 → 采用后作为附件。
-			chat("本机", text)
-			image_pick_requested.emit()
-			return
-		"/exec_log":
-			# 本地直驱状态实时推送开关（默认关）：/exec_log [on|off]
-			var el_on := true
-			if pieces.size() > 1:
-				var ea: String = pieces[1].strip_edges().to_lower()
-				el_on = ea == "on" or ea == "1" or ea == "true"
-			cmd = CP.exec_log(el_on)
-		"/ai_log":
-			# AI 调试/延迟日志回推开关（默认关）：/ai_log [on|off]
-			var al_on := true
-			if pieces.size() > 1:
-				var aa: String = pieces[1].strip_edges().to_lower()
-				al_on = aa == "on" or aa == "1" or aa == "true"
-			cmd = CP.ai_log(al_on)
-		"/light":
-			# 直驱灯光：/light <front|vibe|back> <0|1>
-			var lt_kind := "front"
-			var light_on := false
-			if pieces.size() > 2:
-				lt_kind = pieces[1].strip_edges().to_lower()
-				var lt_arg: String = pieces[2].strip_edges().to_lower()
-				light_on = lt_arg == "on" or lt_arg == "1" or lt_arg == "true"
-			elif pieces.size() > 1:
-				lt_kind = "front"
-				var la: String = pieces[1].strip_edges().to_lower()
-				light_on = la == "on" or la == "1" or la == "true"
-			cmd = CP.light(lt_kind, light_on)
-		"/stop":
-			var scope := "all"
-			if pieces.size() > 1 and pieces[1].strip_edges().to_lower() in ["wheels", "arm"]:
-				scope = pieces[1].strip_edges().to_lower()
-			cmd = CP.stop(scope)
-			set_ai_running(false)  # /stop 手动接管：板端打断 AI 闭环，按钮恢复
-		"/config":
-			var rest := pieces[1] if pieces.size() > 1 else ""
-			var kv := rest.strip_edges().split(" ", true, 1)
-			if kv.size() < 2 or kv[0].is_empty():
-				chat("提示", "用法: /config <WiFi名> <密码>")
-				return
-			cmd = CP.config_wifi(kv[0], kv[1])
-		"/ai":
-			_handle_ai_slash(text)
-			return
-		"/goal":  # 兼容旧写法，等同 /ai goal
-			var gmsg := pieces[1].strip_edges() if pieces.size() > 1 else ""
-			if gmsg.is_empty():
-				chat("提示", "用法: /goal <目标文本>")
-				return
-			chat("本机", text)
-			_send_ai_goal(gmsg)
-			return
-		"/cancel", "/stopai":  # 兼容旧写法，等同 /ai cancel
-			chat("本机", text)
-			cmd = CP.ai_cancel()
-			set_ai_running(false)
-		"/ws":
-			_handle_ws_slash(text)
-			return
-		"/connect":  # 不经蓝牙直连 WS：等同 /ws connect <IP>
-			_handle_ws_slash("/ws connect %s" % (pieces[1].strip_edges() if pieces.size() > 1 else ""))
-			return
-		"/servo":  # 调试直驱：绕过执行板，大脑板直接驱动哪吒机械臂舵机
-			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
-			var kv := sp.split(" ", true, 1)
-			if kv.size() < 2 or not kv[0].is_valid_int() or not kv[1].is_valid_int():
-				chat("提示", "用法: /servo <n=0转向/1左/2右/3前> <pwm=50..250>")
-				return
-			var serv_n := kv[0].to_int()
-			var serv_pwm := kv[1].to_int()
-			if serv_n < 0 or serv_n > 3 or serv_pwm < 50 or serv_pwm > 250:
-				chat("提示", "用法: /servo <n=0转向/1左/2右/3前> <pwm=50..250>")
-				return
-			cmd = CP.servo(serv_n, serv_pwm)
-		"/arm_pose":  # 二连杆 IK：给末端位姿，让大脑板联动算左右两舵机
-			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
-			var pv := sp.split(" ", true, 1)
-			if pv.size() < 2 or not pv[0].is_valid_float() or not pv[1].is_valid_float():
-				chat("提示", "用法: /arm_pose <x=车头系前方cm> <h=离地高度cm>")
-				return
-			# 校准用：不限制数值范围（可为负/超界），不可达由板端可达域检查拦截，安全。
-			var pose_x := pv[0].to_float()
-			var pose_h := pv[1].to_float()
-			cmd = CP.arm_pose(pose_x, pose_h)
-		"/spin":  # 原地转向（普通四轮滑移式）；第三参 angle_deg 定角微操（板端时长近似）
-			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
-			var sv := sp.split(" ", true, 2)
-			if sv.size() < 1 or not sv[0].is_valid_int():
-				chat("提示", "用法: /spin <dir=+1/-1/0> [speed 0..1000] [angle_deg]")
-				return
-			var spin_dir := sv[0].to_int()
-			var spin_speed := 500
-			var spin_angle := 0
-			if sv.size() > 1 and sv[1].is_valid_int():
-				spin_speed = clampi(sv[1].to_int(), 0, 1000)
-			if sv.size() > 2 and sv[2].is_valid_int():
-				spin_angle = clampi(sv[2].to_int(), 0, 500)
-			if spin_dir < -1 or spin_dir > 1:
-				chat("提示", "用法: /spin <dir=+1/-1/0> [speed 0..1000] [angle_deg]")
-				return
-			cmd = CP.spin(spin_dir, spin_speed, spin_angle)
-		"/move":  # 微操/标定测试：定距移动（板端时长近似到点自停）
-			# /move <油门 -100..100> <距离 cm 1..500>（油门 50=throttle 0.5）
-			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
-			var mv := sp.split(" ", true, 1)
-			if mv.size() < 2 or not mv[0].is_valid_int() or not mv[1].is_valid_int():
-				chat("提示", "用法: /move <油门 -100..100> <距离 cm 1..500>（油门50=throttle0.5）")
-				return
-			var mv_thr := float(mv[0].to_int()) / 100.0
-			var mv_cm := mv[1].to_int()
-			if mv_thr < -1.0 or mv_thr > 1.0 or mv_cm < 1 or mv_cm > 500:
-				chat("提示", "用法: /move <油门 -100..100> <距离 cm 1..500>（油门50=throttle0.5）")
-				return
-			cmd = CP.move_dist(mv_thr, mv_cm)
-		"/motor":  # 调试直驱：绕过执行板，大脑板直接驱动哪吒单轮电机
-			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
-			var mv := sp.split(" ", true, 2)
-			if mv.size() < 3 or not mv[0].is_valid_int() or not mv[1].is_valid_int() or not mv[2].is_valid_int():
-				chat("提示", "用法: /motor <n=1..4> <a=0..1000> <b=0..1000>")
-				return
-			var m_n := mv[0].to_int()
-			var m_a := mv[1].to_int()
-			var m_b := mv[2].to_int()
-			if m_n < 1 or m_n > 4 or m_a < 0 or m_a > 1000 or m_b < 0 or m_b > 1000:
-				chat("提示", "用法: /motor <n=1..4> <a=0..1000> <b=0..1000>")
-				return
-			cmd = CP.motor(m_n, m_a, m_b)
-		"/drive":  # 调试直驱：一键全车前进/后退/停
-			var sp := pieces[1].strip_edges() if pieces.size() > 1 else "0"
-			if not sp.is_valid_int():
-				chat("提示", "用法: /drive <speed=-1000..1000> (0=停)")
-				return
-			var d_spd := sp.to_int()
-			if d_spd < -1000 or d_spd > 1000:
-				chat("提示", "用法: /drive <speed=-1000..1000> (0=停)")
-				return
-			cmd = CP.drive(d_spd)
-		_:
-			chat("提示", "未知指令: %s(/help 查看可用指令)" % verb)
-			return
-	chat("本机", text)
-	if not AppState.send_command(cmd):
-		chat("提示", "指令未发送(当前离线)")
-
-## /ai 统一入口：/ai goal <目标>（迭代闭环）/ ai oneshot <目标>（单轮）/ ai cancel（取消）。
-func _handle_ai_slash(text: String) -> void:
-	var pieces := text.split(" ", true, 2)
-	var mode := pieces[1].strip_edges().to_lower() if pieces.size() > 1 else ""
-	var msg := pieces[2].strip_edges() if pieces.size() > 2 else ""
-	var cmd: Dictionary = {}
-	match mode:
-		"cancel":
-			cmd = CP.ai_cancel()
-		"oneshot":
-			if msg.is_empty():
-				chat("提示", "用法: /ai oneshot <目标文本>")
-				return
-			cmd = CP.ai_oneshot(msg)
-		_:
-			if msg.is_empty():
-				chat("提示", "用法: /ai goal <目标文本>")
-				return
-			cmd = CP.ai_goal(msg)
-	chat("本机", text)
-	if not AppState.send_command(cmd):
-		chat("提示", "指令未发送(当前离线)")
+	var r: Dictionary = SC.parse(text)
+	if not bool(r.get("ok", false)):
+		chat("提示", str(r.get("hint", "未知指令")))
 		return
-	set_ai_running(mode != "cancel")
+	chat("本机", text)
+	match str(r.get("kind", "")):
+		"cmd":
+			_send_slash_cmd(r)
+		"local":
+			_apply_slash_local(r)
 
-func _show_help() -> void:
-	var lines := CP.help_lines()
-	chat("提示", "可用指令:\n" + "\n".join(lines))
+## 词表指令：发送并复位发送按钮（手动接管类打断 AI，/ai 类按模式切换）。
+func _send_slash_cmd(r: Dictionary) -> void:
+	var cmd: Dictionary = r.get("cmd", {})
+	var sent: bool = DeviceConn.send_command(cmd)
+	if not sent:
+		chat("提示", "指令未发送(当前离线)")
+	var mode: String = str(r.get("ai_mode", ""))
+	if mode != "":
+		# /ai 类仅在发送成功后才切换运行态（失败保持原状）。
+		if sent:
+			set_ai_running(mode != "cancel")
+	elif bool(r.get("interrupts_ai", false)):
+		# 手动接管类无条件复位（即使离线也还原按钮，避免残留「中止」）。
+		set_ai_running(false)
 
-## /ws 手动控制：connect [IP] 开启自动重连并重连（可带 IP 直连，不经蓝牙）；disconnect 暂停自动重连并断开；status 查状态。
-func _handle_ws_slash(text: String) -> void:
-	var pieces := text.split(" ", true, 2)
-	var arg := pieces[1].strip_edges().to_lower() if pieces.size() > 1 else "status"
-	match arg:
+## 本地动作：不经板子，直接处理。
+func _apply_slash_local(r: Dictionary) -> void:
+	match str(r.get("local", "")):
+		"help":
+			chat("提示", "可用指令:\n" + "\n".join(CP.help_lines()))
+		"clear":
+			_chat_log.clear()
+		"stream":
+			stream_requested.emit(bool(r.get("on", true)))
+		"grid":
+			grid_requested.emit(bool(r.get("on", true)))
+		"snapshot":
+			_snapshot()
+		"append":
+			image_pick_requested.emit()
+		"ws":
+			_apply_ws_local(r)
+
+## /ws 手动控制：connect [IP]（可带 IP 直连，不经蓝牙）/ disconnect / status。
+func _apply_ws_local(r: Dictionary) -> void:
+	var verb: String = str(r.get("arg", "status"))
+	var ip: String = str(r.get("ip", ""))
+	match verb:
 		"connect":
-			var ip := pieces[2].strip_edges() if pieces.size() > 2 else ""
 			DeviceConn.connect_ws(ip)
 			chat("提示", ("已发起 WS 连接 %s（自动重连已开启）" % ip) if not ip.is_empty() else "已发起 WS 连接（自动重连已开启）")
 		"disconnect":

@@ -19,7 +19,6 @@ config/icon="uid://doggpirofqfh8"
 [autoload]
 
 DeviceConn="*res://net/DeviceConn.gd"
-AppState="*res://state/AppState.gd"
 AnimationManager="*res://animation/AnimationManager.gd"
 Store="*res://state/LocalStore.gd"
 AppLog="*res://state/AppLog.gd"
