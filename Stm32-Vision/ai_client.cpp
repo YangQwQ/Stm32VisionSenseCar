@@ -754,7 +754,7 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
   }
   if (!strcmp(type, "arm")) {
     const char* act = doc["params"]["act"] | "";
-    static const char* acts[] = {"lift_up","lift_down","reach_forward","reach_backward","clip","release","home", nullptr};
+    static const char* acts[] = {"lift_up","lift_down","reach_forward","reach_backward","clip","release","fold", nullptr};
     bool good = false;
     for (int i = 0; acts[i]; i++) if (!strcmp(act, acts[i])) { good = true; break; }
     if (!good) { snprintf(err_buf, err_cap, "AI arm 非法 act=%s", act); return err_buf; }

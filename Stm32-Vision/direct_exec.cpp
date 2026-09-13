@@ -99,10 +99,10 @@ static void arm_fk(int16_t reach_pwm, int16_t lift_pwm, float* x_out, float* h_o
 // 过快（原 0.25cm/拍=25cm/s）机械臂会抖、AI 难以精确到位。约 16 拍/cm
 #define ARM_STEP_CM    0.06f
 #define ARM_CNT_PER_CM 16
-// home 折叠姿态（查 IK 标定表）：右舵机 α=90°（第一节竖直）→ 130；左舵机 β 最小（第二节折回）→ 130。
+// fold 折叠姿态（查 IK 标定表）：右舵机 α=90°（第一节竖直）→ 130；左舵机 β 最小（第二节折回）→ 130。
 // 区别于 reset 回中（臂仍前伸、盲区大），折叠态摄像头最高、视野最大。
-#define HOME_LIFT_PWM  130
-#define HOME_REACH_PWM 130
+#define FOLD_LIFT_PWM  130
+#define FOLD_REACH_PWM 130
 
 // AI 微操的"时长近似"换算（无里程计，只能按时长模拟距离/角度）。系数来自真机实测标定：
 // 移动 actual_cm≈v(throttle)*t_s+c(throttle)，车速对油门不敏感（≈10..12.5cm/s），高油门带起停余量；
@@ -280,12 +280,12 @@ static void send_arm(const JsonObjectConst& p) {
   } else if (!strcmp(act_, "release")) {
     clear_active();
     s_grip = GRIP_HI; write_grip();
-  } else if (!strcmp(act_, "home")) {
+  } else if (!strcmp(act_, "fold")) {
     // 收臂折叠回平台（一次性离散）：右舵机 α=90° 竖直、左舵机 β 最小折回、夹爪回中；
     // 摄像头到最高位扩大视野、避开盲区。不动车轮（区别于 reset 的全停）。
     clear_active();
-    s_lift  = HOME_LIFT_PWM;  write_lift();
-    s_reach = HOME_REACH_PWM; write_reach();
+    s_lift  = FOLD_LIFT_PWM;  write_lift();
+    s_reach = FOLD_REACH_PWM; write_reach();
     s_grip  = GRIP_CENTER;    write_grip();
   }
 }
