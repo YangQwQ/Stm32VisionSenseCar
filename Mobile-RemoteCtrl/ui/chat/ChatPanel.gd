@@ -506,13 +506,11 @@ func _handle_slash(text: String) -> void:
 			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""
 			var pv := sp.split(" ", true, 1)
 			if pv.size() < 2 or not pv[0].is_valid_float() or not pv[1].is_valid_float():
-				chat("提示", "用法: /arm_pose <x=轴前方cm> <h=地面以上cm>")
+				chat("提示", "用法: /arm_pose <x=车头系前方cm> <h=离地高度cm>")
 				return
+			# 校准用：不限制数值范围（可为负/超界），不可达由板端可达域检查拦截，安全。
 			var pose_x := pv[0].to_float()
 			var pose_h := pv[1].to_float()
-			if pose_x < 0.0 or pose_h < 0.0:
-				chat("提示", "用法: /arm_pose <x=轴前方cm> <h=地面以上cm>")
-				return
 			cmd = CP.arm_pose(pose_x, pose_h)
 		"/spin":  # 原地转向（普通四轮滑移式）；第三参 angle_deg 定角微操（板端时长近似）
 			var sp := pieces[1].strip_edges() if pieces.size() > 1 else ""

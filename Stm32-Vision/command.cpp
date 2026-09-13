@@ -240,15 +240,19 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   }
 
   if (!strcmp(type, "arm_pose")) {
-    // 二连杆 IK：给末端位姿(x=轴前方cm, h=地面以上cm)，联动算左右两舵机 pwm 一并下发。
-    float x = params["x"] | -1.f;
-    float h = params["h"] | -1.f;
-    if (x >= 0.f && h >= 0.f) {
+    // 二连杆 IK：给末端位姿(x=车头系前方cm, h=离地高度cm)，联动算左右两舵机 pwm 一并下发。
+    // 校准用：不限制数值范围（可为负/超界），不可达由 exec::arm_pose 可达域检查拦截并回执。
+    bool has_x = params["x"].is<float>() || params["x"].is<int>();
+    bool has_h = params["h"].is<float>() || params["h"].is<int>();
+    if (has_x && has_h) {
+      float x = params["x"] | 0.f;
+      float h = params["h"] | 0.f;
       exec::set_move_cap_ms(0);  // 手动接管轮子/转向：先清 AI move 兜底，防旧时限误停
-      exec::arm_pose(x, h);
+      if (!exec::arm_pose(x, h))
+        reply_status(doc, reply, reply_ctx, "arm_pose: 目标不可达(xh 超出机械臂可达范围)");
       // 成功不回执：状态看 exec_log 即知。
     } else {
-      reply_status(doc, reply, reply_ctx, "arm_pose: 目标不可达，需要 x=轴前方cm h=地面以上cm");
+      reply_status(doc, reply, reply_ctx, "arm_pose: 需要 x=车头系前方cm h=离地高度cm");
     }
     return;
   }

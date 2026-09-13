@@ -426,13 +426,17 @@ static void ws_stream_task(void *arg)
 
         ble::set_ws_connected(has_client);
         // 本地直驱状态 → 手机（exec_log 开启时实时推送；替代原执行板上行帧镜像）。
-        // 默认关：空闲不刷屏。开启后约 400ms 推一条 exec::read_state 合成的状态文本。
+        // 默认关：空闲不刷屏。开启后约 400ms 推一条 exec::read_state 合成的状态文本；
+        // 状态文本与上次完全相同时跳过（防刷屏，只有变化才推）。
         static uint32_t s_last_status_ms = 0;
+        static char s_last_state[96] = {0};
         if (has_client && cmd::exec_log() &&
             (int32_t)(now - s_last_status_ms) >= (int32_t)400) {
             s_last_status_ms = now;
-            char st[96];  // 状态含抓手前端 XZ，需足量避免截断
-            if (exec::read_state(st, sizeof(st))) {
+            char st[96];  // 状态含抓手前端 XZ 与 PWM，需足量避免截断
+            if (exec::read_state(st, sizeof(st)) && strcmp(st, s_last_state)) {
+                strncpy(s_last_state, st, sizeof(s_last_state) - 1);
+                s_last_state[sizeof(s_last_state) - 1] = 0;
                 JsonDocument sdoc;
                 sdoc["type"] = "exec_status";
                 JsonObject sp = sdoc["params"].to<JsonObject>();
