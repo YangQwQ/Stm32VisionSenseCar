@@ -599,7 +599,7 @@ static void mem_feed(char* buf, size_t cap) {
 // 有 edited 时带编辑图；prev 非空时带上一帧做周期性双帧运动对比，否则单帧。
 static void build_body(PsaBuf& b, const char* goal, const char* ann, const char* hint,
                        const char* last_cmd, const char* exec_state, unsigned last_age_s,
-                       const char* hist, const char* chat,
+                       const char* hist, const char* chat, const char* note, const char* prog,
                        const uint8_t* frame, size_t frame_len,
                        const uint8_t* prev, size_t prev_len,
                        bool use_edited, const uint8_t* edited, size_t edited_len) {
@@ -611,14 +611,25 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   sys.put("上一步已下发：");
   sys.put(last_cmd && last_cmd[0] ? last_cmd : "无");
   sys.put("。每次只输出一个合法 JSON：");
-  sys.put("{\"type\":\"move\",\"params\":{\"throttle\":0.3,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 移动/转向：离目标距离明确时务必加 distance_cm 定距（已生效、按时长近似，幅度宜小防过冲）；也要 angle_deg 定角；不加则持续移动；低速优先 throttle/steering≤0.5；");
-  sys.put("或 {\"type\":\"spin\",\"params\":{\"dir\":1,\"angle_deg\":90},\"reason\":\"..\"} 原地旋转(dir: +1右转(顺时针)/-1左转(逆时针)/0停)：保持车头朝向不变原地转动视角，是观察环境/环视四周的推荐转弯方式，须配合前轮保持直行；可选 angle_deg 定角转指定度数（已生效、近似），小幅微调或转够观察角度用；");
-  sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\",\"dist_cm\":15},\"reason\":\"..\"} act 取 lift_up/lift_down/reach_forward/reach_backward/clip/release/home（home=收臂折叠回平台：第一节竖直、第二节折回，摄像头回最高位扩大视野，用于避开盲区重新观察）；与操作者交接物品时先停稳、伸到其手边再 release；");
-  sys.put("或 {\"type\":\"arm_pose\",\"params\":{\"x\":10,\"h\":4},\"reason\":\"..\"} 直接把夹爪末端移动到指定位姿（一步到位）：x=轴前方 cm（可达约4..15），h=夹爪中心离地高度 cm（越高夹爪越抬、越低越贴近地面）。夹取前最推荐用它把夹爪调到与目标高度匹配；不可达时不会移动，请改 x/h 重试；");
+  sys.put("{\"type\":\"move\",\"params\":{\"throttle\":0.3,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 移动/转向：离目标距离明确时务必加 distance_cm 定距，幅度宜小防过冲；低速优先 throttle/steering≤0.5；");
+  sys.put("或 {\"type\":\"spin\",\"params\":{\"dir\":1,\"angle_deg\":90},\"reason\":\"..\"} 原地旋转(dir: +1右转(顺时针)/-1左转(逆时针)/0停)：保持车头朝向不变原地转动视角，是观察环境/环视四周的推荐转弯方式，须配合前轮保持直行；可选 angle_deg 定角转指定度数，小幅微调或转够观察角度用；");
+  sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\",\"dist_cm\":15},\"reason\":\"..\"} act 取 lift_up/lift_down/reach_forward/reach_backward/clip/release/home（home=收臂折叠回平台，避免遮挡小型物体）");
+  sys.put("或 {\"type\":\"arm_pose\",\"params\":{\"x\":10,\"h\":4},\"reason\":\"..\"} 直接把夹爪末端移动到指定位姿：x=车头前方 cm（可达约4..15），h=夹爪中心离地高度 cm（越高夹爪越抬、越低越贴近地面）。夹取前最推荐用它把夹爪调到与目标高度匹配；不可达时不会移动，请改 x/h 重试；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
-  sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 保持当前所有动作不变，原地等待观察：当还在运动中没到目标、或者画面没变化、或者还没锁定目标时，用 wait；");
-  sys.put("可选附加字段（可加在任意指令 JSON 里）：\"carry_prev\":true（下轮带上本帧做前后对比）；\"observe\":{\"name\":\"沙漏\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录物体位置：name=物体名（同一物体务必保持同名），px/py=物体中心归一化坐标 左上(0,0)右下(1,1)，visible=false=当前不在画面；优先用 px/py（程序换算地面坐标，准得多），无法给出像素时用 \"rel_deg\":-20,\"dist_cm\":25 兜底（rel_deg 相对当前车头 正=右负=左）；");
-  sys.put("规则: 1. 只输出 JSON, 每次只规划一步，若任务不要求实际行动可以 stop; 回复务必简短——思考放在 reason。2. reason 一句中文简要解释, 需包含目标方位: 相对小车的左/中/右 + 是否已贴近/被夹爪遮挡; 若目标消失, 写明最后已知方位与推断(如“最后在偏左处, 现在应在车头右前方, 右转找回”), 供下轮决定转向或后退, 避免走过头后盲目环视。3. 旋转时使用 原地旋转(spin) ，需要观察环境/还没锁定目标时优先用小幅环视探索视角。4. 若有障碍物挡路或有明显高低差的区域则尝试绕行，若绕行多轮仍无进展或人持续挡在车前, 做出示意停止的手势，则可以 stop 并说明原因。5. 记录任务相关物体的位置用 observe 字段（格式见上方指令区）：同一物体务必保持同名，报位置优先用 px/py（程序换算地面坐标并喂回\"当前车头局部系\"，如\"车向:35°; 沙漏 右偏20°约25cm\"；车向 0°=任务开始车头方向）。记忆仅供参考, 画面所见永远为准——看到就刷新 observe, 看不到就报 visible=false; 画面与记忆不符说明物体被移动或车已转向, 一律以画面为准更新。目标不在画面时, 可用记忆里的全局坐标结合当前车向推断目标方位。6. 目标先前可见且在近处、随后画面中消失(尤其上一步是前进靠近)。可以尝试回退操作或根据空间记忆转向找回目标，若空间记忆推断目标方位十分接近, 可能被阻挡，则应选择先前的移动，确认方位后再靠近。当确认目标被机械臂本体遮挡可用 收臂 home。7. 画面右下角为小车的夹爪，其朝向为小车朝向，画面中心经过小车正前方。状态里“抓手:前Xcm 高Ycm”是夹爪夹心与离地高度, 若画面不好判断可据此判断能否夹住目标及当前抓手高度是否合适; 继续朝受限方向动作不会改变位置时(到顶/缩到底), 应换方向或调整姿态。8. 发现目标在左前方/右前方时, 先原地转向对准目标, 正对目标且距离小于10时可以尝试使用arm_pose控制夹子移动到目标距离和高度尝试夹取, 高度应选择目标高度的一半或者明显适合夹取的高度，无法确认合适高度时选择较低的高度，夹爪松开时宽度3cm，可以用来作为推测长度的方式9. 夹爪是两片平行夹板, 装机在高位侧俯视时可看到夹爪; “爪:合”只代表夹爪伺服已闭合到位, 绝不代表夹住了物体。判断是否夹住必须执行 arm lift_up 抬臂, 检查目标是否随夹爪抬起; 目标仍在地面或夹爪空合则未夹住, 应 release 后调整高度或重新对准。10. 需要下一轮同时收到本轮画面做前后对比时，输出额外字段 \"carry_prev\":true（格式见上方指令区）。例如发现目标、或即将移动担心目标进盲区需要对比判定时。下轮你会同时收到上一帧与当前帧, 据此判断目标是否移动/进入盲区。");
+  sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 空操作，用于不执行移动操作跳过本轮，不会停止正在进行的移动；");
+  sys.put("可选附加字段（可加在任意指令 JSON 里）：\"carry_prev\":true（下轮带上本帧做前后对比）；\"carry_user\":true（下轮带操作者发的参考图，与 carry_prev 二选一，外观难描述时可用）；\"observe\":{\"name\":\"物体名字\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录物体位置：name=物体名（同一物体务必保持同名），px/py=物体在画面上的归一化坐标 左上(0,0)右下(1,1)，visible=false=当前不在画面；优先用 px/py（程序换算地面坐标，准得多），无法给出像素时用 \"rel_deg\":-20,\"dist_cm\":25 兜底（rel_deg 相对当前车头 右正左负）；\"task_note\":\"目标外观/备注\"（任务开始写一次，程序每轮喂回）；\"tasks\":[{\"name\":\"出门\",\"done\":true},{\"name\":\"右转\",\"done\":false}]（新建/重写整个任务列表，低频）；\"task_done\":{\"index\":1,\"done\":true}（标记第N项完成/未完成，index从1起，高频轻量、不用重写列表）；");
+  sys.put("规则: \
+	1. 只输出 JSON, 每次只规划一步，若任务不要求实际行动可以 stop; 回复务必简短——思考放在 reason。\
+	2. reason 一句中文简要解释, 需包含目标方位: 相对小车的左/中/右 + 是否已贴近/被夹爪遮挡; 若目标消失, 写明最后已知方位与推断(如“最后在偏左处, 现在应在车头右前方, 右转找回”), 供下轮决定转向或后退, 避免走过头后盲目环视。\
+	3. 旋转时使用 原地旋转(spin) ，需要观察环境/还没锁定目标时优先用小幅环视探索视角。\
+	4. 若有障碍物挡路或有明显高低差的区域则尝试绕行，若绕行多轮仍无进展或人持续挡在车前, 做出示意停止的手势，则可以 stop 并说明原因。\
+	5. 记录任务相关物体的位置用 observe 字段（格式见上方指令区）：同一物体务必保持同名，报位置优先用 px/py（程序换算地面坐标并喂回\"当前车头局部系\"，如\"车向:35°; 沙漏 右偏20°约25cm\"；车向 0°=任务开始车头方向）。记忆仅供参考, 画面所见永远为准——看到就刷新 observe, 看不到就报 visible=false; 画面与记忆不符说明物体被移动或车已转向, 一律以画面为准更新。目标不在画面时, 可用记忆里的全局坐标结合当前车向推断目标方位。\
+	6. 目标先前可见且在近处、随后画面中消失(尤其上一步是前进靠近)。可以尝试回退操作或根据空间记忆转向找回目标，若空间记忆推断目标方位十分接近, 可能被阻挡，则应选择先前的移动，确认方位后再靠近。当确认目标被机械臂本体遮挡可用 收臂 home。\
+	7. 画面右下角为小车的夹爪，其朝向为小车朝向，画面中心经过小车正前方。状态里“抓手:前Xcm 高Ycm”是夹爪夹心与离地高度, 若画面不好判断可据此判断能否夹住目标及当前抓手高度是否合适; 继续朝受限方向动作不会改变位置时(到顶/缩到底), 应换方向或调整姿态。\
+	8. 发现目标在左前方/右前方时, 先原地转向对准目标, 正对目标且距离小于10时可以尝试使用arm_pose控制夹子移动到目标距离和高度尝试夹取, 高度应选择目标高度的一半或者明显适合夹取的高度，无法确认合适高度时选择较低的高度，夹爪松开时宽度3cm，可以用来作为推测长度的方式\
+	9. 夹爪是两片平行夹板, 装机在高位侧俯视时可看到夹爪; “爪:合”只代表夹爪伺服已闭合到位, 绝不代表夹住了物体。判断是否夹住必须执行 arm lift_up 抬臂, 检查目标是否随夹爪抬起; 目标仍在地面或夹爪空合则未夹住, 应 release 后调整高度或重新对准。\
+	10. 需要下一轮同时收到本轮画面做前后对比时，输出额外字段 \"carry_prev\":true（格式见上方指令区）。例如发现目标、或即将移动担心目标进盲区需要对比判定时。下轮你会同时收到上一帧与当前帧, 据此判断目标是否移动/进入盲区。\
+	11. 多步任务用 tasks 新建/重写任务列表、task_done 标记第N项完成（index从1起，完成后及时标记，不必重写列表）；task_note 记录目标外观/备注（低频）。程序每轮喂回当前任务列表与笔记，据此推进下一步即可，勿重复推断进度。外观难描述的目标可输出 \"carry_user\":true 持续带参考图（与 carry_prev 二选一）。");
   { // 画面标定：从顶部 CAL_* 宏读取，改一处即可应对镜头松动后整体调参
     char cal[1280];   // 标定文案（格式化后约 0.96KB，加长文案前核对足量，防截断半个汉字致云端 400）
     snprintf(cal, sizeof(cal),
@@ -647,6 +658,9 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
     ut.put(age);
   }
   if (hist && hist[0]) { ut.put(hist); ut.put("；"); }
+  // 任务笔记/任务列表：AI 自己写入并持续喂回（目标外观/计划/各任务状态），无需每轮重新推断。
+  if (note && note[0]) { ut.put("任务笔记："); ut.put(note); ut.put("；"); }
+  if (prog && prog[0]) { ut.put(prog); ut.put("；"); }  // prog 为已渲染的"任务列表：..."文本
   // 用户插话（ai_chat 喂入，不打断任务）：以最高优先级提示 AI 采纳/修正当前计划。
   if (chat && chat[0]) { ut.put("操作者插话（重要，请据此调整当前计划，不必停车/结束任务）："); ut.put(chat); ut.put("。"); }
   { // 空间记忆喂回（车向 + 已记物体，当前车头局部系）
@@ -657,6 +671,8 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   if (frame) {
     if (prev && prev_len > 0) {
       ut.put("下面按顺序给出：标注图（若有）、上一帧、当前帧。请对比上一帧与当前帧，判断画面中移动的人手/物体大致朝哪个方向移动；若上一步动作已让目标消失，据两帧差异推断目标方位与盲区。");
+    } else if (use_edited && edited) {
+      ut.put("下面按顺序给出：操作者参考图、当前帧。参考图用于辨识目标外观/位置，请在当前帧中寻找匹配的目标。");
     } else {
       ut.put("当前画面如下：");
     }
@@ -1274,6 +1290,10 @@ static void ai_worker(void*) {
     int stall = 0;
     bool stall_hint = false;
     bool want_prev = false;     // AI 上轮 carry_prev=true → 本轮带上 prev 帧做对比
+    bool want_user = false;     // AI 上轮 carry_user=true → 本轮带操作者参考图（与 carry_prev 二选一）
+    char task_note[192] = {0};  // AI 写入的任务笔记（目标外观/计划），每轮喂回
+    struct { char name[48]; bool done; } s_tasks[8] = {{0}};  // AI 维护的任务列表（JSON 更新）
+    int s_task_n = 0;
 
     // 编辑图一次性取快照（供整轮任务复用，避免中途被覆盖）。
     uint8_t* edited = nullptr; size_t edited_len = 0;
@@ -1374,11 +1394,21 @@ static void ai_worker(void*) {
         xSemaphoreGive(g_mtx);
         // 上一帧是否带上：仅由 AI 上轮 carry_prev=true 决定（锁定/追踪意图），其余保持单帧省开销。
         bool use_prev = want_prev && prev_len > 0;
+        // 操作者参考图：首轮必带（初始参考）；之后仅 AI carry_user=true 才带（与上一帧二选一）。
+        bool use_edited_now = (steps == 0) || (want_user && edited != nullptr);
+        // 渲染任务列表喂回：任务列表：1.出门[完成] 2.右转[未完成] ...
+        char task_s[320] = {0};
+        if (s_task_n > 0) {
+          int tp2 = snprintf(task_s, sizeof(task_s), "任务列表：");
+          for (int ti = 0; ti < s_task_n && tp2 < (int)sizeof(task_s) - 48; ti++)
+            tp2 += snprintf(task_s + tp2, sizeof(task_s) - tp2, "%d.%s[%s] ",
+                            ti + 1, s_tasks[ti].name, s_tasks[ti].done ? "完成" : "未完成");
+        }
         build_body(body, t.text, t.ann, hint, last_disp, stp,
                    last_act_ms ? (unsigned)((esp_timer_get_time() / 1000 - last_act_ms) / 1000) : 0u,
-                   hist_s, chat_now,
+                   hist_s, chat_now, task_note, task_s,
                    frame, frame_len, prev, use_prev ? prev_len : 0,
-                   edited != nullptr, edited, edited_len);
+                   use_edited_now, edited, edited_len);
         if (!body.ok) { fail = "组装请求 body 失败"; break; }
 
         String resp;
@@ -1467,6 +1497,36 @@ static void ai_worker(void*) {
           else { memmove(act_hist[0], act_hist[1], 3 * 48); strncpy(act_hist[3], cur_cmd, 47); act_hist[3][47] = 0; }
           // AI 显式要求保留上一帧（锁定/追踪）：下轮带上 prev；否则按兜底节奏走
           want_prev = cmdD["carry_prev"].is<bool>() && cmdD["carry_prev"].as<bool>();
+          // AI 要求下轮带操作者参考图（与 carry_prev 二选一）
+          want_user = cmdD["carry_user"].is<bool>() && cmdD["carry_user"].as<bool>();
+          // 任务笔记/进度：AI 写入并持续喂回（目标外观/计划/进行到哪）
+          const char* tn = cmdD["task_note"] | "";
+          if (tn[0] && strcmp(tn, task_note)) {
+            strncpy(task_note, tn, sizeof(task_note) - 1); task_note[sizeof(task_note) - 1] = 0;
+            ai::logf("[ai] 任务笔记: %s", task_note);
+          }
+          // 任务列表：全量重写（新建/重组时用，低频）；AI 每轮只看到当前状态喂回。
+          if (cmdD["tasks"].is<JsonArray>()) {
+            JsonArrayConst ta = cmdD["tasks"].as<JsonArrayConst>();
+            int n = 0;
+            for (JsonObjectConst it : ta) {
+              if (n >= 8) break;
+              const char* nm = it["name"] | "";
+              if (!nm[0]) continue;
+              strncpy(s_tasks[n].name, nm, 47); s_tasks[n].name[47] = 0;
+              s_tasks[n].done = it["done"] | false;
+              n++;
+            }
+            if (n > 0 || s_task_n > 0) { s_task_n = n; ai::logf("[ai] 任务列表更新(%d项)", s_task_n); }
+          }
+          // 任务状态标记：增量（第 N 项完成/未完成，index 从 1 起）
+          if (cmdD["task_done"].is<JsonObject>()) {
+            int idx = (cmdD["task_done"]["index"] | 0) - 1;
+            if (idx >= 0 && idx < s_task_n) {
+              s_tasks[idx].done = cmdD["task_done"]["done"] | false;
+              ai::logf("[ai] 任务%d → %s", idx + 1, s_tasks[idx].done ? "完成" : "未完成");
+            }
+          }
           // 发给 AI 的"上一步已下发"：指令 + reason，替代双帧供跨轮衔接（目标方位/执行情况）。
           // reason 较长时按 UTF-8 安全截断（%.*s 会截断半个中文字节 → 云端 400 invalid unicode）。
           const char* r = cmdD["reason"] | "";
