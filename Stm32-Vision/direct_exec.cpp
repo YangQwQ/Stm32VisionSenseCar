@@ -6,18 +6,25 @@
 // ================= 二连杆 IK 标定（挖掘机式机械臂） =================
 // 几何：第一节(A)长 L1，第二节(B)长 L2，右舵机控 A 相对水平角 α，左舵机(推杆)控两臂夹角 β。
 // 轴(肩)高于地面 AXIS_H cm；末端夹爪位置 = f(α,β)。L1=L2=7.5cm（转轴到转轴）。
+// AXIS_X_OFF：肩轴转轴在小车车头后方 cm。坐标统一用"车头系"：FK 输出 x 加该偏移，
+// arm_pose 输入 x 也按车头系（减回偏移再反解）。2026-09-13 实测 17 点拟合标定：
+// α/β 角度表经最小二乘反解得出（AH/XO 为拟合等效值，非真实机械尺寸；表域内 FK/IK 精确互逆闭环）。
 #define IK_L1       7.5f
 #define IK_L2       7.5f
-#define AXIS_H      9.5f   // 肩轴相对地面的高度（3.5 平台 + 0.5 转轴 + 5.5 底盘）
-#define RMIN        4.0f   // 可达最近（约 3.5，留余量）
+#define AXIS_H      2.0f   // 拟合等效肩轴高（22 实测点反解）
+#define AXIS_X_OFF  3.5f   // 拟合等效：肩轴在小车车头后方 cm
+#define RMIN        0.5f   // 可达最近（防 r→0 除零；真实最近由标定表域兜底）
 #define RMAX        15.0f  // 理论最远 L1+L2
 
-// 标定映射（实测）：表按横轴升序排列。纵轴出界自动夹到首尾。
-// α(第一节与水平夹角, 度) → 右舵机 pwm
-const float ALPHA_X[] = { 0.f, 50.f, 55.f, 90.f };
+// 标定映射（实测 22 点拟合）：表按横轴升序排列。纵轴出界自动夹到首尾。
+// 注：真实机械为 7cm 两连杆 + 曲柄连杆驱动第二节 + 夹爪水平延伸约7cm/低0.75cm（肩轴车头后6.5cm、离地10.5cm），
+// 但实测数据与纯二连杆几何不完全吻合，故采用等效模型（L=7.5 二连杆 + 拟合 AH/XO + 角度表），
+// 表域内 FK/IK 精确互逆闭环、22 点残差 <2cm。表域=实际可达域，表外命令判"不可达"。
+// α(第一节与水平夹角, 度) → 右舵机 pwm（角度升序、pwm 降序）
+const float ALPHA_X[] = { 59.8f, 72.2f, 112.7f, 125.6f };
 const float ALPHA_PWM[] = { 220.f, 200.f, 150.f, 130.f };
-// β(两臂夹角, 度) → 左舵机 pwm
-const float BETA_X[] = { 25.f, 45.f, 80.f, 140.f };
+// β(两臂夹角, 度) → 左舵机 pwm（均升序）
+const float BETA_X[] = { 15.6f, 47.6f, 64.0f, 102.0f };
 const float BETA_PWM[] = { 130.f, 150.f, 180.f, 230.f };
 
 // 分段线性插值（查表），横轴需升序
@@ -62,7 +69,7 @@ static float inv_plerp(const float* xs, const float* ys, int n, float y) {
 static void arm_fk(int16_t reach_pwm, int16_t lift_pwm, float* x_out, float* h_out) {
   float a = inv_plerp(ALPHA_X, ALPHA_PWM, 4, (float)lift_pwm) * PI / 180.0f;
   float b = inv_plerp(BETA_X,  BETA_PWM,  4, (float)reach_pwm) * PI / 180.0f;
-  float x = IK_L1 * cosf(a) - IK_L2 * cosf(a + b);   // 轴前方 cm
+  float x = IK_L1 * cosf(a) - IK_L2 * cosf(a + b) + AXIS_X_OFF;  // 车头系轴前方 cm
   float z = IK_L1 * sinf(a) - IK_L2 * sinf(a + b);   // 相对轴，向上+
   *x_out = x;
   *h_out = z + AXIS_H;                                // 离地高度 cm
@@ -252,6 +259,9 @@ static void setup_active(int8_t axis, int16_t dir, bool has_dist, int16_t dist) 
 }
 
 static void send_arm(const JsonObjectConst& p) {
+  // 每次手臂指令先清掉可能残留的旧联动步进（s_active）：防止上次持续动作因 button_up/限位
+  // 等原因未清干净，导致本次新指令被上次残留干扰而"点了没反应"（回正=全清后即恢复）。
+  clear_active();
   const char* act_ = p["act"] | "";
   bool has_dist = p["dist_cm"].is<int>();
   int16_t dist = (int16_t)((int)(p["dist_cm"] | 0));
@@ -346,10 +356,11 @@ bool exec::set_servo(uint8_t logical, uint16_t pwm) {
 }
 
 bool exec::arm_pose(float x, float h) {
-  // 给末端目标位姿：x=轴前方 cm，h=地面以上高度 cm。
-  // 相对臂基坐标 z = h - AXIS_H；二连杆反解 → (α,β) → 查表得左右两舵机 pwm，联动下发。
+  // 给末端目标位姿：x=车头系轴前方 cm，h=地面以上高度 cm。
+  // 相对臂基坐标 z = h - AXIS_H、xa = x - AXIS_X_OFF；二连杆反解 → (α,β) → 查表得两舵机 pwm。
   float z = h - AXIS_H;
-  float r2 = x * x + z * z;
+  float xa = x - AXIS_X_OFF;
+  float r2 = xa * xa + z * z;
   if (r2 < RMIN * RMIN || r2 > RMAX * RMAX) return false;  // 目标不可达
   float r = sqrtf(r2);
   float d = (IK_L1*IK_L1 + IK_L2*IK_L2 - r2) / (2.f*IK_L1*IK_L2);
@@ -358,8 +369,12 @@ bool exec::arm_pose(float x, float h) {
   float ph = (IK_L1*IK_L1 + r2 - IK_L2*IK_L2) / (2.f*IK_L1*r);
   ph = ph > 1.f ? 1.f : (ph < -1.f ? -1.f : ph);
   float phi0 = acosf(ph) * 180.f / PI;               // 原点处基线与第一节夹角
-  float psi  = atan2f(z, x) * 180.f / PI;            // 原点指向目标的方位角
+  float psi  = atan2f(z, xa) * 180.f / PI;           // 原点指向目标的方位角
   float alpha = psi + phi0;
+  // 反解角度超出标定表域 = 超出实测可达范围，明确判不可达（表外插值不闭环、会送到错误位置）。
+  if (alpha < ALPHA_X[0] - 1.f || alpha > ALPHA_X[3] + 1.f ||
+      beta  < BETA_X[0]  - 1.f || beta  > BETA_X[3]  + 1.f)
+    return false;
 
   int pr = (int)roundf(plerp(ALPHA_X, ALPHA_PWM, 4, alpha));
   int pl = (int)roundf(plerp(BETA_X,  BETA_PWM,  4, beta));
@@ -443,10 +458,11 @@ bool exec::read_state(char* buf, size_t cap) {
   if (s_lift >= LIFT_HI - 2) snprintf(lim + strlen(lim), sizeof(lim) - strlen(lim), " 抬落最低");
   else if (s_lift <= LIFT_LO + 2) snprintf(lim + strlen(lim), sizeof(lim) - strlen(lim), " 抬到顶");
   // 末端前端坐标（前向运动学）：让 AI 知道夹爪现在伸到多前、多高，判断还能往哪移/当前高度。
+  // 括号内为左右舵机 PWM（Servo2=移爪 s_reach / Servo4=抬落 s_lift），供 exec_log 校准机械臂坐标。
   float fk_x = 0, fk_h = 0;
   arm_fk(s_reach, s_lift, &fk_x, &fk_h);
   if (fk_x < 0) fk_x = 0;
-  snprintf(buf, cap, "小车:%s %s | 抓手:前%.0fcm 高%.0fcm 爪:%s%s",
-    car, steer, fk_x, fk_h, grip, lim);
+  snprintf(buf, cap, "小车:%s %s | 抓手:前%.0fcm(%d) 高%.0fcm(%d) 爪:%s%s",
+    car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, lim);
   return buf[0] != '\0';
 }
