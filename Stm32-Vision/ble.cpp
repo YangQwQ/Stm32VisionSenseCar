@@ -13,6 +13,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
+// 放开本地 MTU：本 core 用 NimBLE 后端（sdkconfig CONFIG_BT_NIMBLE_ENABLED=y，preferred MTU=256）。
+// 手机 gdble 连接后即请求协商较大 MTU，若不把 server 侧 preferred MTU 显式设上，NimBLE 默认响应
+// 到 23 → 手机 status=133 "MTU negotiation failed" → GATT 未就绪 → 连接判失败断开。
+// 头文件已被 BLEDevice.h 间接引入（ble_att_set_preferred_mtu 返回 int，忽略返回值即可）。
+#include "host/ble_att.h"
+
 // UUID（与 Ctrl-App net/ble/BleProfile.gd 逐字 mirror——改一侧必须同步另一侧）。
 // 服务 0000C0DE-…，特征 c0e0(ssid) c0e1(pass) c0e2(ai_url) c0e3(ai_key)
 //       c0e4(ai_model) c0e5(cmd) c0e6(status: 读/通知)。广播名 VisionS3。
@@ -67,8 +73,19 @@ static String build_status(const char* reply) {
 static void notify_status(const char* reply) {
   if (!g_status_char) return;
   String s = build_status(reply);
-  g_status_char->setValue((uint8_t*)s.c_str(), s.length());
-  g_status_char->notify();  // core 3.x 已移除 getNotifyProperty()；特征含 NOTIFY 即可通知
+  // 按 ≤MTU 的片多次 notify（手机端按"能解析出完整 JSON"拼接）。NimBLE 单包 notify 只发
+  // MTU-3 字节，超长会截断导致手机 Parse JSON failed。配合 ble_att_set_preferred_mtu(256)
+  // 后单片 200B 安全；若协议栈仍未升 MTU（保守 23），长 status 仍会被截——需先烧含该调用的固件。
+  const size_t chunk = 200;
+  size_t len = s.length(), off = 0;
+  if (len == 0) { g_status_char->setValue((uint8_t*)"{}", 2); g_status_char->notify(); return; }
+  while (off < len) {
+    size_t n = (len - off) > chunk ? chunk : (len - off);
+    g_status_char->setValue((uint8_t*)s.c_str() + off, n);
+    g_status_char->notify();
+    off += n;
+    if (off < len) vTaskDelay(pdMS_TO_TICKS(2));  // 给收端缓冲时间，避免连发丢片
+  }
 }
 
 // ---------------- GATT 回调 ----------------
@@ -145,6 +162,9 @@ void ble::init() {
   if (g_server) return;
   BLEDevice::init("VisionS3");  // 广播名，手机扫描按 name 过滤
   BLEDevice::setPower(ESP_PWR_LVL_P9);  // core 3.x 发射功率枚举改为 _P9 封顶（对应 +9dBm）
+  // 放开本地 MTU：手机 gdble 连接后即请求协商较大 MTU，不设则 NimBLE 响应到 23，
+  // 手机收到 status=133 → "MTU negotiation failed" → GATT 未就绪 → 连接判失败断开。
+  ble_att_set_preferred_mtu(256);
 
   g_q = xQueueCreate(8, sizeof(char*));
 

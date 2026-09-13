@@ -139,6 +139,13 @@ func stop_scan() -> void:
 	_ble.stop_scan()
 
 func connect_device(address: String, display_name: String = "") -> bool:
+	# 连接前停掉任何进行中的扫描（含双断恢复扫描），避免 scan/connect 并发抢蓝牙射频
+	# 造成 "scan already active" 抖动与连接不稳定。
+	_recovery_active = false
+	_pending_target_addr = ""
+	_auto_target_addr = ""
+	if _ble.get_ble_state() == "scanning":
+		_ble.stop_scan()
 	return _ble.connect_device(address, display_name)
 
 func disconnect_device() -> void:

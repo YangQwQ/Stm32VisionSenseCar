@@ -23,6 +23,10 @@ signal status_received(data: Dictionary)
 const SCAN_DURATION := 8.0
 const BP := preload("res://net/ble/BleProfile.gd")
 
+## 长 status（配网/IP 等）分片拼接窗口：板端按 ≤MTU 多次 notify，收端在此毫秒内累积。
+## 独立 JSON 通知直接解析成功、不混入缓冲；窗口过期则丢弃旧残片防串。
+const _STATUS_JOIN_WINDOW_MS := 500
+
 var _state := "off"      # off / unavailable / initializing / idle / scanning / connecting / connected
 var _mgr: Node = null
 var _initialized := false
@@ -36,6 +40,10 @@ var _dev: Variant = null            # BleDevice (RefCounted)，connect_device �
 var _dev_addr := ""
 var _dev_name := ""
 var _gatt_ready := false            # 服务发现完成、可读写
+
+# status 分片拼接缓冲（见 _STATUS_JOIN_WINDOW_MS）
+var _status_buf := ""
+var _status_deadline_ms := 0
 
 func get_ble_state() -> String:
 	return _state
@@ -374,11 +382,21 @@ func _handle_status_bytes(data: PackedByteArray) -> void:
 	var text := data.get_string_from_utf8()
 	if text.is_empty():
 		return
-	var parsed = JSON.parse_string(text)
+	var now := Time.get_ticks_msec()
+	# 分片拼接：板端长 status 会按片多次 notify（单片 ≤MTU）。连续片段在 _STATUS_JOIN_WINDOW_MS
+	# 内累积，直到能解析出完整 JSON 才上抛；独立的一次性 JSON 通知直接解析成功、不混入缓冲。
+	if not _status_buf.is_empty() and now > _status_deadline_ms:
+		_status_buf = ""  # 上一段残片窗口已过：丢弃，避免拼到新通知上
+	_status_buf += text
+	_status_deadline_ms = now + _STATUS_JOIN_WINDOW_MS
+	var parsed = JSON.parse_string(_status_buf)
 	if parsed is Dictionary:
+		_status_buf = ""
 		status_received.emit(parsed)
+	elif _status_buf.length() > 4096:
+		_status_buf = ""  # 防御：异常超长直接丢弃
 	else:
-		print("[BLE] status 非 JSON: ", text)
+		print("[BLE] status 分片待拼: %dB" % _status_buf.length())
 
 # ============================== 清理 ==============================
 
