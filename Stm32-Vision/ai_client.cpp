@@ -287,6 +287,25 @@ static void esc_append(PsaBuf& b, const char* s) {
   b.put('"');
 }
 
+// 裁剪字符串尾部的残缺 UTF-8 序列：固定缓冲截断常切在汉字中间，残留半个字节会让云端判
+// "invalid unicode code point" 400。原地修改；合法 UTF-8 输入不受影响。
+static void utf8_clamp_tail(char* buf) {
+  size_t n = strlen(buf), e = n, ncont = 0;
+  while (e > 0) {
+    unsigned char ch = (unsigned char)buf[e - 1];
+    if ((ch & 0xC0) == 0x80) { e--; ncont++; continue; }        // 续字节：继续回退
+    int need;
+    if (ch < 0x80) break;                                       // ASCII 结尾：完整
+    else if ((ch & 0xE0) == 0xC0) need = 1;
+    else if ((ch & 0xF0) == 0xE0) need = 2;
+    else if ((ch & 0xF8) == 0xF0) need = 3;
+    else break;                                                 // 非法引导字节：不动
+    if (ncont < need) e--;                                      // 续字节不足：连同引导字节一起删
+    break;
+  }
+  if (e != n) buf[e] = 0;
+}
+
 static void b64_append(PsaBuf& b, const uint8_t* in, size_t inlen) {
   static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   size_t i = 0;
@@ -480,12 +499,19 @@ static void car_update_pose(const char* type, const JsonObjectConst& p) {
   }
 }
 
+// 同一物体判定：精确同名，或首字相同且长度差≤3。
+static bool name_same_obj(const char* a, const char* b) {
+  int la = (int)strlen(a), lb = (int)strlen(b);
+  if (la == 0 || lb == 0) return false;
+  if (!strcmp(a, b)) return true;
+  return a[0] == b[0] && abs(la - lb) <= 3;
+}
 // 把一次"车头系坐标"观测写入物体记忆表：入表时立即用**观测时刻**的车位姿转成全局坐标，
 // 历史观测各自已是全局坐标，融合直接取中位数。不再依赖"当前"车位姿，避免随车移动漂移。
 static void mem_store(const char* name, float wx, float wy) {
   int slot = -1, oldest = 0;
   for (int i = 0; i < AI_MEM_MAX; i++) {
-    if (g_mem[i].valid && g_mem[i].name[0] && !strcmp(g_mem[i].name, name)) { slot = i; break; }
+    if (g_mem[i].valid && g_mem[i].name[0] && name_same_obj(g_mem[i].name, name)) { slot = i; break; }
     if (!g_mem[i].valid) { slot = i; break; }
     if (g_mem[i].t_ms < g_mem[oldest].t_ms) oldest = i;
   }
@@ -591,16 +617,18 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   sys.put("或 {\"type\":\"arm_pose\",\"params\":{\"x\":10,\"h\":4},\"reason\":\"..\"} 直接把夹爪末端移动到指定位姿（一步到位）：x=轴前方 cm（可达约4..15），h=夹爪中心离地高度 cm（越高夹爪越抬、越低越贴近地面）。夹取前最推荐用它把夹爪调到与目标高度匹配；不可达时不会移动，请改 x/h 重试；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
   sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 保持当前所有动作不变，原地等待观察：当还在运动中没到目标、或者画面没变化、或者还没锁定目标时，用 wait；");
-  sys.put("规则：1. 只输出 JSON，每次只规划一步；回复务必简短——思考放在 reason（中文一句），不要输出长篇推理或解释。2.画面多轮无变化、或需要观察环境/还没锁定目标时，优先用 原地旋转(spin) 小幅环视探索视角；障碍物挡路则尝试绕行；绕行多轮仍无进展才 stop 并说明原因。3.停车信号只认明确手势：掌心正对镜头且五指张开、在镜头前持续上下/左右挥手、或人持续挡在车前，此时才 stop；人只是坐着、抬手或手指出现在画面里，不是停车信号。4.单手指向或手臂指向某一方向=操作者的方向指示，应朝该方向移动；画面中标出目标时朝标注区域移动，不要因为出现人手就停车。5.若目标是纯判断/评估类（含“判断”“是否”“能不能”“可达”“能不能到达”等），以判断优先于移动：不要朝标注区域移动，输出 stop 或 wait 并在 reason 里直接给出结论（如“该位置在对面，不可到达”）。6.目标为空或“巡视”时持续小幅原地旋转(spin)环视四周。7.结合上一轮执行情况与本轮画面判断目标是否已达成或仍在视野：画面暂未出现目标时，优先按规则10做盲区判定，勿因单帧未见就继续前进或误判已完成。8. reason 一句中文简要解释，但必须含目标方位：相对小车的左/中/右 + 距离（约x cm）+ 是否已贴近/被夹爪遮挡；若目标消失，写明最后已知方位与推断（如“最后在偏左约10cm，现在应在车头右前方，右转找回”），供下轮决定转向或后退，避免走过头后盲目环视。9. 摄像头俯视能看到小车整体（含夹爪）。画面无镜像、无颠倒，所见即真实方位：画面左侧=小车左前方、画面右侧=小车右前方、画面中央=正前方；夹爪指向前=小车正前方。直接按画面判断左右，禁止任何镜像/翻转/视差换算。10.目标先前可见且在近处、随后画面中消失（尤其上一步是前进靠近）——先不要假定\"进了盲区\"或\"被机械臂挡了\"：机械臂已很少遮挡目标。目标消失的常见原因是 ①移出画面边缘（转向过头/偏离），②已过近落进两夹板之间（这时两板根部可见但目标被板挡住）。此时绝对禁止继续往前撞；优先用空间记忆（车向+已记物体方位）推断目标现在应在哪个方向，据此转向找回或小距离后退让它重新入画，确认方位后再靠近。仅当确系被机械臂本体遮挡（收臂/伸出/高位时臂体正挡在目标方向）才用 收臂 home 抬摄像头重新观察。11.最后贴近夹取时目标必然被夹爪遮住而消失，属正常：按最后已知位置直接 clip，不要再前进。12.夹爪是两片平行夹板，装机在高位侧俯视时可看到夹爪；“爪:合”只代表夹爪伺服已闭合到位，绝不代表夹住了物体。判断是否夹住必须验证：夹取后执行 arm lift_up 抬臂，目标被带离地面、或仍在两板间随夹爪抬起才算夹住；目标仍在地面或夹爪空合则未夹住，应 release 后重试或调整高度。13.合爪前确认目标位于两夹板之间且贴近夹板根部；目标在两板外侧或下方较远处时合爪必然夹空。夹取类任务不得仅凭“爪:合”或画面接近就 stop done 宣告成功，必须先完成抬臂验证。14.机械臂已很少遮挡目标（摄像头高位俯视），目标不可见几乎都是移出画面边缘或落进两板之间。遇目标暂时不可见：先凭空间记忆（车向 + 已记物体全局方位）推断目标应在哪个方向，转向对准那个方向找回；原地小幅旋转换视角也行，但不要无方向地连续原地打转或盲目前进。15.可输出额外字段 \"carry_prev\":true——当你需要下一轮同时收到本轮画面做前后对比时置位：例如已锁定目标/正在追踪、或即将移动担心目标进盲区需要对比判定时。下轮你会同时收到上一帧与当前帧，据此判断目标是否移动/进入盲区。无需对比时保持单帧以节省开销。16.状态里“抓手:前Xcm 高Ycm”是夹爪末端轴前方与离地高度（前向运动学），据此判断能否/还需伸多远、目标在当前抓手高度是否合适；继续朝受限方向动作不会改变位置时（到顶/缩到底），应换方向或调整姿态。17.发现目标在夹爪轴线的左前方/右前方时，务必先原地转向（spin 或 move+steering）把夹爪轴线对准目标方向，再小步前进；绝对不要朝着斜侧目标直线猛冲——目标很近会撞倒、较远会错过或钻进两夹板间隙。对准后每步前进量宜小（≤10cm），并走一步停一步复查画面。18.夹取前必须先把夹爪高度调到与目标匹配，夹爪悬空过高必然夹空：目标贴地时（沙漏/水瓶等在地面上）h 取 2~5cm；目标有一定高度时估其腰部离地高度，两夹板中心对准腰部。判断目标高度参考画面：夹爪两板张开时可见，其张开宽度约 3~4cm 可当标尺，对比目标在画面中的相对大小估计高度。对准后先用 arm_pose 把夹爪调到该高度，再前进贴近到两板之间，最后 clip；夹空（抬臂验证目标未离地）后，调整高度 h 重试而非反复在原高度空夹。19.可输出额外字段 \"observe\":{\"name\":\"沙漏\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录画面中物体的位置：name=物体名（你想记住的都行），px/py=物体中心在画面中的归一化坐标，坐标系与你看到的画面完全一致、不要做任何翻转/镜像/变换：左上角=(0,0)、右下角=(1,1)、画面中心=(0.5,0.5)、正右=px增大、正下=py增大。visible=false 表示该物体当前不在画面中。报位置时优先用 px/py（程序会换算成地面坐标，比目测距离准得多）；只有无法给出像素时才用 rel_deg/dist_cm 兜底（rel_deg=相对当前车头角度正=右负=左，dist_cm=距离）。程序会记住并后续以\"当前车头局部系\"喂回给你（如\"车向:35°；沙漏 右偏20°约25cm\"）。车向角 0°=任务开始时的车头方向，逆时针为正（左转为正）；程序已按当前车向把记忆换算好，你直接照此判断方位即可、无需自己换算。注意：记忆仅供参考，画面所见永远为准——看到就刷新 observe，看不到就报 visible=false；画面中物体位置与记忆明显不符说明物体被移动或车已转向，一律以画面为准更新。目标不在画面时，用记忆里的全局坐标结合当前车向，推断它应在车头局部系的哪个方向（右偏/左偏多少度、约多远），直接转向那个方向去找，不要无方向瞎转。20.状态行\"抓手:前Xcm 高Ycm\"与\"车向\"均为程序合成/累积的近似值，做粗粒度参考即可，精细动作仍以画面判断为准。");
+  sys.put("可选附加字段（可加在任意指令 JSON 里）：\"carry_prev\":true（下轮带上本帧做前后对比）；\"observe\":{\"name\":\"沙漏\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录物体位置：name=物体名（同一物体务必保持同名），px/py=物体中心归一化坐标 左上(0,0)右下(1,1)，visible=false=当前不在画面；优先用 px/py（程序换算地面坐标，准得多），无法给出像素时用 \"rel_deg\":-20,\"dist_cm\":25 兜底（rel_deg 相对当前车头 正=右负=左）；");
+  sys.put("规则: 1. 只输出 JSON, 每次只规划一步，若任务不要求实际行动可以 stop; 回复务必简短——思考放在 reason。2. reason 一句中文简要解释, 需包含目标方位: 相对小车的左/中/右 + 是否已贴近/被夹爪遮挡; 若目标消失, 写明最后已知方位与推断(如“最后在偏左处, 现在应在车头右前方, 右转找回”), 供下轮决定转向或后退, 避免走过头后盲目环视。3. 旋转时使用 原地旋转(spin) ，需要观察环境/还没锁定目标时优先用小幅环视探索视角。4. 若有障碍物挡路或有明显高低差的区域则尝试绕行，若绕行多轮仍无进展或人持续挡在车前, 做出示意停止的手势，则可以 stop 并说明原因。5. 记录任务相关物体的位置用 observe 字段（格式见上方指令区）：同一物体务必保持同名，报位置优先用 px/py（程序换算地面坐标并喂回\"当前车头局部系\"，如\"车向:35°; 沙漏 右偏20°约25cm\"；车向 0°=任务开始车头方向）。记忆仅供参考, 画面所见永远为准——看到就刷新 observe, 看不到就报 visible=false; 画面与记忆不符说明物体被移动或车已转向, 一律以画面为准更新。目标不在画面时, 可用记忆里的全局坐标结合当前车向推断目标方位。6. 目标先前可见且在近处、随后画面中消失(尤其上一步是前进靠近)。可以尝试回退操作或根据空间记忆转向找回目标，若空间记忆推断目标方位十分接近, 可能被阻挡，则应选择先前的移动，确认方位后再靠近。当确认目标被机械臂本体遮挡可用 收臂 home。7. 画面右下角为小车的夹爪，其朝向为小车朝向，画面中心经过小车正前方。状态里“抓手:前Xcm 高Ycm”是夹爪夹心与离地高度, 若画面不好判断可据此判断能否夹住目标及当前抓手高度是否合适; 继续朝受限方向动作不会改变位置时(到顶/缩到底), 应换方向或调整姿态。8. 发现目标在左前方/右前方时, 先原地转向对准目标, 正对目标且距离小于10时可以尝试使用arm_pose控制夹子移动到目标距离和高度尝试夹取, 高度应选择目标高度的一半或者明显适合夹取的高度，无法确认合适高度时选择较低的高度，夹爪松开时宽度3cm，可以用来作为推测长度的方式9. 夹爪是两片平行夹板, 装机在高位侧俯视时可看到夹爪; “爪:合”只代表夹爪伺服已闭合到位, 绝不代表夹住了物体。判断是否夹住必须执行 arm lift_up 抬臂, 检查目标是否随夹爪抬起; 目标仍在地面或夹爪空合则未夹住, 应 release 后调整高度或重新对准。10. 需要下一轮同时收到本轮画面做前后对比时，输出额外字段 \"carry_prev\":true（格式见上方指令区）。例如发现目标、或即将移动担心目标进盲区需要对比判定时。下轮你会同时收到上一帧与当前帧, 据此判断目标是否移动/进入盲区。");
   { // 画面标定：从顶部 CAL_* 宏读取，改一处即可应对镜头松动后整体调参
-    char cal[768];
+    char cal[1280];   // 标定文案（格式化后约 0.96KB，加长文案前核对足量，防截断半个汉字致云端 400）
     snprintf(cal, sizeof(cal),
              "画面标定（摄像头左前高位俯视，无镜像；数值为近似值，画面所见永远优先）：屏幕越往下越近——"
              "最底部横带贴近夹爪（0cm）、屏幕中心约车前%dcm正前、中心到顶部一半约%dcm、顶部约%dcm；"
              "中横带左边缘中点约车左%dcm、右边缘中点约车右%dcm（左右不对称因镜头偏左）。"
              "这套标定假设小车前方地面基本水平；若目标明显不在同一高度（桌面/台阶/被垫高，或前方高低差），"
              "该距离标定不成立、勿套用；此时只据画面判断大致方向与偏向，距离以状态或合理推断给个大约范围。"
-             "近距时夹爪相对目标高低看不清，一律以状态抓手:前Xcm 高Ycm 为准微调，不要靠画面猜高矮。",
+             "近距时夹爪相对目标高低看不清，一律以状态抓手:前Xcm 高Ycm 为准微调，不要靠画面猜高矮。"
+             "夹爪回正（非 home 收臂）状态时，夹爪正下方/两板之间在画面约 (0.7, 0.8)——目标出现在该点附近且进入两板之间可尝试合爪。",
              CAL_FWD_MID_CM, CAL_FWD_MIDTOP_CM, CAL_FWD_TOP_CM, CAL_SIDE_LEFT_CM, CAL_SIDE_RIGHT_CM);
     sys.put(cal);
   }
@@ -993,6 +1021,39 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
 }
 #endif  // http_exchange 已废弃，改用 HTTPClient
 
+// 手动读取 chunked 响应体。HTTPClient 的 chunked 解码在 TLS 明文空窗期（响应跨多个 TCP 段、
+// 段间隙数据未到）会因 readBytes 遇 read()==-1 立即判死 → READ_TIMEOUT → 断连，实测正文只
+// 剩一个 TCP 段（1448B）被截断。这里改用"读不到就短延时重试"直到超时/连接关闭，根除截断。
+static bool read_chunked_body(WiFiClientSecure& c, String& body, unsigned long timeout_ms) {
+  unsigned long t0 = millis();
+  auto rd = [&]() -> int {                    // 读 1 字节；无明文则等待（-1 = 超时/断连）
+    while (millis() - t0 < timeout_ms) {
+      if (c.available()) {
+        int b = c.read();
+        if (b >= 0) return b;
+      }
+      if (!c.connected()) return -1;
+      delay(2);
+    }
+    return -1;
+  };
+  for (;;) {
+    String hdr;                               // chunk size 行（可能带 ";扩展"）
+    int ch;
+    while ((ch = rd()) >= 0 && ch != '\n') hdr += (char)ch;
+    if (ch < 0) return false;
+    hdr.trim();
+    long sz = strtol(hdr.c_str(), nullptr, 16);
+    if (sz <= 0) return true;                 // 末块；忽略可能存在的 trailer
+    for (long i = 0; i < sz; i++) {
+      ch = rd();
+      if (ch < 0) return false;
+      body += (char)ch;
+    }
+    if (rd() < 0 || rd() < 0) return false;   // 块尾 \r\n
+  }
+}
+
 static bool http_post(const char* url, const char* key, const char* body, String& resp,
                       unsigned long gen) {
   (void)gen;  // 代际/中断判断由调用方（worker 循环）负责；cancel 走 g_client.stop()
@@ -1013,9 +1074,11 @@ static bool http_post(const char* url, const char* key, const char* body, String
     s_tls_cfg = true;
   }
   for (int pass = 0; pass < 2; pass++) {
+    resp = "";                                              // 清残留：失败重试时防上次部分字节叠加
     if (pass == 1 && g_client.connected()) { g_client.stop(); }  // 复用失败：彻底断开，全新握手
     HTTPClient http;
     http.setReuse(true);                    // 成功即保留连接供下轮复用
+    http.collectAllHeaders(true);           // 保存响应头，供判断 Transfer-Encoding（默认不收集）
     if (!http.begin(g_client, url)) { Serial.println("[ai] HTTPClient begin 失败"); return false; }
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", String("Bearer ") + String(key));
@@ -1035,15 +1098,27 @@ static bool http_post(const char* url, const char* key, const char* body, String
       http.end();
       return false;
     }
-    resp = http.getString();                // HTTPClient 已自动解码 chunked；模型简短，落堆可接受
-    http.end();                             // 成功即保留连接，下轮复用
+    // 读响应体：chunked 走手动解码（规避上述 TLS 明文空窗截断）；Content-Length 路径
+    // writeToStreamDataBlock 外层循环会重试短读，getString 安全。
+    if (http.header("Transfer-Encoding").indexOf("chunked") >= 0) {
+      if (!read_chunked_body(g_client, resp, AI_HTTP_TIMEOUT_MS)) {
+        g_client.stop();                      // 截断/超时：弃用复用连接
+        http.end();
+        if (pass == 0) continue;              // pass1 全新握手重发同 body
+        return false;
+      }
+    } else {
+      resp = http.getString();                // CL 路径：模型简短，落堆可接受
+    }
+    http.end();                               // 成功即保留连接，下轮复用
     return resp.length() > 0;
   }
   return false;
 }
 
 // 从响应提取 choices[0].message.content；同时打印 reasoning_content（思考过程，截断防刷屏）。
-static bool extract_content(const String& resp, String& content) {
+// broken: 解析失败时置 true（多半是传输层截断/复用残留，调用方应弃用复用连接）
+static bool extract_content(const String& resp, String& content, bool* broken = nullptr) {
   // 若响应是 SSE 文本（chunked-SSE 解码产物）：按行取 data: 负载拼成最终 JSON
   String payload = resp;
   if (resp.startsWith("data:") || resp.indexOf("\ndata:") >= 0) {
@@ -1081,6 +1156,7 @@ static bool extract_content(const String& resp, String& content) {
   }
   JsonDocument doc(&g_js_alloc);
   if (deserializeJson(doc, payload)) {
+    if (broken) *broken = true;  // 解析失败即视为连接可疑：截断/残留污染，调用方弃用复用连接
     // 解析失败诊断：打印完整 payload + 结构判据（判断是状体被拼断/chunked 泄漏/SSE 多段拼接）。
     auto sanitize = [](String s) {
       for (int i = 0; i < s.length(); i++) {
@@ -1294,7 +1370,7 @@ static void ai_worker(void*) {
         // 每轮取一次插话（一次性消费，读完清空）：喂进本轮 prompt，避免旧插话残留或重复塞 AI。
         char chat_now[256] = {0};
         xSemaphoreTake(g_mtx, portMAX_DELAY);
-        if (g_chat_has) { strncpy(chat_now, g_chat, sizeof(chat_now) - 1); g_chat_has = false; }
+        if (g_chat_has) { strncpy(chat_now, g_chat, sizeof(chat_now) - 1); utf8_clamp_tail(chat_now); g_chat_has = false; }
         xSemaphoreGive(g_mtx);
         // 上一帧是否带上：仅由 AI 上轮 carry_prev=true 决定（锁定/追踪意图），其余保持单帧省开销。
         bool use_prev = want_prev && prev_len > 0;
@@ -1321,10 +1397,12 @@ static void ai_worker(void*) {
         if (t.generation != m_generation) { done = true; interrupted = true; break; }  // 在途结果作废
 
         String content;
-        if (!extract_content(resp, content)) {
+        bool body_broken = false;
+        if (!extract_content(resp, content, &body_broken)) {
           // 解码成功但无有效内容（瞬态错误体/空 content 等）：打印原始片段便于定位
           Serial.printf("[ai] 响应无内容，原始(前120B): %s\n", resp.substring(0, 120).c_str());
           fail = "AI 响应无内容";
+          if (body_broken) g_client.stop();  // 传输层截断/残留：弃用复用连接，下次全新握手防污染
           continue;  // 空内容→重试，不终止
         }
 
