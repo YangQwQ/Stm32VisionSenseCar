@@ -10,6 +10,7 @@ const BT_ITEM := preload("res://ui/bluetooth/BTDeviceListItem.tscn")
 @onready var _joystick: VirtualJoystick = $BodyControl/CtrlArea/Joystick
 @onready var _wifi_popup: PanelContainer = $WifiPopup
 @onready var _editor: Control = $ImageEditor
+var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 
 @onready var _refresh_btn: Button = $BodyBTScan/RefreshBtn
 @onready var _device_vbox: VBoxContainer = $BodyBTScan/DeviceList/VBox
@@ -34,6 +35,7 @@ const BT_ITEM := preload("res://ui/bluetooth/BTDeviceListItem.tscn")
 
 var _joy_held := false
 var _last_joy_cmd := Vector2.ZERO  # 上一次真正下发的摇杆指令（模拟值量化后对比用）
+var _last_spin_active := false     # 原地旋转模式下当前是否在转（避免斜向切换时漏停残余自转）
 # 摇杆量化档：死区内不动作；速度分 低速/高速 两档；转向固定档。仅档位变化才发 move，松手发 stop。
 const _JOY_DEADZONE := 0.15
 const _JOY_SLOW := 0.5
@@ -74,6 +76,8 @@ func _ready() -> void:
 	DeviceConn.text_received.connect(_on_ws_text)
 	DeviceConn.frame_received.connect(_on_frame)
 	DeviceConn.state_changed.connect(_on_ble_state)
+	# /append：聊天区发起的"从图库选图"由 Main 弹出系统文件选择器并打开标注编辑器。
+	_chat_panel.image_pick_requested.connect(_on_chat_image_pick_requested)
 
 	# 用 toggled + bind 页码；按钮同属一个 ButtonGroup，互斥单选。
 	_nav_bt.toggled.connect(_on_nav_toggled.bind(0))
@@ -192,12 +196,13 @@ func _on_scan_finished(devices: Array) -> void:
 		if not (raw_addr is String) or (raw_addr as String).is_empty():
 			continue
 		var addr: String = raw_addr as String
-		if _device_seen.has(addr):
+		# 去重 key 统一小写：gdble 个别调用对地址大小写不一致，避免同一设备以不同 case 重复入列
+		if _device_seen.has(addr.to_lower()):
 			continue
 		var nm: String = str(dd.get("name", addr))
 		if nm.is_empty():
 			nm = addr
-		_device_seen[addr] = nm
+		_device_seen[addr.to_lower()] = nm
 		_add_device_card(nm, addr)
 	if _device_seen.is_empty():
 		_show_empty_hint()
@@ -212,12 +217,13 @@ func _on_device_found(device: Dictionary) -> void:
 	if not (raw_addr is String) or (raw_addr as String).is_empty():
 		return
 	var addr: String = raw_addr as String
-	if _device_seen.has(addr):
+	# 去重 key 统一小写（同 scan_finished）
+	if _device_seen.has(addr.to_lower()):
 		return
 	var nm: String = str(device.get("name", addr))
 	if nm.is_empty():
 		nm = addr
-	_device_seen[addr] = nm
+	_device_seen[addr.to_lower()] = nm
 	_add_device_card(nm, addr)
 	# 启动自连：发现目标地址即在卡片弹出同时自动连接（清空待匹配防重复）。
 	if _startup_connect_addr != "" and addr.to_lower() == _startup_connect_addr:
@@ -274,9 +280,10 @@ func _on_device_connected(_address: String, name: String) -> void:
 	var ai: Dictionary = _pending_ai
 	_pending_provision = {}
 	_pending_ai = {}
-	if wifi.is_empty() and ai.is_empty():
-		return
+	# Bug1：BLE 连上后拉一次状态，同步 LED/夹爪 + AI 运行态（覆盖纯蓝牙控制、无 WS 场景）。
+	# WS 连上时 _on_ws_connected 也会补发 get_state，二者幂等无副作用。
 	await _wait_gatt_ready()
+	AppState.send_command(CP.get_state())
 	if not wifi.is_empty():
 		if DeviceConn.provision(str(wifi.get("ssid", "")), str(wifi.get("password", ""))):
 			_chat_panel.chat("提示", "已下发 WiFi: %s | 板子可能重启，稍后会自动重连" % str(wifi.get("ssid", "")))
@@ -306,7 +313,12 @@ func _on_ble_status(data: Dictionary) -> void:
 		if json.parse(txt) == OK and json.data is Dictionary:
 			parsed = json.data
 			var t: String = str(parsed.get("type", ""))
-			if t == "pong":
+			if t == "state":
+				# get_state 经 BLE 通道回传：同步直控按钮 + AI 运行态（同 WS 通道，见 _apply_state）。
+				_apply_state(parsed as Dictionary)
+				_update_status()
+				return
+			elif t == "pong":
 				txt = "pong"
 			elif parsed.has("params"):
 				var pm: Variant = parsed.get("params")
@@ -394,6 +406,11 @@ func _apply_state(data: Dictionary) -> void:
 	var lights: Variant = stm.get("lights")
 	if lights is Dictionary:
 		$BodyControl/CtrlArea.call("sync_state", lights, bool(stm.get("grip_close", false)))
+	# Bug1：连接成功后 get_state 回传 ai_busy，用板端真实 AI 运行态纠正本地「中止/发送」按钮，
+	# 覆盖任务失败/掉线等本地漏更新场景（done 未及时回传）。
+	var ai_busy: Variant = stm.get("ai_busy")
+	if ai_busy is bool:
+		_chat_panel.set_ai_running(ai_busy as bool)
 
 func _on_ws_connected() -> void:
 	_chat_panel.chat("板", "WS 已连接")
@@ -527,6 +544,52 @@ func _on_annotate_pressed() -> void:
 		return
 	_editor.call("open", tex)
 
+## /append：打开系统文件选择器选一张图片（懒建 FileDialog）。
+## 选择后压缩到 ~20KB、用现有标注编辑器标注，采用后进入附件列表（Main.tscn 已连 image_sent）。
+func _on_chat_image_pick_requested() -> void:
+	if _pick_dialog == null:
+		_pick_dialog = FileDialog.new()
+		_pick_dialog.title = "选择图片"
+		_pick_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+		_pick_dialog.access = FileDialog.ACCESS_FILESYSTEM
+		_pick_dialog.use_native_dialog = true  # Android 上走系统 SAF 文件选择器（4.6+ 内置，无需插件）
+		_pick_dialog.filters = PackedStringArray(["*.png ; PNG 图片", "*.jpg ; JPG 图片", "*.jpeg ; JPEG 图片"])
+		_pick_dialog.file_selected.connect(_on_pick_file)
+		var pics: String = OS.get_system_dir(OS.SYSTEM_DIR_PICTURES)
+		if not pics.is_empty():
+			_pick_dialog.current_dir = pics
+		add_child(_pick_dialog)
+	_pick_dialog.popup_centered()
+
+func _on_pick_file(path: String) -> void:
+	var img := Image.new()
+	if img.load(path) != OK:
+		_chat_panel.chat("提示", "图片读取失败: %s" % path)
+		return
+	img = _compress_to_target(img, 20480)  # 压缩到 ~20KB，避免把大图发给板端/AI
+	if img == null:
+		_chat_panel.chat("提示", "图片压缩失败（未能压到 20KB 内）")
+		return
+	_editor.call("open", ImageTexture.create_from_image(img))
+
+## 把图压到 ≤ max_bytes（JPEG）：先降质量，仍超则等比缩宽后再降质，返回压缩后 Image。
+## 0=用原宽（仅降质）；宽度从大到小、质量从高到低，命中 ≤max_bytes 即返回（尽量清晰）。
+func _compress_to_target(img: Image, max_bytes: int) -> Image:
+	var widths := [0, 1600, 1280, 1024, 800, 640, 480, 360]
+	var qualities := [0.88, 0.76, 0.64, 0.52, 0.40, 0.30]
+	for w: int in widths:
+		var cur: Image = img
+		if w > 0 and img.get_width() > w:
+			cur = img.duplicate()
+			cur.resize(w, maxi(int(round(img.get_height() * float(w) / float(img.get_width()))), 1))
+		for q: float in qualities:
+			var buf: PackedByteArray = cur.save_jpg_to_buffer(q)
+			if buf.size() > 0 and buf.size() <= max_bytes:
+				var out := Image.new()
+				if out.load_jpg_from_buffer(buf) == OK:
+					return out
+	return null
+
 func _on_editor_cancelled() -> void:
 	pass  # 取消 = 放弃这张图，不影响输入框与已附图
 
@@ -558,17 +621,23 @@ func _update_joystick() -> void:
 	var steering := 0.0
 	if absf(v.x) >= _JOY_DEADZONE:
 		steering = signf(v.x) * _JOY_STEER
-	var cmd := Vector2(throttle, steering)
+	# 原地旋转模式下摇杆斜向（左右+前后同时有效）：原地转与前进物理互斥，忽略转向、只前进/后退。
+	# 普通（转向舵）模式保留"一边转弯一边前进"的原有行为。
+	var spin_mode: bool = _spin_mode_btn.button_pressed
+	var diagonal: bool = spin_mode and absf(v.x) >= _JOY_DEADZONE and absf(v.y) >= _JOY_DEADZONE
+	# cmd 仅做"是否变化"的去重；斜向时 steering 归零，避免单独触发自转。
+	var cmd := Vector2(throttle, 0.0 if diagonal else steering)
 	if cmd == _last_joy_cmd:
 		return
 	_last_joy_cmd = cmd
 	# 摇杆操作 = 手动接管：打断板端 AI 闭环，聊天发送按钮恢复「发送」
 	_chat_panel.set_ai_running(false)
 	if cmd == Vector2.ZERO:
-			# 松手/居中：停四轮；原地旋转模式下停旋转，否则转向回正
+			# 松手/居中：停四轮；原地旋转模式下停旋转（复位自转态），否则转向回正
 			AppState.send_command(CP.drive(0))
-			if _spin_mode_btn.button_pressed:
+			if spin_mode:
 				AppState.send_command(CP.spin(0))
+				_last_spin_active = false
 			else:
 				AppState.send_command(CP.servo(0, _SERVO_CENTER))
 			return
@@ -578,9 +647,13 @@ func _update_joystick() -> void:
 	if throttle < 0:
 		drive_spd = -drive_spd
 	AppState.send_command(CP.drive(clampi(drive_spd, -1000, 1000)))
-	if _spin_mode_btn.button_pressed:
-		if absf(steering) >= _JOY_DEADZONE:
-			AppState.send_command(CP.spin(1 if steering > 0 else -1, _SPIN_SPEED))
+	if spin_mode:
+		# 原地旋转模式：仅纯左右（非斜向）才自转；斜向/前进时若此前在转则补停残余自转。
+		var want_spin: bool = (not diagonal) and absf(steering) >= _JOY_DEADZONE
+		var want_dir: int = 1 if steering > 0 else -1
+		if want_spin != _last_spin_active:
+			AppState.send_command(CP.spin(want_dir if want_spin else 0, _SPIN_SPEED))
+			_last_spin_active = want_spin
 	else:
 		AppState.send_command(CP.servo(0, clampi(
 			_SERVO_CENTER + int(round(steering / _JOY_STEER * _SERVO_RANGE)), 50, 250)))
@@ -588,10 +661,12 @@ func _update_joystick() -> void:
 func _on_joystick_pressed(_v: Variant = null) -> void:
 	_joy_held = true
 	_last_joy_cmd = Vector2.ZERO
+	_last_spin_active = false
 
 func _on_joystick_release(_v: Variant = null) -> void:
 	_joy_held = false
 	_last_joy_cmd = Vector2.ZERO
+	_last_spin_active = false
 	_chat_panel.set_ai_running(false)
 	AppState.send_command(CP.drive(0))
 	if _spin_mode_btn.button_pressed:

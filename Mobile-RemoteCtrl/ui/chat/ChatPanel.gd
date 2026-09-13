@@ -10,6 +10,8 @@ extends VBoxContainer
 
 signal stream_requested(on: bool)
 signal grid_requested(on: bool)
+## /append 请求：Main 弹出系统文件选择器选图，读图后打开标注编辑器。
+signal image_pick_requested()
 
 const CP := preload("res://net/proto/CommandProto.gd")
 const MAX_IMAGES := 3
@@ -152,6 +154,28 @@ func _on_del_pressed(index: int) -> void:
 	_refresh_bottom()
 	_message_input.grab_focus()
 
+## 保存当前图传画面（/snapshot，本地操作，不下发板子）。
+## 优先写相册 Pictures 目录；失败或 Android 分区存储限制时兜底写应用 user:// 目录。
+func _snapshot() -> void:
+	var img: Image = AppState.current_image
+	if img == null or img.is_empty():
+		chat("提示", "暂无可保存的画面（先开启图传、等画面出现）")
+		return
+	var dirs := PackedStringArray()
+	var pictures: String = OS.get_system_dir(OS.SYSTEM_DIR_PICTURES)
+	if not pictures.is_empty():
+		dirs.append("%s/CarVisionSnapShot" % pictures)
+	dirs.append("user://CarVisionSnapShot")
+	for d: String in dirs:
+		if d.is_empty():
+			continue
+		DirAccess.make_dir_recursive_absolute(d)
+		var path: String = "%s/car_%d.jpg" % [d, Time.get_unix_time_from_system()]
+		if img.save_jpg(path) == OK:
+			chat("提示", "已保存画面: %s" % path)
+			return
+	chat("提示", "截图保存失败（无写入权限）")
+
 ## 把附件列表渲染进 3 个图片槽位（Image1..3，按加入顺序），多余的槽位隐藏。
 func _render_images() -> void:
 	for i in _panels.size():
@@ -169,16 +193,26 @@ func _render_images() -> void:
 
 func _on_input_text_changed(_new_text: String) -> void:
 	_refresh_bottom()
+	_refresh_send_btn()
 
 func _on_send_pressed(_new_text: String = "") -> void:
-	# AI 任务执行中：按钮语义已切换为「中止」，按下即打断任务并急停，不发输入内容。
+	var text: String = _message_input.text.strip_edges()
+	# AI 任务执行中：决定是"插话/发指令"还是"中止"。
+	#  - 输入框非空 → 临时为发送语义：插话（纯文本）/ 指令（/ 前缀，板端自决定是否打断）。
+	#  - 输入框空 → 中止（打断任务并急停）。
 	if _ai_running:
-		_abort_ai()
+		# AI 运行中：仅"有输入文本"才是插话/发指令语义；空文本一律中止（避免发空插话、静默丢弃附件）。
+		if text.is_empty():
+			_abort_ai()
+		else:
+			_send_during_ai(text)
 		return
-	if _message_input.text.strip_edges().is_empty() and _attachments.is_empty():
+	# 非 AI 态：Button 用 toggle_mode 承载，这里按下后立即复位按下态，假装普通按钮（Bug2）。
+	_send_btn.set_pressed_no_signal(false)
+	if text.is_empty() and _attachments.is_empty():
 		return
 	if not _attachments.is_empty():
-		var plain: String = _message_input.text.strip_edges()
+		var plain: String = text
 		# 仅 /ai 指令支持带图；其他 / 指令与图冲突，提示后保留输入与附件。
 		if plain.begins_with("/") and not plain.begins_with("/ai"):
 			chat("提示", "该指令不支持带图（图片仅支持 /ai 或直接输入文字目标）")
@@ -193,7 +227,6 @@ func _on_send_pressed(_new_text: String = "") -> void:
 		else:
 			_send_image_goal(batch, plain)
 		return
-	var text: String = _message_input.text.strip_edges()
 	_message_input.text = ""
 	_push_to_history(text)
 	_refresh_bottom()  # 输入清空后指令提示隐藏（无图时）
@@ -202,13 +235,46 @@ func _on_send_pressed(_new_text: String = "") -> void:
 	else:
 		_send_ai_goal(text)
 
-## 切换 AI 执行中状态，同步发送按钮文字（发送 ↔ 中止）。Main 摇杆手动接管时也会调用。
-func set_ai_running(run: bool) -> void:
-	if _ai_running == run:
+## AI 任务执行中发送：纯文本→插话补信息（不打断），/ 指令→正常下发（板端自行决定是否接管打断）。
+func _send_during_ai(text: String) -> void:
+	_message_input.text = ""
+	_push_to_history(text)
+	_refresh_bottom()
+	_refresh_send_btn()
+	if text.begins_with("/"):
+		# 指令原样下发：手动直驱类（/move /stop 等）板端会接管打断 AI，属预期；旁路类不打断。
+		_handle_slash(text)
+		# 手动接管类指令已令板端取消 AI，但旁路类不打断。这里把接管类本地同步复位「中止」，
+		# 避免板端已停任务、手机按钮却残留「中止」（接管后被中断的任务不会回补 done）。
+		var verb := text.get_slice(" ", 0).to_lower()
+		if verb in ["/move", "/drive", "/spin", "/servo", "/motor", "/arm",
+					"/arm_pose", "/reset", "/stop", "/cancel", "/stopai"]:
+			set_ai_running(false)
 		return
+	chat("本机", "插话·%s" % text)
+	if not AppState.send_command(CP.ai_chat(text)):
+		chat("提示", "插话未发送（当前离线）")
+
+## 切换 AI 执行中状态。Main 摇杆手动接管 / 板端 done / 连接同步都会调用。
+## Bug1：连接成功后经 get_state.ai_busy 同步板端真实运行态，以此纠正本地按钮。
+func set_ai_running(run: bool) -> void:
 	_ai_running = run
-	_send_btn.button_pressed = run
-	_send_btn.text = "中止" if run else "发送"
+	_refresh_send_btn()
+
+## 刷新发送按钮形态：
+##  - AI 运行且无输入 → 「中止」按下态（toggle 卡住）；
+##  - AI 运行且有输入 → 临时「发送」（插话），取消按下态；
+##  - 非 AI → 「发送」普通按钮（按下态永远复位）。
+func _refresh_send_btn() -> void:
+	var typing: bool = not _message_input.text.strip_edges().is_empty()
+	if _ai_running and not typing:
+		_send_btn.text = "中止"
+		if not _send_btn.button_pressed:
+			_send_btn.set_pressed_no_signal(true)
+	else:
+		_send_btn.text = "发送"
+		if _send_btn.button_pressed:
+			_send_btn.set_pressed_no_signal(false)
 
 ## 中止 AI：打断进行中的任务并急停（板端 ai_cancel 打断闭环并补停残留持续指令）。
 func _abort_ai() -> void:
@@ -352,6 +418,16 @@ func _handle_slash(text: String) -> void:
 				g_on = ga != "off" and ga != "0" and ga != "false"
 			chat("本机", text)
 			grid_requested.emit(g_on)
+			return
+		"/snapshot":
+			# 保存当前图传画面到相册/应用目录（本地，不下发板子）。
+			chat("本机", text)
+			_snapshot()
+			return
+		"/append", "/append_image", "/append image":
+			# 从系统图库选一张图 → 打开标注编辑器 → 采用后作为附件。
+			chat("本机", text)
+			image_pick_requested.emit()
 			return
 		"/exec_log":
 			# 本地直驱状态实时推送开关（默认关）：/exec_log [on|off]

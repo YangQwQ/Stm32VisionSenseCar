@@ -86,6 +86,11 @@ static size_t g_edited_len = 0;
 static uint64_t g_edited_ts = 0;
 static SemaphoreHandle_t g_img_mtx = nullptr;
 
+// AI 任务进行中"插话"缓冲（ai_chat 写入、worker 每轮消费一次，受 g_mtx 保护）。
+// 一次性消费：喂进下一轮 prompt 后清空，避免重复塞给 AI。
+static char g_chat[256] = {0};
+static bool g_chat_has = false;
+
 // TLS 客户端（worker 唯一实例）：cancel/set_goal 可从其他任务 stop() 中止在途请求。
 static WiFiClientSecure g_client;
 
@@ -102,7 +107,7 @@ static int16_t s_car_heading = 0;
 
 // 物体记忆表（通用：AI 觉得值得记的都记）。程序存全局坐标，喂给 AI 时一律换算成
 // "当前车头局部系"（相对车头角度+距离），AI 零换算。stale=每轮未观测+1（过期不清空）。
-// 每条保留最近 AI_OBS_N 次车头系观测，取中位数融合——DeepSeek 单次报的像素/角度方差大
+// 每条保留最近 AI_OBS_N 次观测，取中位数融合——DeepSeek 单次报的像素/角度方差大
 // （轮间跳变、reason 与 observe 字段不一致），中位数对单次离谱值鲁棒，防记忆被污染。
 #define AI_MEM_MAX 8
 #define AI_OBS_N 5
@@ -112,8 +117,7 @@ static struct {
   uint32_t t_ms;       // 最近观测时刻
   int16_t stale;       // 0=新鲜；每轮未观测 +1；>20 时不再喂回
   bool valid;
-  float hx[AI_OBS_N], hy[AI_OBS_N];  // 车头系观测环形缓冲（记录时各自的车头角在 hh）
-  int16_t hh[AI_OBS_N];              // 每条观测对应的车头角（融合时转全局用）
+  float hx[AI_OBS_N], hy[AI_OBS_N];  // 各次观测的全局坐标环形缓冲（入表时已按当时车位姿转换）
   uint8_t hn, hi;                    // 已存数量 / 写指针
 } g_mem[AI_MEM_MAX];
 static const float AI_PI = 3.14159265358979f;
@@ -315,14 +319,16 @@ static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
 // （曾算出 H=(480,-567)）；QR 不放大条件数，double 软件模拟也够。QR 失败/回验超差时
 // 回退 PC 预计算的硬编码常量。标定点 CAL_N 可增（≥4），新增实测点直接往表里加即可。
 // 实测校准点（屏幕归一化 0..1 → 车头系地面 cm）：
-#define CAL_N 14
+#define CAL_N 16
 static const double CAL_UV[CAL_N][2] = {
   {0.5,0.25},{0.25,0.375},{0.25,0.5},{0.25,0.75},{0.25,1.0},{0.0,1.0},{0.0,0.75},
-  {0.75,0.125},{0.5,1.0},{0.75,0.25},{0.75,0.5},{0.75,0.75},{1.0,0.5},{1.0,0.75}
+  {0.75,0.125},{0.5,1.0},{0.75,0.25},{0.75,0.5},{0.75,0.75},{1.0,0.5},{1.0,0.75},
+  {0.5,0.5},{0.5,0.75}
 };
 static const double CAL_XY[CAL_N][2] = {
   {40,134},{-50,242},{-45,112},{-38,48},{-34,23},{-64,36},{-105,90},
-  {78,85},{-15,14},{45,55},{16,26},{1.5,12},{23,13},{7,6}
+  {78,85},{-15,14},{45,55},{16,26},{1.5,12},{23,13},{7,6},
+  {0,52},{-8,21}
 };
 
 // 当前生效的单应 + 归一化参数（QR 求解后为动态值；回退时为 fallback 常量）
@@ -331,14 +337,14 @@ static double SU_MU, SU_S, SV_MU, SV_S, SX_MU, SX_S, SY_MU, SY_S;
 static bool s_h_ok = false;
 
 // PC 高精度预计算常量（QR 不可靠时的回退；由上述 CAL_* 经 DLT 归一化最小二乘得出）
-static const double SU_MU_FB = 0.5,                 SU_S_FB = 0.2857142857142857;
-static const double SV_MU_FB = 0.6071428571428571,  SV_S_FB = 0.25;
-static const double SX_MU_FB = -10.035714285714286, SX_S_FB = 40.107142857142868;
-static const double SY_MU_FB = 64.0,                SY_S_FB = 49.0;
+static const double SU_MU_FB = 0.5,                 SU_S_FB = 0.25;
+static const double SV_MU_FB = 0.609375,            SV_S_FB = 0.234375;
+static const double SX_MU_FB = -9.28125,            SX_S_FB = 35.75390625;
+static const double SY_MU_FB = 60.5625,             SY_S_FB = 45.0234375;
 static const double H_FALLBACK[8] = {
-  0.60143113350335875, -0.24375293926870129, 0.085187899550564716,
-  -0.75630851952496025, -0.76604382688550554, -0.6000131115682783,
-  0.43120841755020961, 0.45749816959869866
+  0.57946103365278445, -0.262075586380767, 0.086826435788850409,
+  -0.69161767976051913, -0.75044489509584567, -0.58084272202547371,
+  0.3788047424521348, 0.42448448567962926
 };
 
 // Householder QR 求解超定最小二乘 Ah≈b（m=2N 方程, n=8 未知）→ h 写回 H。
@@ -474,9 +480,8 @@ static void car_update_pose(const char* type, const JsonObjectConst& p) {
   }
 }
 
-// 把一次"车头系坐标"观测写入物体记忆表（同名刷新，满则覆盖最旧）。
-// 观测历史按各自记录时的车头角转成全局坐标后取中位数——DeepSeek 单次观测方差大，
-// 中位数对单次离谱值鲁棒；车头角变化也被正确补偿（各观测转同一全局系再融合）。
+// 把一次"车头系坐标"观测写入物体记忆表：入表时立即用**观测时刻**的车位姿转成全局坐标，
+// 历史观测各自已是全局坐标，融合直接取中位数。不再依赖"当前"车位姿，避免随车移动漂移。
 static void mem_store(const char* name, float wx, float wy) {
   int slot = -1, oldest = 0;
   for (int i = 0; i < AI_MEM_MAX; i++) {
@@ -486,20 +491,21 @@ static void mem_store(const char* name, float wx, float wy) {
   }
   if (slot < 0) slot = oldest;                        // 满：覆盖最旧
   strncpy(g_mem[slot].name, name, 15); g_mem[slot].name[15] = 0;
-  // 压入本次观测（记录当前车头角）
-  g_mem[slot].hx[g_mem[slot].hi] = wx;
-  g_mem[slot].hy[g_mem[slot].hi] = wy;
-  g_mem[slot].hh[g_mem[slot].hi] = s_car_heading;
+  // 车头系 (wx右+, wy前+) → 全局：heading 逆时针正（左转+），前=(-sin,cos)、右=(cos,sin)
+  float h = s_car_heading * AI_PI / 180.0f, ch = cosf(h), sh = sinf(h);
+  float gx0 = s_car_x + wx * ch - wy * sh;
+  float gy0 = s_car_y + wx * sh + wy * ch;
+  // 压入本次观测（全局坐标）
+  g_mem[slot].hx[g_mem[slot].hi] = gx0;
+  g_mem[slot].hy[g_mem[slot].hi] = gy0;
   g_mem[slot].hi = (g_mem[slot].hi + 1) % AI_OBS_N;
   if (g_mem[slot].hn < AI_OBS_N) g_mem[slot].hn++;
-  // 历史观测各自转全局后取中位数
+  // 历史观测（已是全局）直接取中位数
   float gxl[AI_OBS_N], gyl[AI_OBS_N];
   for (int i = 0; i < g_mem[slot].hn; i++) {
     int idx = (g_mem[slot].hi - g_mem[slot].hn + i + AI_OBS_N) % AI_OBS_N;  // 最旧→最新
-    float h = g_mem[slot].hh[idx] * AI_PI / 180.0f;
-    float ch = cosf(h), sh = sinf(h);
-    gxl[i] = s_car_x - g_mem[slot].hx[idx] * ch + g_mem[slot].hy[idx] * sh;
-    gyl[i] = s_car_y + g_mem[slot].hx[idx] * sh + g_mem[slot].hy[idx] * ch;
+    gxl[i] = g_mem[slot].hx[idx];
+    gyl[i] = g_mem[slot].hy[idx];
   }
   g_mem[slot].gx = median_n(gxl, g_mem[slot].hn);
   g_mem[slot].gy = median_n(gyl, g_mem[slot].hn);
@@ -549,8 +555,8 @@ static void mem_feed(char* buf, size_t cap) {
     if (!g_mem[i].valid || g_mem[i].stale > 20) continue;   // 太久(>20轮)才不喂，避免环视中记忆过早消失
     float dx = g_mem[i].gx - s_car_x, dy = g_mem[i].gy - s_car_y;
     float dist = sqrtf(dx * dx + dy * dy);
-    float thg = atan2f(dx, dy) * 180.0f / AI_PI;      // 全局角（相对 Y+，逆时针+）
-    int rel = (int)roundf(s_car_heading - thg);        // rel 正=右
+    float thg = atan2f(dx, dy) * 180.0f / AI_PI;      // 目标方位（相对 Y+，右转正）
+    int rel = (int)roundf(s_car_heading + thg);        // heading 逆时针正(左转+)；rel 正=右
     rel = (rel + 540) % 360 - 180;                     // wrap -180..180
     n += snprintf(buf + n, cap - n, "；%s %s%u°约%.0fcm",
                   g_mem[i].name, rel >= 0 ? "右偏" : "左偏", (unsigned)abs(rel), dist);
@@ -567,7 +573,7 @@ static void mem_feed(char* buf, size_t cap) {
 // 有 edited 时带编辑图；prev 非空时带上一帧做周期性双帧运动对比，否则单帧。
 static void build_body(PsaBuf& b, const char* goal, const char* ann, const char* hint,
                        const char* last_cmd, const char* exec_state, unsigned last_age_s,
-                       const char* hist,
+                       const char* hist, const char* chat,
                        const uint8_t* frame, size_t frame_len,
                        const uint8_t* prev, size_t prev_len,
                        bool use_edited, const uint8_t* edited, size_t edited_len) {
@@ -613,6 +619,8 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
     ut.put(age);
   }
   if (hist && hist[0]) { ut.put(hist); ut.put("；"); }
+  // 用户插话（ai_chat 喂入，不打断任务）：以最高优先级提示 AI 采纳/修正当前计划。
+  if (chat && chat[0]) { ut.put("操作者插话（重要，请据此调整当前计划，不必停车/结束任务）："); ut.put(chat); ut.put("。"); }
   { // 空间记忆喂回（车向 + 已记物体，当前车头局部系）
     char mem_s[192];
     mem_feed(mem_s, sizeof(mem_s));
@@ -989,8 +997,8 @@ static bool http_post(const char* url, const char* key, const char* body, String
                       unsigned long gen) {
   (void)gen;  // 代际/中断判断由调用方（worker 循环）负责；cancel 走 g_client.stop()
   g_last_status = 0;  // 入口重置，避免沿用上一轮 4xx/429 误判
-  ai::logf("[ai] TLS前 freeHeap=%u maxBlock=%u freePsram=%u",
-           ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getFreePsram());
+//   ai::logf("[ai] TLS前 freeHeap=%u maxBlock=%u freePsram=%u",
+//            ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getFreePsram());
   unsigned long t0 = millis();
   // 连接策略：尽量复用同一条 TLS 连接（省握手、降延迟）。复用的风险是上一次成功响应在
   // ssl_ctx/HTTPClient 留下未读尽的残留，或连接在决策间隙被服务端/半开关掉，导致下一次
@@ -1013,7 +1021,7 @@ static bool http_post(const char* url, const char* key, const char* body, String
     http.addHeader("Authorization", String("Bearer ") + String(key));
     int code = http.POST(body);             // body 为 PSRAM C 串；流式发送、不整体拷内部堆
     g_last_status = code;
-    ai::logf("[ai] POST 完成 code=%d ~%u ms rssi=%d", code, (unsigned)(millis() - t0), (int)WiFi.RSSI());
+    // ai::logf("[ai] POST 完成 code=%d ~%u ms rssi=%d", code, (unsigned)(millis() - t0), (int)WiFi.RSSI());
     if (code <= 0) {
       ai::logf("[ai] HTTP POST 失败 code=%d pass%d rssi=%d", code, pass + 1, (int)WiFi.RSSI());
       if (pass == 0) { g_client.stop(); http.end(); continue; }   // 复用失败：断开，pass1 全新握手
@@ -1172,6 +1180,8 @@ static void ai_worker(void*) {
 
     unsigned long steps = 0;
     bool done = false;
+    bool sent_done = false;      // 是否已确报过终态 done（正常/单轮/超步数/超连续失败）
+    bool interrupted = false;    // 是否因新目标/手动中断退出（代际变更），此时不发补发 done
     const char* fail = nullptr;
     char err_buf[160];
     // 死循环防线状态：上一步指令短描述 / 连续相同指令计数 / 已注入引导标记。
@@ -1219,7 +1229,7 @@ static void ai_worker(void*) {
       uint64_t step_ts = esp_timer_get_time();  // 本轮起点（周期控制基准）
       fail = nullptr;  // 每轮重置，避免沿用上轮错误文本误导日志/回报
       // 中止检查（代际号变化即本任务作废）；兜底停统一在任务出口解析。
-      if (t.generation != m_generation) { Serial.println("[ai] 被新目标/手动中断"); break; }
+      if (t.generation != m_generation) { Serial.println("[ai] 被新目标/手动中断"); interrupted = true; break; }
       if (!net::is_connected()) { snprintf(err_buf, sizeof(err_buf), "WiFi 掉线"); fail = err_buf; break; }
       if (cfg::ai_key().isEmpty()) { snprintf(err_buf, sizeof(err_buf), "未配置 AI Key"); fail = err_buf; break; }
 
@@ -1281,11 +1291,16 @@ static void ai_worker(void*) {
         PsaBuf body;
         char st[96];  // exec 状态缓冲（含限位提示，需足量避免截断）
         const char* stp = exec::read_state(st, sizeof(st)) ? st : "";  // 本地直驱状态（无执行板，状态本地合成）
+        // 每轮取一次插话（一次性消费，读完清空）：喂进本轮 prompt，避免旧插话残留或重复塞 AI。
+        char chat_now[256] = {0};
+        xSemaphoreTake(g_mtx, portMAX_DELAY);
+        if (g_chat_has) { strncpy(chat_now, g_chat, sizeof(chat_now) - 1); g_chat_has = false; }
+        xSemaphoreGive(g_mtx);
         // 上一帧是否带上：仅由 AI 上轮 carry_prev=true 决定（锁定/追踪意图），其余保持单帧省开销。
         bool use_prev = want_prev && prev_len > 0;
         build_body(body, t.text, t.ann, hint, last_disp, stp,
                    last_act_ms ? (unsigned)((esp_timer_get_time() / 1000 - last_act_ms) / 1000) : 0u,
-                   hist_s,
+                   hist_s, chat_now,
                    frame, frame_len, prev, use_prev ? prev_len : 0,
                    edited != nullptr, edited, edited_len);
         if (!body.ok) { fail = "组装请求 body 失败"; break; }
@@ -1294,7 +1309,7 @@ static void ai_worker(void*) {
         bool http_ok = false;
         for (int nr = 0; nr < 3 && !http_ok; nr++) {   // 网络失败指数退避重试（任务串行，代价可控）
           if (http_post(cfg::ai_url().c_str(), cfg::ai_key().c_str(), body.p, resp, t.generation)) { http_ok = true; break; }
-          if (t.generation != m_generation) { done = true; break; }  // 被中止，静默作废
+          if (t.generation != m_generation) { done = true; interrupted = true; break; }  // 被中止，静默作废
           if (g_last_status >= 400 && g_last_status < 500) {  // 4xx 重发同 body 必然再拒，快速失败
             fail = "云端拒绝(4xx)，疑似参数或限流";
             break;
@@ -1303,7 +1318,7 @@ static void ai_worker(void*) {
         }
         if (done) break;
         if (!http_ok) { if (!fail) fail = "AI 请求失败"; break; }
-        if (t.generation != m_generation) { done = true; break; }  // 在途结果作废
+        if (t.generation != m_generation) { done = true; interrupted = true; break; }  // 在途结果作废
 
         String content;
         if (!extract_content(resp, content)) {
@@ -1334,8 +1349,7 @@ static void ai_worker(void*) {
           // 校验通过 → 执行 move/arm/stop（本板直驱，不再经执行板），记录时刻供时间感知。
           exec::act(type, params);
           last_act_ms = (unsigned long)(esp_timer_get_time() / 1000);
-          // 空间记忆：按 move/spin 定距/定角更新车姿态；解析 AI observe 更新物体记忆表。
-          car_update_pose(type, params);
+          // 空间记忆：先解析 AI observe（用**动作前**的车位姿把观测转全局），再按 move/spin 更新车姿态。
           if (cmdD["observe"].is<JsonObject>()) {
             JsonObjectConst ob = cmdD["observe"].as<JsonObjectConst>();
             const char* nm = ob["name"] | "";
@@ -1352,6 +1366,7 @@ static void ai_worker(void*) {
               }
             }
           }
+          car_update_pose(type, params);
           // 无里程计兜底：AI 无定距的持续 move 单次最多行驶 AI_MOVE_CAP_MS，到期由 exec 自动停轮；
           // 带 distance_cm 的定距 move 已在 send_move 按时长近似自停，不叠加持续兜底。
           if (!strcmp(type, "move") && !params["distance_cm"].is<int>() &&
@@ -1387,6 +1402,7 @@ static void ai_worker(void*) {
           // 不带 done 的 stop 仅临时停车观察，任务继续下一轮。严格按 bool 判定，防模型输出字符串 "true"。
           if (!strcmp(type, "stop") && cmdD["done"].is<bool>() && cmdD["done"].as<bool>()) {
             done = true;
+            sent_done = true;   // 已向手机确报终态，任务出口不再补发
             Serial.println("[ai] AI 判定任务完成（stop+done）");
           }
           got = true;
@@ -1411,6 +1427,7 @@ static void ai_worker(void*) {
         e["done"] = true;
         String s = build_feedback(t.id, e);
         enqueue_result(s.c_str(), t.fn, t.ctx);
+        sent_done = true;   // 单轮已确报终态
         done = true;
         break;
       }
@@ -1421,6 +1438,8 @@ static void ai_worker(void*) {
           const char* reason = "云端持续无响应（疑似限流），任务已中止，请稍后重试";
           JsonDocument e(&g_js_alloc);
           e["error"] = reason;
+          e["done"] = true;   // Bug1：终结必带 done，让手机端把「中止」复位为「发送」
+          sent_done = true;
           String s = build_feedback(t.id, e);
           enqueue_result(s.c_str(), t.fn, t.ctx);
           Serial.println("[ai] 连续网络失败超限，任务中止");
@@ -1444,6 +1463,7 @@ static void ai_worker(void*) {
 
       if (++steps >= AI_MAX_STEPS_PER_GOAL) {
         JsonDocument e(&g_js_alloc); e["done"] = true; String s = build_feedback(t.id, e); enqueue_result(s.c_str(), t.fn, t.ctx);
+        sent_done = true;
         break;
       }
       // 周期控制：以 AI_INTERVAL_MS 为下限节奏，扣掉本轮已耗时（含抓帧/HTTP/校验），
@@ -1451,6 +1471,17 @@ static void ai_worker(void*) {
       uint64_t el = esp_timer_get_time() - step_ts;
       long rem = (long)AI_INTERVAL_MS - (long)(el / 1000);
       if (rem > 0) vTaskDelay(pdMS_TO_TICKS(rem));
+    }
+
+    // 任务终结补发 done：覆盖失败/掉线等"只报 error 不带 done"的终态（Bug1），
+    // 让手机端把「中止」复位为「发送」。被新目标/手动中断（interrupted）时跳过，
+    // 避免把下一任务的按钮状态误复位。正常 stop+done / 单轮 / 超步数已置 sent_done，不再补发。
+    if (!interrupted && !sent_done) {
+      JsonDocument e(&g_js_alloc);
+      e["done"] = true;
+      if (fail) e["error"] = fail;
+      String s = build_feedback(t.id, e);
+      enqueue_result(s.c_str(), t.fn, t.ctx);
     }
 
     if (edited) free(edited);
@@ -1507,6 +1538,7 @@ void ai::set_goal(const char* text, bool use_image, const char* annotation, long
                   cmd::ReplyFn reply, void* reply_ctx, bool one_shot) {
   xSemaphoreTake(g_mtx, portMAX_DELAY);
   ++m_generation;
+  g_chat_has = false;   // 新目标清除上一任务的残留插话，避免串任务
   // 替换旧槽（旧字符串为空因 worker 已取走；残余则释放）
   if (g_slot.text) free(g_slot.text);
   if (g_slot.ann) free(g_slot.ann);
@@ -1542,3 +1574,17 @@ void ai::cancel(StopMode m) {
 }
 
 bool ai::busy() { return m_busy; }
+
+bool ai::append_chat(const char* text) {
+  if (!text || !text[0]) return false;
+  xSemaphoreTake(g_mtx, portMAX_DELAY);
+  bool fed = m_busy;  // 仅当有任务在跑才接收插话
+  if (fed) {
+    strncpy(g_chat, text, sizeof(g_chat) - 1);
+    g_chat[sizeof(g_chat) - 1] = 0;
+    g_chat_has = true;
+    Serial.printf("[ai] 插话入队: %s\n", text);
+  }
+  xSemaphoreGive(g_mtx);
+  return fed;
+}

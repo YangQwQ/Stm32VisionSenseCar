@@ -153,7 +153,8 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     lights["vibe"]  = exec::light_on("vibe");
     lights["back"]  = exec::light_on("back");
     params["grip_close"] = exec::grip_closing();
-    if (has_id(doc)) out["id"] = doc["id"].as<long>();
+	params["ai_busy"] = ai::busy();   // Bug1：手机连接成功后同步板端 AI 运行态，纠正「中止/发送」按钮
+	if (has_id(doc)) out["id"] = doc["id"].as<long>();
     String s;
     serializeJson(out, s);
     if (reply) { reply(reply_ctx, s.c_str()); }
@@ -207,6 +208,19 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     // 显式取消 AI 任务：残留持续指令会在任务出口补停（≠强制停车）。
     ai::cancel(ai::StopMode::All);
     reply_status(doc, reply, reply_ctx, "AI 任务已取消");
+    return;
+  }
+
+  if (!strcmp(type, "ai_chat")) {
+    // AI 任务进行中"插话"：把用户补充喂给当前任务，不打断（区别于 ai_goal/ai_cancel）。
+    // 无任务在跑时忽略，仅回执提示——不当作新目标接管。
+    const char* msg = params["message"] | "";
+    if (!msg[0]) {
+      reply_status(doc, reply, reply_ctx, "ai_chat: message 为空");
+      return;
+    }
+    bool fed = ai::append_chat(msg);
+    reply_status(doc, reply, reply_ctx, fed ? "已补充给 AI（任务继续）" : "当前无进行中的 AI 任务，补充被忽略");
     return;
   }
 

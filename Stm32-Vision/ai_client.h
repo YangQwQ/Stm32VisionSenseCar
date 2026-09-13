@@ -26,6 +26,10 @@ enum class StopMode : uint8_t { None, Wheels, All };
 void cancel(StopMode m = StopMode::All);  // 中止当前任务（新目标 / 手动指令 / ai_cancel）
 bool busy();                              // 是否有任务进行中（BLE status.ai_busy 用）
 
+// AI 任务进行中"插话"：把用户补充文本追加进当前任务上下文，不打断任务（区别于 set_goal）。
+// 返回是否有任务在跑（true=已入队，worker 下一轮连同 prompt 一起喂给模型）。
+bool append_chat(const char* text);
+
 // AI 调试日志：始终写串口；ai_log 开关开启且任务回传通道在位时，同时把该行
 // 以 {"type":"ai_log","text":..} 推送当前手机（复用 ai_result 的回传队列）。
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));

@@ -63,6 +63,11 @@ static func ai_cancel() -> Dictionary:
 	# 取消当前 AI 任务（板侧须手动/新目标也能中止；此指令离线经 BLE 兜底也可用）。
 	return {"type": "ai_cancel", "params": {}, "id": _new_id()}
 
+static func ai_chat(message: String) -> Dictionary:
+	# AI 任务进行中「插话」：把补充文本喂给正在运行的任务，不打断（区别于 ai_goal 的接管）。
+	# 无任务在跑时板端忽略并回执提示。非 BLACKLISTED 类型，支持 BLE 兜底。
+	return {"type": "ai_chat", "params": {"message": message}, "id": _new_id()}
+
 static func ai_oneshot(message: String, annotation: Dictionary = {}, use_image: bool = false) -> Dictionary:
 	# 单轮 AI：板侧只执行一次决策即自动收尾（区别于 ai_goal 的迭代闭环）。参数同 ai_goal。
 	var params: Dictionary = {"message": message}
@@ -109,30 +114,13 @@ static func move_dist(throttle: float, cm: int, steering: float = 0.0) -> Dictio
 	# 定距移动：油门+距离cm，板端按时长近似到时自停（无里程计，粗略，供微操/标定）。
 	return {"type": "move", "params": {"throttle": throttle, "steering": steering, "distance_cm": cm}, "id": _new_id()}
 
-## /help 文案：可用指令说明（仅供本地展示，不下发板子）。
+## /help 文案：由 COMMAND_HINTS 生成（唯一事实源，避免重复维护）；特殊说明在此追加。
 static func help_lines() -> PackedStringArray:
-	return PackedStringArray([
-		"/ping [IP|域名]  连通性测试（不带参数=测小车）",
-		"/clear  清空消息区(仅本机)",
-		"/stream [on|off]  图传开关",
-		"/grid [on|off]  图传叠加标定网格（本地，不下发板子）",
-		"/stop [wheels|arm]  停车",
-		"/exec_log [on|off]  实时状态推送开关（默认关)",
-		"/ai_log [on|off]  AI日志推送开关（默认关，开启后AI调试/延迟日志发手机）",
-		"/light <front|vibe|back> <0|1>  直驱灯开关(前/氛围/尾)",
-		"/reset  机械臂+转向回正",
-		"/config <WiFi名> <密码>  配网",
-		"/ai goal <目标>  下发 AI 目标(DIRECT)",
-		"/ai oneshot <目标>  单轮 AI（只执行一次决策）",
-		"/ai cancel  取消当前 AI 任务",
-		"/ws [connect [IP]|disconnect|status]  WS 手动连接/断开/状态",
-		"/connect <IP>  不经蓝牙直连 WS（等同 /ws connect IP）",
-		"/servo <n> <pwm>  直驱机械臂舵机(绕过执行板,调试用)",
-		"/motor <n> <a> <b>  直驱单轮电机(绕过执行板,调试用)",
-		"/drive <speed>  一键全车前进/后退/停(绕过执行板)",
-		"/move <油门> <cm>  定距移动测试(板端按时长近似到点自停)",
-		"直接输入文字 = 以下发 AI 目标; 框选后发文字 = 带区域目标",
-	])
+	var out := PackedStringArray()
+	for cmd: String in COMMAND_HINTS.keys():
+		out.append("%s   %s" % [cmd, COMMAND_HINTS[cmd]])
+	out.append("直接输入文字 = 以下发 AI 目标; 框选后发文字 = 带区域目标")
+	return out
 
 ## 指令提示表：完整指令（语法） → 说明。/help 与输入 / 时的匹配提示共用。
 const COMMAND_HINTS := {
@@ -147,6 +135,8 @@ const COMMAND_HINTS := {
 	"/reset": "机械臂+转向回正",
 	"/config <WiFi名> <密码>": "配网",
 	"/ai [goal|oneshot|cancel] <目标>": "AI 目标 / 单轮 / 取消",
+	"/snapshot": "保存当前图传画面(本地)",
+	"/append": "从图库选一张图，标注后作为附件",
 	"/ws [connect [IP]|disconnect|status]": "WS 手动连接/断开/状态",
 	"/connect <IP>": "不经蓝牙直连 WS",
 	"/servo <n=0转向/1左/2右/3前> <pwm=50..250>": "直驱舵机(可超标定限位)",

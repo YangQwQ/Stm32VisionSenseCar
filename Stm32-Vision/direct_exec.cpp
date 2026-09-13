@@ -152,12 +152,19 @@ static void drive_motors(int spd) {
   nezha::set_motor(4, rev ? 0u : u, rev ? u : 0u);
 }
 
+static void set_steer_pwm(int16_t p);  // 前向声明：send_spin 在回正转向轮时会调用
+
 // 原地旋转（普通四轮滑移式，无需特殊轮子）：左/右侧轮反向拖胎绕中心旋转。
 // dir=+1 左进右退=右转(顺时针) / -1 左退右进=左转(逆时针) / 0 停；speed=单车轮 pwm 0..1000。
 // 车轮映射与 drive_motors 一致：左轮 a 正前、右轮 b 正前，故 dir>0 统一写 (a,0)、dir<0 统一写 (0,b)。
 static void send_spin(const JsonObjectConst& p) {
   int dir = p["dir"] | 0;
   int spd = p["speed"] | 500;
+  // 原地旋转前必须回正转向轮（前轮直行位），否则拖胎方向不纯、转不正（Bug6）。
+  // dir=0（停车）不动舵机，避免每次停转都无谓地 reset 转向。
+  if (dir != 0 && s_steer != STEER_CENTER) {
+    set_steer_pwm(STEER_CENTER);
+  }
   if (dir == 0) spd = 0;  // dir=0 = 停车，speed 必须连同归零，否则默认 500 会让轮子继续转
   if (spd < 0) spd = 0;
   if (spd > 1000) spd = 1000;
