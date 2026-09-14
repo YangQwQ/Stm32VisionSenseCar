@@ -30,6 +30,7 @@
 #define AI_WAIT_FB_MIN_MS 10000   // wait 反馈节流：同一动作少于此间隔只回一条
 #define AI_MOVE_CAP_MS 2000       // AI 持续 move 单次行驶时限（无里程计兜底，防决策间隔内盲走撞墙）
 #define AI_MAX_NET_FAIL 4         // 连续"无有效输出"轮数上限：超过即中止任务并回报（防云端持续无响应时无限空转）
+#define AI_HIST_N 8               // 历史环条数（AI 决策 + 插话共用，满员淘汰最旧）
 
 // ================== 画面标定（摄像头左前高位、俯视；改这些数即可应对镜头被碰歪） ==================
 // 以小车为原点：+y=车前，−y=车后，+x=车右，−x=车左。单位 cm，均为实测近似值，AI 只当粗参考。
@@ -328,7 +329,7 @@ static void b64_append(PsaBuf& b, const uint8_t* in, size_t inlen) {
 static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
   b.put("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,");
   b64_append(b, data, len);
-  b.put("\",\"detail\":\"low\"}}");
+  b.put("\",\"detail\":\"medium\"}}");
 }
 
 // ============ 屏幕像素 → 地面坐标（单应矩阵） ============
@@ -592,32 +593,29 @@ static void mem_feed(char* buf, size_t cap) {
   ai::logf("[ai] 记忆 %s", buf);   // 喂回内容同步到 ai_log，便于观察 AI 看到的物体位置理解
 }
 
-// 构建请求 body。goal 目标文本；ann 标注 JSON 或空；hint 为纠正/引导语（重试或死循环打断）；
-// last_cmd 上一步已下发指令的短描述（含 reason，供 AI 判断上一步效果与目标方位）；
-// exec_state 执行板状态一行文本（无数据为空串）；hist 为"近几步动作+进度"摘要（方位记忆）。
-// 系统提示词 + 目标 + 标注先组进 PSRAM 缓冲，再整体 JSON 转义（内含引号）。
-// 有 edited 时带编辑图；prev 非空时带上一帧做周期性双帧运动对比，否则单帧。
+// 构建请求 body 的结构说明：
+// goal 当前任务目标（可被插话/ task_goal 热替换）；hrole/htext/hn = 历史环条目（角色+文本，
+// 同时含 assistant=AI 决策 与 user=插话），逐条作为独立消息回喂，构成真多轮对话记录；
+// exec_state 执行板状态一行文本（无数据为空串）及"距上次执行"秒数喂当前 user。
+// 系统提示词？（角色+规则+JSON格式+标定，不含目标）+ 独立 user(目标) 消息先组进 PSRAM。
+// 图预算 ≤2：carry_prev 双帧优先（放弃参考图），否则 参考图(首轮)+当前帧。
 static void build_body(PsaBuf& b, const char* goal, const char* ann, const char* hint,
-                       const char* last_cmd, const char* exec_state, unsigned last_age_s,
-                       const char* hist, const char* chat, const char* note, const char* prog,
+                       const char* const* hrole, const char* const* htext, int hn,
+                       const char* exec_state, unsigned last_age_s,
+                       const char* note, const char* prog,
                        const uint8_t* frame, size_t frame_len,
                        const uint8_t* prev, size_t prev_len,
-                       bool use_edited, const uint8_t* edited, size_t edited_len) {
+                       bool use_prev, bool use_edited, const uint8_t* edited, size_t edited_len) {
   PsaBuf sys;
-  sys.put("你是「小车+机械臂」视觉控制大脑。画面中操作者的红色标注（方框/箭头/文字）必须优先遵循。");
-  sys.put("当前任务目标：");
-  sys.put(goal);
-  if (ann && ann[0]) { sys.put("（操作者标注区域："); sys.put(ann); sys.put("）"); }
-  sys.put("上一步已下发：");
-  sys.put(last_cmd && last_cmd[0] ? last_cmd : "无");
-  sys.put("。每次只输出一个合法 JSON：");
+  sys.put("你是「小车+机械臂」视觉控制大脑。画面中若有红色标注（方框/圆圈）需根据要求优先遵循。");
+  sys.put("每次只输出一个合法 JSON：");
   sys.put("{\"type\":\"move\",\"params\":{\"throttle\":0.3,\"steering\":0,\"distance_cm\":30},\"reason\":\"..\"} 移动/转向：离目标距离明确时务必加 distance_cm 定距，幅度宜小防过冲；低速优先 throttle/steering≤0.5；");
   sys.put("或 {\"type\":\"spin\",\"params\":{\"dir\":1,\"angle_deg\":90},\"reason\":\"..\"} 原地旋转(dir: +1右转(顺时针)/-1左转(逆时针)/0停)：保持车头朝向不变原地转动视角，是观察环境/环视四周的推荐转弯方式，须配合前轮保持直行；可选 angle_deg 定角转指定度数，小幅微调或转够观察角度用；");
   sys.put("或 {\"type\":\"arm\",\"params\":{\"act\":\"lift_up\",\"dist_cm\":15},\"reason\":\"..\"} act 取 lift_up/lift_down/reach_forward/reach_backward/clip/release/home（home=收臂折叠回平台，避免遮挡小型物体）");
   sys.put("或 {\"type\":\"arm_pose\",\"params\":{\"x\":10,\"h\":4},\"reason\":\"..\"} 直接把夹爪末端移动到指定位姿：x=车头前方 cm（可达约4..15），h=夹爪中心离地高度 cm（越高夹爪越抬、越低越贴近地面）。夹取前最推荐用它把夹爪调到与目标高度匹配；不可达时不会移动，请改 x/h 重试；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
   sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 空操作，用于不执行移动操作跳过本轮，不会停止正在进行的移动；");
-  sys.put("可选附加字段（可加在任意指令 JSON 里）：\"carry_prev\":true（下轮带上本帧做前后对比）；\"carry_user\":true（下轮带操作者发的参考图，与 carry_prev 二选一，外观难描述时可用）；\"observe\":{\"name\":\"物体名字\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录物体位置：name=物体名（同一物体务必保持同名），px/py=物体在画面上的归一化坐标 左上(0,0)右下(1,1)，visible=false=当前不在画面；优先用 px/py（程序换算地面坐标，准得多），无法给出像素时用 \"rel_deg\":-20,\"dist_cm\":25 兜底（rel_deg 相对当前车头 右正左负）；\"task_note\":\"目标外观/备注\"（任务开始写一次，程序每轮喂回）；\"tasks\":[{\"name\":\"出门\",\"done\":true},{\"name\":\"右转\",\"done\":false}]（新建/重写整个任务列表，低频）；\"task_done\":{\"index\":1,\"done\":true}（标记第N项完成/未完成，index从1起，高频轻量、不用重写列表）；");
+  sys.put("可选附加字段（可加在任意指令 JSON 里）：\"carry_prev\":true（下轮带上本帧做前后对比，用于锁定/追踪）；\"task_goal\":\"新目标文字\"（把插话/新意图提升为当前任务目标，程序会把该文字更新到目标位置并每轮喂回）；\"observe\":{\"name\":\"物体名字\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录物体位置：name=物体名（同一物体务必保持同名），px/py=物体在画面上的归一化坐标 左上(0,0)右下(1,1)，visible=false=当前不在画面；优先用 px/py（程序换算地面坐标，准得多），无法给出像素时用 \"rel_deg\":-20,\"dist_cm\":25 兜底（rel_deg 相对当前车头 右正左负）；\"task_note\":\"目标外观/备注\"（任务开始写一次，程序每轮喂回）；\"tasks\":[{\"name\":\"出门\",\"done\":true},{\"name\":\"右转\",\"done\":false}]（新建/重写整个任务列表，低频）；\"task_done\":{\"index\":1,\"done\":true}（标记第N项完成/未完成，index从1起，高频轻量、不用重写列表）；");
   sys.put("规则: \
 	1. 只输出 JSON, 每次只规划一步，若任务不要求实际行动可以 stop; 回复务必简短——思考放在 reason。\
 	2. reason 一句中文简要解释, 需包含目标方位: 相对小车的左/中/右 + 是否已贴近/被夹爪遮挡; 若目标消失, 写明最后已知方位与推断(如“最后在偏左处, 现在应在车头右前方, 右转找回”), 供下轮决定转向或后退, 避免走过头后盲目环视。\
@@ -629,7 +627,7 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
 	8. 发现目标在左前方/右前方时, 先原地转向对准目标, 正对目标且距离小于10时可以尝试使用arm_pose控制夹子移动到目标距离和高度尝试夹取, 高度应选择目标高度的一半或者明显适合夹取的高度，无法确认合适高度时选择较低的高度，夹爪松开时宽度3cm，可以用来作为推测长度的方式\
 	9. 夹爪是两片平行夹板, 装机在高位侧俯视时可看到夹爪; “爪:合”只代表夹爪伺服已闭合到位, 绝不代表夹住了物体。判断是否夹住必须执行 arm lift_up 抬臂, 检查目标是否随夹爪抬起; 目标仍在地面或夹爪空合则未夹住, 应 release 后调整高度或重新对准。\
 	10. 需要下一轮同时收到本轮画面做前后对比时，输出额外字段 \"carry_prev\":true（格式见上方指令区）。例如发现目标、或即将移动担心目标进盲区需要对比判定时。下轮你会同时收到上一帧与当前帧, 据此判断目标是否移动/进入盲区。\
-	11. 多步任务用 tasks 新建/重写任务列表、task_done 标记第N项完成（index从1起，完成后及时标记，不必重写列表）；task_note 记录目标外观/备注（低频）。程序每轮喂回当前任务列表与笔记，据此推进下一步即可，勿重复推断进度。外观难描述的目标可输出 \"carry_user\":true 持续带参考图（与 carry_prev 二选一）。");
+	11. 多步任务用 tasks 新建/重写任务列表、task_done 标记第N项完成（index从1起，完成后及时标记，不必重写列表）；task_note 记录目标外观/备注（低频）。程序每轮喂回当前任务列表与笔记，据此推进下一步即可，勿重复推断进度。若操作者插话构成新任务/需改目标，用 task_goal 更新当前任务目标即可。");
   { // 画面标定：从顶部 CAL_* 宏读取，改一处即可应对镜头松动后整体调参
     char cal[1280];   // 标定文案（格式化后约 0.96KB，加长文案前核对足量，防截断半个汉字致云端 400）
     snprintf(cal, sizeof(cal),
@@ -643,34 +641,52 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
              CAL_FWD_MID_CM, CAL_FWD_MIDTOP_CM, CAL_FWD_TOP_CM, CAL_SIDE_LEFT_CM, CAL_SIDE_RIGHT_CM);
     sys.put(cal);
   }
-  if (hint && hint[0]) { sys.put("注意："); sys.put(hint); }
 
   b.put("{\"model\":");
   esc_append(b, cfg::ai_model().c_str());
   b.put(",\"messages\":[{\"role\":\"system\",\"content\":");
   esc_append(b, sys.p ? sys.p : "");
-  // 结束 system 对象后接下一消息
-  b.put("},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-  PsaBuf ut;  // user 文本：执行板状态 + 上一指令时长 + 进度/近几步 + 画面引导（整体转义一次）
+  // user(目标)：独立持久消息；目标被 task_goal 热替换时只换这条、不碰 system（保前缀缓存）
+  b.put("},{\"role\":\"user\",\"content\":");
+  {
+    PsaBuf gt;
+    gt.put("任务目标："); gt.put(goal ? goal : "");
+    if (ann && ann[0]) { gt.put("（操作者标注："); gt.put(ann); gt.put("）"); }
+    esc_append(b, gt.p ? gt.p : "");
+  }
+  b.put("}");
+  // 历史环：逐条独立消息（assistant=自己之前的决策 / user=操作者插话），构成真多轮对话记录。
+  // 角色交替保护：若末条是 user 插话，把它并入当前 user 文本，避免"连续两条 user"被严格端点拒。
+  const char* merge_tail = (hn > 0 && !strcmp(hrole[hn - 1], "user")) ? htext[hn - 1] : nullptr;
+  int hn_out = merge_tail ? hn - 1 : hn;
+  for (int i = 0; i < hn_out; i++) {
+    b.put(",{\"role\":");
+    esc_append(b, hrole[i]);
+    b.put(",\"content\":");
+    esc_append(b, htext[i]);
+    b.put("}");
+  }
+  // 当前 user：状态 + 画面（整体转义一次），作为本轮模型的输入
+  b.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+  PsaBuf ut;
   if (exec_state && exec_state[0]) { ut.put(exec_state); ut.put("；"); }
   if (last_age_s > 0) {
     char age[32]; snprintf(age, sizeof(age), "上一指令约%us前执行；", last_age_s);
     ut.put(age);
   }
-  if (hist && hist[0]) { ut.put(hist); ut.put("；"); }
+  if (merge_tail) { ut.put("（操作者前一条插话：" ); ut.put(merge_tail); ut.put("）"); }
   // 任务笔记/任务列表：AI 自己写入并持续喂回（目标外观/计划/各任务状态），无需每轮重新推断。
   if (note && note[0]) { ut.put("任务笔记："); ut.put(note); ut.put("；"); }
   if (prog && prog[0]) { ut.put(prog); ut.put("；"); }  // prog 为已渲染的"任务列表：..."文本
-  // 用户插话（ai_chat 喂入，不打断任务）：以最高优先级提示 AI 采纳/修正当前计划。
-  if (chat && chat[0]) { ut.put("操作者插话（重要，请据此调整当前计划，不必停车/结束任务）："); ut.put(chat); ut.put("。"); }
+  if (hint && hint[0]) { ut.put("注意："); ut.put(hint); ut.put("。"); }
   { // 空间记忆喂回（车向 + 已记物体，当前车头局部系）
     char mem_s[192];
     mem_feed(mem_s, sizeof(mem_s));
     if (mem_s[0]) { ut.put(mem_s); ut.put("；"); }
   }
   if (frame) {
-    if (prev && prev_len > 0) {
-      ut.put("下面按顺序给出：标注图（若有）、上一帧、当前帧。请对比上一帧与当前帧，判断画面中移动的人手/物体大致朝哪个方向移动；若上一步动作已让目标消失，据两帧差异推断目标方位与盲区。");
+    if (use_prev && prev && prev_len > 0) {
+      ut.put("下面按顺序给出：上一帧、当前帧。请对比两帧，判断画面中移动的人手/物体大致朝哪个方向移动；若上一步动作已让目标消失，据两帧差异推断目标方位与盲区。");
     } else if (use_edited && edited) {
       ut.put("下面按顺序给出：操作者参考图、当前帧。参考图用于辨识目标外观/位置，请在当前帧中寻找匹配的目标。");
     } else {
@@ -691,11 +707,12 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
       img_block(b, d, n);
       first = false;
     };
-    if (use_edited && edited) img(edited, edited_len);
-    if (prev && prev_len > 0) img(prev, prev_len);  // 上一帧在前，供对比运动（周期性启用）
+    // 图预算 ≤2：carry_prev 双帧优先（此时放弃参考图）；否则 参考图(首轮)+当前帧
+    if (use_prev && prev && prev_len > 0) img(prev, prev_len);
+    else if (use_edited && edited) img(edited, edited_len);
     img(frame, frame_len);
   }
-  b.put("]}],\"max_tokens\":8192,\"reasoning_effort\":\"low\",\"response_format\":{\"type\":\"json_object\"}}");
+  b.put("]}],\"temperature\":0.3,\"max_tokens\":8192,\"reasoning_effort\":\"low\",\"response_format\":{\"type\":\"json_object\"}}");
 }
 
 // 指令短描述（供"上一步已下发"拼接与死循环判定；含运动数值，便于识别"相同指令"）。
@@ -793,6 +810,8 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
   }
   const char* reason = doc["reason"] | "";
   if (reason[0]) out["reason"] = reason;
+  const char* tg = doc["task_goal"] | "";
+  if (tg[0]) out["task_goal"] = tg;   // 选项：把插话/新意图提升为当前任务目标（AI 显式标记）
   if (doc["done"].is<bool>() && doc["done"].as<bool>()) out["done"] = true;  // 任务完结标记
   // carry_prev:true = 下一轮希望同时收到本轮画面做对比（目标锁定/追踪、判断移动后目标方位）。
   // 本字段不进 params，仅作 worker 决策是否带 prev 的信号。
@@ -1196,7 +1215,7 @@ static bool extract_content(const String& resp, String& content, bool* broken = 
   if (rc[0]) {
     String r = rc;
     if (r.length() > 120) r = r.substring(0, 120);
-    ai::logf("[ai] 思考: %s", r.c_str());
+    ai::logf("[ai] 思考: %s", r.c_str());   // 仅调试展示，不回投（决策由完整 reason 承接）
   }
   const char* c = doc["choices"][0]["message"]["content"] | "";
   // 注意：content 为空但 reasoning 有值 = 模型只给了思考没给正式回答（安全终止/条件触达）
@@ -1278,22 +1297,42 @@ static void ai_worker(void*) {
     char err_buf[160];
     // 死循环防线状态：上一步指令短描述 / 连续相同指令计数 / 已注入引导标记。
     char last_cmd[48] = {0}, cur_cmd[48] = {0};
-    char last_disp[256] = {0};  // 发给 AI 的"上一步已下发"（指令+reason，含目标方位，供延续判断）
-    // 近几步动作环形缓冲（方位记忆）：让 AI 知道自己转过几次/走过多远，防重复打转。
-    char act_hist[4][48] = {{0}};
-    int act_hist_n = 0;
-    // 任务内指令类型计数（进度）：让 AI 数得清已发几次 move/spin/...，防"补发"重复执行。
-    static const char* k_type_names[] = {"move", "spin", "arm", "arm_pose", "stop", "wait"};
-    int act_cnt[sizeof(k_type_names) / sizeof(k_type_names[0])] = {0};
     unsigned long last_act_ms = 0;  // 上次真正下执行/微操指令的时刻（ms），供给 AI 算"距上次决策多久"
     int net_fail = 0;           // 连续"无有效输出"轮数（网络/解析失败），用于退避与上限收尾
     int stall = 0;
     bool stall_hint = false;
     bool want_prev = false;     // AI 上轮 carry_prev=true → 本轮带上 prev 帧做对比
-    bool want_user = false;     // AI 上轮 carry_user=true → 本轮带操作者参考图（与 carry_prev 二选一）
     char task_note[192] = {0};  // AI 写入的任务笔记（目标外观/计划），每轮喂回
     struct { char name[48]; bool done; } s_tasks[8] = {{0}};  // AI 维护的任务列表（JSON 更新）
     int s_task_n = 0;
+    // 当前任务目标（独立 user 消息展示；可被 task_goal 热替换）
+    char goal_now[256];
+    snprintf(goal_now, sizeof(goal_now), "%s", t.text ? t.text : "");
+    // 历史环（PSRAM 动态分配）：AI 决策(assistant) + 插话(user) 共用一条管理，满员淘汰最旧。
+    char* hist_text[AI_HIST_N] = {nullptr};
+    const char* hist_role[AI_HIST_N] = {nullptr};   // "assistant" / "user"
+    int hist_n = 0;
+    char task_remind[160] = {0};  // 插话即将被冲掉前的提醒（提示补 task_goal 更新目标），一次性消费
+    auto ps_dup = [](const char* s) -> char* {   // 拷贝到 PSRAM（供历史条用）
+      size_t n = strlen(s);
+      char* p = (char*)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
+      if (p) memcpy(p, s, n + 1);
+      return p;
+    };
+    auto hist_add = [&](const char* role, const char* text) {   // 推入历史环（满则冲掉最旧）
+      char* dup = ps_dup(text);
+      if (!dup) return;
+      if (hist_n < AI_HIST_N) { hist_role[hist_n] = role; hist_text[hist_n] = dup; hist_n++; }
+      else {
+        if (hist_role[0] && !strcmp(hist_role[0], "user"))   // 被冲掉的恰是插话：提醒先 task_goal 更新目标
+          snprintf(task_remind, sizeof(task_remind),
+                   "较早的一条操作者插话即将被历史丢弃；若它表达了新任务/新目标而你还未用 task_goal 更新，请现在更新。");
+        free(hist_text[0]);
+        memmove(hist_text, hist_text + 1, (AI_HIST_N - 1) * sizeof(hist_text[0]));
+        memmove(hist_role, hist_role + 1, (AI_HIST_N - 1) * sizeof(hist_role[0]));
+        hist_text[AI_HIST_N - 1] = dup; hist_role[AI_HIST_N - 1] = role;
+      }
+    };
 
     // 编辑图一次性取快照（供整轮任务复用，避免中途被覆盖）。
     uint8_t* edited = nullptr; size_t edited_len = 0;
@@ -1368,34 +1407,19 @@ static void ai_worker(void*) {
         } else {
           hint = "";
         }
-        // 进度与近几步动作摘要（方位记忆）：供 AI 知道自己转了几次/走过多远，防重复打转
-        char hist_s[256] = {0};
-        int hp = 0;
-        // 任务内指令计数：move×N spin×M ...（仅列出 >0 的，AI 据此不再"补发"已完成的动作）
-        hp += snprintf(hist_s + hp, sizeof(hist_s) - hp, "已发[");
-        int kc = 0;
-        for (int ki = 0; ki < (int)(sizeof(act_cnt) / sizeof(act_cnt[0])) && hp < (int)sizeof(hist_s) - 64; ki++) {
-          if (!act_cnt[ki]) continue;
-          hp += snprintf(hist_s + hp, sizeof(hist_s) - hp, "%s%s×%d", kc++ ? "," : "", k_type_names[ki], act_cnt[ki]);
-        }
-        if (!kc) hp += snprintf(hist_s + hp, sizeof(hist_s) - hp, "无");
-        hp += snprintf(hist_s + hp, sizeof(hist_s) - hp, "] 近几步：[");
-        for (int hi = 0; hi < act_hist_n && hp < (int)sizeof(hist_s) - 48; hi++)
-          hp += snprintf(hist_s + hp, sizeof(hist_s) - hp, "%s%s", hi ? "," : "", act_hist[hi]);
-        hp += snprintf(hist_s + hp, sizeof(hist_s) - hp, "]；第%lu步", (unsigned long)(steps + 1));
-        ai::logf("[ai] %s", hist_s);  // 任务进度与近几步：手机端 /ai_log 直接可见
         PsaBuf body;
         char st[96];  // exec 状态缓冲（含限位提示，需足量避免截断）
         const char* stp = exec::read_state(st, sizeof(st)) ? st : "";  // 本地直驱状态（无执行板，状态本地合成）
-        // 每轮取一次插话（一次性消费，读完清空）：喂进本轮 prompt，避免旧插话残留或重复塞 AI。
+        // 每轮取一次插话（一次性消费，读完清空）：推入历史环作 user 消息，随环一起保留/冲掉。
         char chat_now[256] = {0};
         xSemaphoreTake(g_mtx, portMAX_DELAY);
         if (g_chat_has) { strncpy(chat_now, g_chat, sizeof(chat_now) - 1); utf8_clamp_tail(chat_now); g_chat_has = false; }
         xSemaphoreGive(g_mtx);
+        if (chat_now[0]) { hist_add("user", chat_now); }   // 插话进入共享历史（操作者话语）
         // 上一帧是否带上：仅由 AI 上轮 carry_prev=true 决定（锁定/追踪意图），其余保持单帧省开销。
         bool use_prev = want_prev && prev_len > 0;
-        // 操作者参考图：首轮必带（初始参考）；之后仅 AI carry_user=true 才带（与上一帧二选一）。
-        bool use_edited_now = (steps == 0) || (want_user && edited != nullptr);
+        // 操作者参考图：仅首轮带一次（初始目标外观参考）；之后不续带（已去掉 carry_user）。
+        bool use_edited_now = (steps == 0) && edited != nullptr;
         // 渲染任务列表喂回：任务列表：1.出门[完成] 2.右转[未完成] ...
         char task_s[320] = {0};
         if (s_task_n > 0) {
@@ -1404,11 +1428,23 @@ static void ai_worker(void*) {
             tp2 += snprintf(task_s + tp2, sizeof(task_s) - tp2, "%d.%s[%s] ",
                             ti + 1, s_tasks[ti].name, s_tasks[ti].done ? "完成" : "未完成");
         }
-        build_body(body, t.text, t.ann, hint, last_disp, stp,
+        // 合并本轮提示（在插话 hist_add 之后构建，确保其触发的 task_remind 本轮可见）：
+        // 一次性提醒（插话将冲掉→提示补 task_goal）在前，死循环引导在后
+        char hint_cb[384] = {0};
+        if (task_remind[0]) { snprintf(hint_cb, sizeof(hint_cb), "%s", task_remind); task_remind[0] = 0; }
+        if (hint && hint[0]) {
+          size_t hl = strlen(hint_cb);
+          if (hl) hint_cb[hl++] = '；';
+          snprintf(hint_cb + hl, sizeof(hint_cb) - hl, "%s", hint);
+        }
+        // 历史环逐条喂给 build_body（assistant=AI决策 / user=插话，真多轮对话）
+        build_body(body, goal_now, t.ann, hint_cb,
+                   (const char* const*)hist_role, (const char* const*)hist_text, hist_n,
+                   stp,
                    last_act_ms ? (unsigned)((esp_timer_get_time() / 1000 - last_act_ms) / 1000) : 0u,
-                   hist_s, chat_now, task_note, task_s,
+                   task_note, task_s,
                    frame, frame_len, prev, use_prev ? prev_len : 0,
-                   use_edited_now, edited, edited_len);
+                   use_prev, use_edited_now, edited, edited_len);
         if (!body.ok) { fail = "组装请求 body 失败"; break; }
 
         String resp;
@@ -1487,18 +1523,11 @@ static void ai_worker(void*) {
           enqueue_result(fb.c_str(), t.fn, t.ctx);
           // 死循环防线：连续多轮下发相同指令 → 下轮注入引导语让 AI 主动变化
           fmt_last(cur_cmd, sizeof(cur_cmd), type, params);
-          for (int ki = 0; ki < (int)(sizeof(act_cnt) / sizeof(act_cnt[0])); ki++)
-            if (!strcmp(type, k_type_names[ki])) { act_cnt[ki]++; break; }  // 任务进度计数
           if (strcmp(cur_cmd, last_cmd)) { stall = 0; stall_hint = false; }
           else if (++stall >= 3 && !stall_hint) { stall_hint = true; Serial.println("[ai] 多轮无进展，注入引导"); }
           snprintf(last_cmd, sizeof(last_cmd), "%s", cur_cmd);
-          // 记录进"近几步"环形缓冲（最多 4 条，满则覆盖最旧）：方位/动作记忆防重复打转
-          if (act_hist_n < 4) { strncpy(act_hist[act_hist_n++], cur_cmd, 47); act_hist[act_hist_n - 1][47] = 0; }
-          else { memmove(act_hist[0], act_hist[1], 3 * 48); strncpy(act_hist[3], cur_cmd, 47); act_hist[3][47] = 0; }
           // AI 显式要求保留上一帧（锁定/追踪）：下轮带上 prev；否则按兜底节奏走
           want_prev = cmdD["carry_prev"].is<bool>() && cmdD["carry_prev"].as<bool>();
-          // AI 要求下轮带操作者参考图（与 carry_prev 二选一）
-          want_user = cmdD["carry_user"].is<bool>() && cmdD["carry_user"].as<bool>();
           // 任务笔记/进度：AI 写入并持续喂回（目标外观/计划/进行到哪）
           const char* tn = cmdD["task_note"] | "";
           if (tn[0] && strcmp(tn, task_note)) {
@@ -1527,15 +1556,23 @@ static void ai_worker(void*) {
               ai::logf("[ai] 任务%d → %s", idx + 1, s_tasks[idx].done ? "完成" : "未完成");
             }
           }
-          // 发给 AI 的"上一步已下发"：指令 + reason，替代双帧供跨轮衔接（目标方位/执行情况）。
-          // reason 较长时按 UTF-8 安全截断（%.*s 会截断半个中文字节 → 云端 400 invalid unicode）。
+          // 发给 AI 的"上一步已下发"：指令 + 完整 reason（含目标方位），替代双帧供跨轮衔接。
+          // 末尾整字符钳制（utf8_clamp_tail）防半个中文字节被云端判 400，但不做长度截断。
           const char* r = cmdD["reason"] | "";
-          int rn = (int)strlen(r);
-          if (rn > 128) {
-            rn = 128;
-            while (rn > 0 && ((unsigned char)r[rn] & 0xC0) == 0x80) rn--;  // 回退到字符边界
+          {
+            PsaBuf ld;   // 指令+完整 reason
+            ld.put(cur_cmd); ld.put("，原因："); ld.put(r);
+            utf8_clamp_tail(ld.p);
+            // AI 决策(assistant) 直接滚入历史环（省去中转拷贝一次）；ld.p 作用域末自动释放
+            if (ld.len) hist_add("assistant", ld.p);
           }
-          snprintf(last_disp, sizeof(last_disp), "%s，原因：%.*s", cur_cmd, rn, r);
+          // AI 显式 task_goal：把插话/新意图提升为目标（只替换目标 message，不碰 system → 保缓存）
+          const char* tg = cmdD["task_goal"] | "";
+          if (tg[0] && strcmp(tg, goal_now)) {
+            snprintf(goal_now, sizeof(goal_now), "%s", tg);
+            utf8_clamp_tail(goal_now);
+            ai::logf("[ai] 目标更新: %s", goal_now);
+          }
           // stop + done:true = AI 自判任务完成：停车并结束任务（build_feedback 已带 done 上报手机端）；
           // 不带 done 的 stop 仅临时停车观察，任务继续下一轮。严格按 bool 判定，防模型输出字符串 "true"。
           if (!strcmp(type, "stop") && cmdD["done"].is<bool>() && cmdD["done"].as<bool>()) {
@@ -1625,6 +1662,7 @@ static void ai_worker(void*) {
     if (edited) free(edited);
     if (cur) free(cur);          // 本轮帧 PSRAM 副本
     if (prev) free(prev);        // 上一帧 PSRAM 副本
+    for (int i = 0; i < AI_HIST_N; i++) free(hist_text[i]);   // 历史环 PSRAM
     if (t.ctx) delete (int*)t.ctx;  // 任务期 sink fd
     ai::logf("[ai] 任务结束 gen=%lu", t.generation);   // 先于注销通道，确保此行也能回推
     g_log_fn = nullptr; g_log_ctx = nullptr;  // 注销 ai_log 回推通道
