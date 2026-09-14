@@ -3,6 +3,7 @@
 #include "camera.h"
 #include "direct_exec.h"
 #include "wifi_net.h"
+#include "ground_proj.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -31,17 +32,6 @@
 #define AI_MOVE_CAP_MS 2000       // AI 持续 move 单次行驶时限（无里程计兜底，防决策间隔内盲走撞墙）
 #define AI_MAX_NET_FAIL 4         // 连续"无有效输出"轮数上限：超过即中止任务并回报（防云端持续无响应时无限空转）
 #define AI_HIST_N 8               // 历史环条数（AI 决策 + 插话共用，满员淘汰最旧）
-
-// ================== 画面标定（摄像头左前高位、俯视；改这些数即可应对镜头被碰歪） ==================
-// 以小车为原点：+y=车前，−y=车后，+x=车右，−x=车左。单位 cm，均为实测近似值，AI 只当粗参考。
-// 竖轴（屏幕纵带中点）对应前向距离：底贴爪→中→中上→顶
-#define CAL_FWD_BOTTOM_CM  0      // 屏幕最底横带   ≈ 贴近夹爪正下方
-#define CAL_FWD_MID_CM     46     // 屏幕中心横带   ≈ 车前 46cm（正前，车轴线）
-#define CAL_FWD_MIDTOP_CM  120    // 中心到顶部中间 ≈ 车前 120cm
-#define CAL_FWD_TOP_CM     200    // 屏幕顶部横带   ≈ 车前 200cm（顶部已超出可测，估计值）
-// 中横带左右两个外侧中点对应横向偏移（本机左前安装故左右不对称：右侧视野更宽）
-#define CAL_SIDE_LEFT_CM   -45    // 屏幕左侧 1/4   ≈ 车左 45cm（(0.25,0.5) 实测）
-#define CAL_SIDE_RIGHT_CM  14     // 屏幕右侧 3/4   ≈ 车右 14cm（(0.75,0.5) 实测）
 
 // ArduinoJson 内存池改用 PSRAM，避免其小分配每轮在内部堆上反复申请/释放，
 // 与 TLS 缓冲交错把内部堆切成碎块（导致握手 -17040/-32512 失败）。
@@ -332,146 +322,7 @@ static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
   b.put("\",\"detail\":\"medium\"}}");
 }
 
-// ============ 屏幕像素 → 地面坐标（单应矩阵） ============
-// 相机固定俯视车前地面，无畸变广角，屏幕归一化 (u,v) → 车头系地面 (x右+, y前+) 为
-// 三维单应变换（8 自由度），由实测点最小二乘拟合，天然吸收相机安装偏差。
-// 求解用 Householder QR（板端）：正规方程法在 ESP32 单精度 FPU 下条件数平方放大会崩
-// （曾算出 H=(480,-567)）；QR 不放大条件数，double 软件模拟也够。QR 失败/回验超差时
-// 回退 PC 预计算的硬编码常量。标定点 CAL_N 可增（≥4），新增实测点直接往表里加即可。
-// 实测校准点（屏幕归一化 0..1 → 车头系地面 cm）：
-#define CAL_N 16
-static const double CAL_UV[CAL_N][2] = {
-  {0.5,0.25},{0.25,0.375},{0.25,0.5},{0.25,0.75},{0.25,1.0},{0.0,1.0},{0.0,0.75},
-  {0.75,0.125},{0.5,1.0},{0.75,0.25},{0.75,0.5},{0.75,0.75},{1.0,0.5},{1.0,0.75},
-  {0.5,0.5},{0.5,0.75}
-};
-static const double CAL_XY[CAL_N][2] = {
-  {40,134},{-50,242},{-45,112},{-38,48},{-34,23},{-64,36},{-105,90},
-  {78,85},{-15,14},{45,55},{16,26},{1.5,12},{23,13},{7,6},
-  {0,52},{-8,21}
-};
-
-// 当前生效的单应 + 归一化参数（QR 求解后为动态值；回退时为 fallback 常量）
-static double H[8];
-static double SU_MU, SU_S, SV_MU, SV_S, SX_MU, SX_S, SY_MU, SY_S;
-static bool s_h_ok = false;
-
-// PC 高精度预计算常量（QR 不可靠时的回退；由上述 CAL_* 经 DLT 归一化最小二乘得出）
-static const double SU_MU_FB = 0.5,                 SU_S_FB = 0.25;
-static const double SV_MU_FB = 0.609375,            SV_S_FB = 0.234375;
-static const double SX_MU_FB = -9.28125,            SX_S_FB = 35.75390625;
-static const double SY_MU_FB = 60.5625,             SY_S_FB = 45.0234375;
-static const double H_FALLBACK[8] = {
-  0.57946103365278445, -0.262075586380767, 0.086826435788850409,
-  -0.69161767976051913, -0.75044489509584567, -0.58084272202547371,
-  0.3788047424521348, 0.42448448567962926
-};
-
-// Householder QR 求解超定最小二乘 Ah≈b（m=2N 方程, n=8 未知）→ h 写回 H。
-// A 按列主元反射逐步上三角化，b 同步施加反射，最后回代。返回 false=奇异/数值失败。
-static bool qr_fit(const double A[2*CAL_N][8], const double b[2*CAL_N], double h[8]) {
-  const int m = 2 * CAL_N, n = 8;
-  double R[32][8];   // m×n 工作副本（CAL_N≤16 时 m≤32）
-  double qb[32];
-  for (int i = 0; i < m; i++) { for (int j = 0; j < n; j++) R[i][j] = A[i][j]; qb[i] = b[i]; }
-  for (int k = 0; k < n; k++) {
-    double n2 = 0;
-    for (int i = k; i < m; i++) n2 += R[i][k] * R[i][k];
-    if (n2 < 1e-30) return false;
-    double alpha = (R[k][k] >= 0 ? -1 : 1) * sqrt(n2);
-    // v = x - alpha·e1（存 R[k..][k]），归一化
-    R[k][k] -= alpha;
-    double vn = 0;
-    for (int i = k; i < m; i++) vn += R[i][k] * R[i][k];
-    vn = sqrt(vn);
-    if (vn < 1e-15) { R[k][k] = alpha; continue; }   // 该列已正交，跳过
-    for (int i = k; i < m; i++) R[i][k] /= vn;
-    // 反射作用到右侧列与 b
-    for (int j = k + 1; j < n; j++) {
-      double dot = 0;
-      for (int i = k; i < m; i++) dot += R[i][k] * R[i][j];
-      for (int i = k; i < m; i++) R[i][j] -= 2 * dot * R[i][k];
-    }
-    double db = 0;
-    for (int i = k; i < m; i++) db += R[i][k] * qb[i];
-    for (int i = k; i < m; i++) qb[i] -= 2 * db * R[i][k];
-    R[k][k] = alpha;   // 存 R 对角
-  }
-  // 回代解 R h = qb（R 上三角在 R[0..n-1][0..n-1]）
-  for (int i = n - 1; i >= 0; i--) {
-    double s = qb[i];
-    for (int j = i + 1; j < n; j++) s -= R[i][j] * h[j];
-    if (fabs(R[i][i]) < 1e-15) return false;
-    h[i] = s / R[i][i];
-  }
-  return true;
-}
-
-// 前向声明：homography_fit 回验需要（定义在下方）
-static bool screen_to_world(float u, float v, float* x, float* y);
-
-// 启动：QR 求解归一化单应；回验校准点误差 ≤5cm 则采用，否则回退硬编码常量。
-static bool homography_fit(void) {
-  // 归一化参数（均值 + 平均绝对偏差）
-  double um=0,vm=0,xm=0,ym=0;
-  for (int i = 0; i < CAL_N; i++) { um+=CAL_UV[i][0]; vm+=CAL_UV[i][1]; xm+=CAL_XY[i][0]; ym+=CAL_XY[i][1]; }
-  um/=CAL_N; vm/=CAL_N; xm/=CAL_N; ym/=CAL_N;
-  double us=0,vs=0,xs=0,ys=0;
-  for (int i = 0; i < CAL_N; i++) {
-    us+=fabs(CAL_UV[i][0]-um); vs+=fabs(CAL_UV[i][1]-vm);
-    xs+=fabs(CAL_XY[i][0]-xm); ys+=fabs(CAL_XY[i][1]-ym);
-  }
-  us=us/CAL_N; vs=vs/CAL_N; xs=xs/CAL_N; ys=ys/CAL_N;
-  if (us<1e-9) us=1; if (vs<1e-9) vs=1; if (xs<1e-9) xs=1; if (ys<1e-9) ys=1;
-  double A[32][8], b[32];
-  for (int i = 0; i < CAL_N; i++) {
-    double u = (CAL_UV[i][0]-um)/us, v = (CAL_UV[i][1]-vm)/vs;
-    double x = (CAL_XY[i][0]-xm)/xs, y = (CAL_XY[i][1]-ym)/ys;
-    A[2*i][0]=u; A[2*i][1]=v; A[2*i][2]=1; A[2*i][3]=0; A[2*i][4]=0; A[2*i][5]=0; A[2*i][6]=-u*x; A[2*i][7]=-v*x; b[2*i]=x;
-    A[2*i+1][0]=0; A[2*i+1][1]=0; A[2*i+1][2]=0; A[2*i+1][3]=u; A[2*i+1][4]=v; A[2*i+1][5]=1; A[2*i+1][6]=-u*y; A[2*i+1][7]=-v*y; b[2*i+1]=y;
-  }
-  double h[8];
-  bool ok = qr_fit(A, b, h);
-  if (ok) {
-    SU_MU=um; SU_S=us; SV_MU=vm; SV_S=vs; SX_MU=xm; SX_S=xs; SY_MU=ym; SY_S=ys;
-    for (int i = 0; i < 8; i++) H[i] = h[i];
-    s_h_ok = true;
-    float maxerr = 0;
-    for (int i = 0; i < CAL_N; i++) {
-      float ex, ey;
-      screen_to_world((float)CAL_UV[i][0], (float)CAL_UV[i][1], &ex, &ey);
-      float e = sqrtf((ex-(float)CAL_XY[i][0])*(ex-(float)CAL_XY[i][0]) +
-                      (ey-(float)CAL_XY[i][1])*(ey-(float)CAL_XY[i][1]));
-      if (e > maxerr) maxerr = e;
-    }
-    if (maxerr <= 5.f) { Serial.printf("[ai] 单应QR求解成功 回验最大误差=%.1fcm\n", maxerr); return true; }
-    Serial.printf("[ai] 单应QR回验超差(%.1fcm)，回退硬编码\n", maxerr);
-  } else {
-    Serial.println("[ai] 单应QR求解失败，回退硬编码");
-  }
-  // 回退：PC 预计算常量
-  SU_MU=SU_MU_FB; SU_S=SU_S_FB; SV_MU=SV_MU_FB; SV_S=SV_S_FB;
-  SX_MU=SX_MU_FB; SX_S=SX_S_FB; SY_MU=SY_MU_FB; SY_S=SY_S_FB;
-  for (int i = 0; i < 8; i++) H[i] = H_FALLBACK[i];
-  s_h_ok = true;
-  return true;
-}
-
-// 屏幕归一化像素 (u,v) → 车头系地面 (x右+, y前+) cm。
-// 单应只在标定区域内可信，区域外分母趋零会剧烈外推（AI 报错/越界像素时可达数千 cm）。
-// 故限制：输入须在 0..1，输出须在可接受地面范围，否则返回 false（调用方回退 rel_deg）。
-static bool screen_to_world(float u, float v, float* x, float* y) {
-  if (!s_h_ok) return false;
-  if (u < 0.f || u > 1.f || v < 0.f || v > 1.f) return false;
-  double un = (u - SU_MU) / SU_S, vn = (v - SV_MU) / SV_S;   // 归一化
-  double d = H[6] * un + H[7] * vn + 1.0;
-  if (fabs(d) < 1e-9) return false;
-  float xx = (float)(((H[0] * un + H[1] * vn + H[2]) / d) * SX_S + SX_MU);
-  float yy = (float)(((H[3] * un + H[4] * vn + H[5]) / d) * SY_S + SY_MU);
-  if (xx < -150.f || xx > 150.f || yy < -20.f || yy > 300.f) return false;  // 防外推爆炸
-  *x = xx; *y = yy;
-  return true;
-}
+// 屏幕像素 → 地面坐标（单应投影）由独立模块 ground_proj 负责：ground::screen_to_world。
 
 // ============ 空间记忆辅助（全局位姿 + 物体记忆表） ============
 // AI 每步执行 move/spin 后调用：按定距/定角近似累积车姿态。持续(无定距/定角)移动
@@ -561,7 +412,7 @@ static bool mem_observe_xy(const char* name, bool visible, float px, float py) {
     return true;
   }
   float wx, wy;
-  if (!screen_to_world(px, py, &wx, &wy)) {
+  if (!ground::screen_to_world(px, py, &wx, &wy)) {
     ai::logf("[ai] 观测 %s 像素(%.2f,%.2f) 越界/解算失败", name, px, py);
     return false;
   }
@@ -615,32 +466,20 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   sys.put("或 {\"type\":\"arm_pose\",\"params\":{\"x\":10,\"h\":4},\"reason\":\"..\"} 直接把夹爪末端移动到指定位姿：x=车头前方 cm（可达约4..15），h=夹爪中心离地高度 cm（越高夹爪越抬、越低越贴近地面）。夹取前最推荐用它把夹爪调到与目标高度匹配；不可达时不会移动，请改 x/h 重试；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
   sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 空操作，用于不执行移动操作跳过本轮，不会停止正在进行的移动；");
-  sys.put("可选附加字段（可加在任意指令 JSON 里）：\"carry_prev\":true（下轮带上本帧做前后对比，用于锁定/追踪）；\"task_goal\":\"新目标文字\"（把插话/新意图提升为当前任务目标，程序会把该文字更新到目标位置并每轮喂回）；\"observe\":{\"name\":\"物体名字\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录物体位置：name=物体名（同一物体务必保持同名），px/py=物体在画面上的归一化坐标 左上(0,0)右下(1,1)，visible=false=当前不在画面；优先用 px/py（程序换算地面坐标，准得多），无法给出像素时用 \"rel_deg\":-20,\"dist_cm\":25 兜底（rel_deg 相对当前车头 右正左负）；\"task_note\":\"目标外观/备注\"（任务开始写一次，程序每轮喂回）；\"tasks\":[{\"name\":\"出门\",\"done\":true},{\"name\":\"右转\",\"done\":false}]（新建/重写整个任务列表，低频）；\"task_done\":{\"index\":1,\"done\":true}（标记第N项完成/未完成，index从1起，高频轻量、不用重写列表）；");
+  sys.put("可选附加字段（可加在任意指令 JSON 里）：\"carry_prev\":true（下轮带上本帧做前后对比，用于锁定/追踪）；\"task_goal\":\"新目标文字\"（把插话/新意图提升为当前任务目标，程序会把该文字更新到目标位置并每轮喂回）；\"observe\":{\"name\":\"物体名字\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录物体位置：name=物体名（同一物体务必保持同名），px/py=物体在画面上的归一化坐标 左上(0,0)右下(1,1)，visible=false=当前不在画面；优先用 px/py（坐标口径见规则12），无法给出像素时用 \"rel_deg\":-20,\"dist_cm\":25 兜底；\"task_note\":\"目标外观/备注\"（任务开始写一次，程序每轮喂回）；\"tasks\":[{\"name\":\"出门\",\"done\":true},{\"name\":\"右转\",\"done\":false}]（新建/重写整个任务列表，低频）；\"task_done\":{\"index\":1,\"done\":true}（标记第N项完成/未完成，index从1起，高频轻量、不用重写列表）；");
   sys.put("规则: \
 	1. 只输出 JSON, 每次只规划一步，若任务不要求实际行动可以 stop; 回复务必简短——思考放在 reason。\
 	2. reason 一句中文简要解释, 需包含目标方位: 相对小车的左/中/右 + 是否已贴近/被夹爪遮挡; 若目标消失, 写明最后已知方位与推断(如“最后在偏左处, 现在应在车头右前方, 右转找回”), 供下轮决定转向或后退, 避免走过头后盲目环视。\
 	3. 旋转时使用 原地旋转(spin) ，需要观察环境/还没锁定目标时优先用小幅环视探索视角。\
 	4. 若有障碍物挡路或有明显高低差的区域则尝试绕行，若绕行多轮仍无进展或人持续挡在车前, 做出示意停止的手势，则可以 stop 并说明原因。\
-	5. 记录任务相关物体的位置用 observe 字段（格式见上方指令区）：同一物体务必保持同名，报位置优先用 px/py（程序换算地面坐标并喂回\"当前车头局部系\"，如\"车向:35°; 沙漏 右偏20°约25cm\"；车向 0°=任务开始车头方向）。记忆仅供参考, 画面所见永远为准——看到就刷新 observe, 看不到就报 visible=false; 画面与记忆不符说明物体被移动或车已转向, 一律以画面为准更新。目标不在画面时, 可用记忆里的全局坐标结合当前车向推断目标方位。\
+	5. 记录物体位置用 observe (格式见上方指令区): 同一物体务必保持同名, 看到就刷新、看不到报 visible=fals; 记忆仅供参考, 画面所见永远为准——画面与记忆不符说明物体被移动或车已转向, 一律以画面为准更新。目标不在画面时, 用记忆里的位置结合当前车向推断方位。\
 	6. 目标先前可见且在近处、随后画面中消失(尤其上一步是前进靠近)。可以尝试回退操作或根据空间记忆转向找回目标，若空间记忆推断目标方位十分接近, 可能被阻挡，则应选择先前的移动，确认方位后再靠近。当确认目标被机械臂本体遮挡可用 收臂 home。\
-	7. 画面右下角为小车的夹爪，其朝向为小车朝向，画面中心经过小车正前方。状态里“抓手:前Xcm 高Ycm”是夹爪夹心与离地高度, 若画面不好判断可据此判断能否夹住目标及当前抓手高度是否合适; 继续朝受限方向动作不会改变位置时(到顶/缩到底), 应换方向或调整姿态。\
-	8. 发现目标在左前方/右前方时, 先原地转向对准目标, 正对目标且距离小于10时可以尝试使用arm_pose控制夹子移动到目标距离和高度尝试夹取, 高度应选择目标高度的一半或者明显适合夹取的高度，无法确认合适高度时选择较低的高度，夹爪松开时宽度3cm，可以用来作为推测长度的方式\
+	7. 画面右下角为小车的夹爪，其朝向为小车朝向。状态里“抓手:前Xcm 高Ycm”是夹爪中心与离地高度, 画面不好判断时据此判断能否夹住及抓手高度是否合适; 继续朝受限方向动作不再改变位置时(到顶/缩到底), 应换方向或调整姿态。\
+	8. 发现目标在左前方/右前方时, 先原地转向对准目标, 正对目标且距离小于10时可以尝试使用arm_pose控制夹子移动到目标距离和高度尝试夹取, 高度应选择目标高度的一半或者明显适合夹取的高度, 无法确认合适高度时选择较低的高度, 夹爪松开时宽度3cm, 可以用来大致推测长度\
 	9. 夹爪是两片平行夹板, 装机在高位侧俯视时可看到夹爪; “爪:合”只代表夹爪伺服已闭合到位, 绝不代表夹住了物体。判断是否夹住必须执行 arm lift_up 抬臂, 检查目标是否随夹爪抬起; 目标仍在地面或夹爪空合则未夹住, 应 release 后调整高度或重新对准。\
-	10. 需要下一轮同时收到本轮画面做前后对比时，输出额外字段 \"carry_prev\":true（格式见上方指令区）。例如发现目标、或即将移动担心目标进盲区需要对比判定时。下轮你会同时收到上一帧与当前帧, 据此判断目标是否移动/进入盲区。\
-	11. 多步任务用 tasks 新建/重写任务列表、task_done 标记第N项完成（index从1起，完成后及时标记，不必重写列表）；task_note 记录目标外观/备注（低频）。程序每轮喂回当前任务列表与笔记，据此推进下一步即可，勿重复推断进度。若操作者插话构成新任务/需改目标，用 task_goal 更新当前任务目标即可。");
-  { // 画面标定：从顶部 CAL_* 宏读取，改一处即可应对镜头松动后整体调参
-    char cal[1280];   // 标定文案（格式化后约 0.96KB，加长文案前核对足量，防截断半个汉字致云端 400）
-    snprintf(cal, sizeof(cal),
-             "画面标定（摄像头左前高位俯视，无镜像；数值为近似值，画面所见永远优先）：屏幕越往下越近——"
-             "最底部横带贴近夹爪（0cm）、屏幕中心约车前%dcm正前、中心到顶部一半约%dcm、顶部约%dcm；"
-             "中横带左边缘中点约车左%dcm、右边缘中点约车右%dcm（左右不对称因镜头偏左）。"
-             "这套标定假设小车前方地面基本水平；若目标明显不在同一高度（桌面/台阶/被垫高，或前方高低差），"
-             "该距离标定不成立、勿套用；此时只据画面判断大致方向与偏向，距离以状态或合理推断给个大约范围。"
-             "近距时夹爪相对目标高低看不清，一律以状态抓手:前Xcm 高Ycm 为准微调，不要靠画面猜高矮。"
-             "夹爪回正（非 home 收臂）状态时，夹爪正下方/两板之间在画面约 (0.7, 0.8)——目标出现在该点附近且进入两板之间可尝试合爪。",
-             CAL_FWD_MID_CM, CAL_FWD_MIDTOP_CM, CAL_FWD_TOP_CM, CAL_SIDE_LEFT_CM, CAL_SIDE_RIGHT_CM);
-    sys.put(cal);
-  }
+	10. 需要下一轮同时收到本轮画面做前后对比时，输出额外字段 \"carry_prev\":true。例如发现目标、或即将移动担心目标进盲区需要对比判定时。下轮你会同时收到上一帧与当前帧, 据此判断目标是否移动/进入盲区。\
+	11. 多步任务用 tasks 新建/重写任务列表、task_done 标记第N项完成(index从1起, 完成后及时标记, 不必重写列表); task_note 记录目标外观/备注（低频）。程序每轮喂回当前任务列表与笔记, 据此推进下一步即可, 勿重复推断进度。若操作者插话构成新任务/需改目标，用 task_goal 更新当前任务目标即可。\
+	12. 坐标系与距离口径(统一约定, 沿用此说法):以小车为基准, 前方=画面中心方向、屏幕越往下越近、右/左=小车右/左; observe 的 px/py 由程序换算成车头局部系喂回（形如\"车向:35°; 沙漏 右偏20°约25cm\", 车向 0°=任务开始车头方向、右正左负; 无像素时 rel_deg 兜底), 你只需相对小车判断方位、距离以程序喂回值为准。该标定只在目标与小车同处水平地面时成立, 若目标与小车不在同一水平地面, 勿依靠此功能。近距夹取时夹爪高低以抓手状态为准。");
 
   b.put("{\"model\":");
   esc_append(b, cfg::ai_model().c_str());
@@ -1278,12 +1117,11 @@ static void ai_worker(void*) {
     bool cam_ok = cam::available();
     ai::logf("[ai] 任务开始 gen=%lu text=%s%s", t.generation, t.text, cam_ok ? "" : "（无摄像头→无画面模式）");
     // 单应状态诊断：若未就绪，所有 px/py 观测都会被拒，直接可看出问题
-    if (!s_h_ok) ai::logf("[ai] 警告：单应未就绪（像素观测将全部被拒绝）");
+    if (!ground::ready()) ai::logf("[ai] 警告：单应未就绪（像素观测将全部被拒绝）");
     else {
       float ex, ey;
-      screen_to_world(0.5f, 0.5f, &ex, &ey);
-      ai::logf("[ai] 单应OK 中心→(%.0f,%.0f) H0-7=(%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f)",
-               ex, ey, H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7]);
+      ground::screen_to_world(0.5f, 0.5f, &ex, &ey);
+      ai::logf("[ai] 单应OK 中心→(%.0f,%.0f)", ex, ey);
     }
     // 打印实际端点/模型，便于排查 404/401 等云端拒绝（配错路径是常见原因）
     ai::logf("[ai] 端点=%s 模型=%s key=%s", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
@@ -1687,21 +1525,7 @@ static void ai_tls_free(void* p) { heap_caps_free(p); }
 void ai::init() {
   if (g_worker) return;
   Serial.println("[ai] build=hwaes_int8192_v4  （TLS: 硬件AES/INTERNAL/8192；ws_stream/ping_svc 栈已调大）");
-  if (homography_fit()) {
-    Serial.printf("[ai] 单应拟合成功 H=(%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f)\n",
-                  H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7]);
-    float tx = 0, ty = 0;
-    bool ok1 = screen_to_world(0.5f, 0.5f, &tx, &ty);
-    Serial.printf("[ai] 单应验证 中心%s(%.1f,%.1f) ", ok1 ? "" : "FAIL ", tx, ty);
-    tx = ty = 0;
-    bool ok2 = screen_to_world(0.75f, 0.5f, &tx, &ty);
-    Serial.printf("右下%s(%.1f,%.1f) ", ok2 ? "" : "FAIL ", tx, ty);
-    tx = ty = 0;
-    bool ok3 = screen_to_world(0.5f, 0.25f, &tx, &ty);
-    Serial.printf("上方%s(%.1f,%.1f)\n", ok3 ? "" : "FAIL ", tx, ty);
-  } else {
-    Serial.println("[ai] 单应拟合失败（校准点不足/退化）");
-  }
+  ground::init();   // 屏幕→地面单应拟合 + 诊断日志（见 ground_proj）
   g_mtx = xSemaphoreCreateMutex();
   g_notify = xSemaphoreCreateBinary();
   g_img_mtx = xSemaphoreCreateMutex();
