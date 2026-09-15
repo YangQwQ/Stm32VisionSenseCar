@@ -17,6 +17,19 @@ static bool has_id(const JsonDocument& doc) {
   return doc["id"].is<int>() || doc["id"].is<long>();
 }
 
+// 合成板端状态位字节，供 get_state 与 reply_status 统一附带，手机端按位解析同步按钮。
+// bit 布局与 Mobile-RemoteCtrl/Main.gd（_apply_state_bits）逐位 mirror，改一侧必改另一侧：
+//   bit0 前灯 / bit1 震灯 / bit2 背灯 / bit3 夹爪夹紧 / bit4 AI busy；bit5-7 留空。
+static uint8_t make_state_bits() {
+  uint8_t b = 0;
+  if (exec::light_on("front")) b |= 1u << 0;
+  if (exec::light_on("vibe"))  b |= 1u << 1;
+  if (exec::light_on("back"))  b |= 1u << 2;
+  if (exec::grip_closing())    b |= 1u << 3;
+  if (ai::busy())              b |= 1u << 4;
+  return b;
+}
+
 // 组一段带原 id 的应答文本并发出（reply 可空）。
 static void reply_status(JsonDocument& src, cmd::ReplyFn reply, void* ctx,
                          const char* reason) {
@@ -28,6 +41,7 @@ static void reply_status(JsonDocument& src, cmd::ReplyFn reply, void* ctx,
   out["type"] = "status";
   JsonObject params = out["params"].to<JsonObject>();
   params["reason"] = reason;
+  params["bits"] = make_state_bits();  // 附带状态位，让"会触发动作重置"的回执驱动手机端自动同步按钮
   if (has_id(src)) out["id"] = src["id"].as<long>();
   String s;
   serializeJson(out, s);
@@ -144,17 +158,12 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   }
 
   if (!strcmp(type, "get_state")) {
-    // 主动查询当前状态（供手机重连后同步控制按钮）：回结构化灯/夹爪状态。
+    // 主动查询当前状态（供手机重连后同步控制按钮）：回状态位字节，手机端按位解析灯/夹爪/AI 运行态。
     JsonDocument out;
     out["type"] = "state";
     JsonObject params = out["params"].to<JsonObject>();
-    JsonObject lights = params["lights"].to<JsonObject>();
-    lights["front"] = exec::light_on("front");
-    lights["vibe"]  = exec::light_on("vibe");
-    lights["back"]  = exec::light_on("back");
-    params["grip_close"] = exec::grip_closing();
-	params["ai_busy"] = ai::busy();   // Bug1：手机连接成功后同步板端 AI 运行态，纠正「中止/发送」按钮
-	if (has_id(doc)) out["id"] = doc["id"].as<long>();
+    params["bits"] = make_state_bits();
+    if (has_id(doc)) out["id"] = doc["id"].as<long>();
     String s;
     serializeJson(out, s);
     if (reply) { reply(reply_ctx, s.c_str()); }

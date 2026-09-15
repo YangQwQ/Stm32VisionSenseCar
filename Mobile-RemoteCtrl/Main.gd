@@ -222,28 +222,39 @@ func _on_device_disconnected(reason: String) -> void:
 	_chat_panel.chat("提示", "设备已断开: %s" % reason)
 
 func _on_ble_status(data: Dictionary) -> void:
-	# 板子 BLE status：reply 为词表应答 JSON（status/pong/params.reason）时解析出可读文本，否则原样展示。
-	var reply: Variant = data.get("reply")
-	if reply is String and not (reply as String).is_empty():
-		var txt: String = reply as String
-		var json := JSON.new()
-		var parsed: Variant = {}
-		if json.parse(txt) == OK and json.data is Dictionary:
-			parsed = json.data
-			var t: String = str(parsed.get("type", ""))
-			if t == "state":
-				# get_state 经 BLE 通道回传：同步直控按钮 + AI 运行态（同 WS 通道，见 _apply_state）。
-				_apply_state(parsed as Dictionary)
-				_update_status()
-				return
-			elif t == "pong":
-				txt = "pong"
-			elif parsed.has("params"):
-				var pm: Variant = parsed.get("params")
-				if pm is Dictionary and (pm as Dictionary).has("reason"):
-					txt = str((pm as Dictionary).get("reason"))
-		_chat_panel.chat("板", txt)
+	# 板端 BLE status 两种形态：
+	#  1) build_status 包装：{"ip",...,"reply":"<JSON>"}（词表应答/状态），无顶层 type → 解包 reply 再路由；
+	#  2) send_status 直推的独立 JSON：顶层带 type（如 exec_status）。
+	# 统一解出消息体后交给公共处理器（_handle_board_msg），与 WS 通道同一套展示逻辑。
+	var msg := data
+	if not data.has("type") and data.has("reply"):
+		var r: Variant = data.get("reply")
+		var j := JSON.new()
+		if r is String and j.parse(r as String) == OK and j.data is Dictionary:
+			msg = j.data as Dictionary
+		else:
+			_update_status()  # 无 reply 的纯状态 notify：只刷新 UI，无可展示文本
+			return
+	if msg.has("type"):
+		_handle_board_msg(msg)
 	_update_status()
+
+## 从 exec_status 的 params 提取可读状态文本；无 text 回退显示原始 cmd/hex。
+## 供 WS（_on_ws_text）与 BLE（_on_ble_status）两条通道共用。
+func _exec_status_text(p: Variant) -> String:
+	if p is Dictionary:
+		var t1: Variant = (p as Dictionary).get("text")
+		if t1 is String and not (t1 as String).is_empty():
+			return t1 as String
+		var line := "%02X" % int((p as Dictionary).get("cmd", 0))
+		var hx: Variant = (p as Dictionary).get("hex")
+		if hx is Array:
+			var parts := PackedStringArray()
+			for b in hx:
+				parts.append("%02X" % int(b))
+			line += " " + " ".join(parts)
+		return line
+	return ""
 
 ## 统一扫描入口。auto=true（启动/恢复）：清列表 + 同步自动目标名；
 ## auto=false（手动）：清列表 + 打断自动重连 + 复位连接占位 + 开扫。
@@ -298,19 +309,25 @@ func _wait_gatt_ready() -> void:
 
 # ============================== WS / 视频 ==============================
 
-## get_state 回传处理：同步直控按钮（灯/夹爪）。WS 与 BLE 通道共用。
+## get_state 回传（type:"state"）：params.bits 为板端状态位字节，按位同步直控按钮（灯/夹爪/AI 运行态）。
 func _apply_state(data: Dictionary) -> void:
 	var st: Variant = data.get("params")
-	if not (st is Dictionary):
-		return
-	var stm := st as Dictionary
-	var lights: Variant = stm.get("lights")
-	if lights is Dictionary:
-		$BodyControl/CtrlArea.call("sync_state", lights, bool(stm.get("grip_close", false)))
-	# get_state 回传 ai_busy：用板端真实运行态纠正本地「中止/发送」按钮。
-	var ai_busy: Variant = stm.get("ai_busy")
-	if ai_busy is bool:
-		_chat_panel.set_ai_running(ai_busy as bool)
+	if st is Dictionary:
+		var b: Variant = (st as Dictionary).get("bits")
+		# Godot JSON 解析把数字存成 float（typeof=3），兼容 int/float。
+		if b is int or b is float:
+			_apply_state_bits(int(b))
+
+## 按板端状态位字节同步直控按钮（灯/夹爪/AI 运行态）。WS 与 BLE 通道共用。
+## bit 布局与 Stm32-Vision/command.cpp（make_state_bits）逐位 mirror，改一侧必改另一侧：
+##   bit0 前灯 / bit1 震灯 / bit2 背灯 / bit3 夹爪夹紧 / bit4 AI busy；bit5-7 留空。
+func _apply_state_bits(bits: int) -> void:
+	$BodyControl/CtrlArea.call("sync_state", {
+		"front": (bits & 1) != 0,
+		"vibe": (bits & 2) != 0,
+		"back": (bits & 4) != 0,
+	}, (bits & 8) != 0)
+	_chat_panel.set_ai_running((bits & 16) != 0)
 
 func _on_ws_connected() -> void:
 	_chat_panel.chat("板", "WS 已连接")
@@ -337,63 +354,50 @@ func _on_frame(img: Image) -> void:
 	DeviceConn.current_image = img
 
 func _on_ws_text(data: Dictionary) -> void:
+	_handle_board_msg(data)
+
+## 板端上行消息统一处理（AI 结果/日志/状态/词表回执），WS 与 BLE 两条通道共用：
+## 按顶层 type 路由展示；返回 true 表示已消费，false 表示未知类型（留给调用方兜底）。
+func _handle_board_msg(data: Dictionary) -> bool:
 	var t: String = str(data.get("type", ""))
-	if t == "pong":
-		_chat_panel.chat("板", "pong")
-		return
-	if t == "ai_result":
-		_chat_panel.show_ai_result(data)
-		return
-	if t == "ai_log":
-		# 板端 AI 调试/延迟日志回推（/ai_log on 开启）：展示并落盘（chat() 统一写日志）。
-		var alt: Variant = data.get("params")
-		var line := ""
-		if alt is Dictionary:
-			var tv: Variant = (alt as Dictionary).get("text")
-			if tv is String:
-				line = tv as String
-		if line != "":
-			_chat_panel.chat("AI日志", line)
-		return
-	if t == "state":
-		# get_state 回传（WS 通道）：同步直控按钮。
-		_apply_state(data)
-		return
-	if t == "exec_status":
-		# 执行板日志镜像：板子把执行板上行帧转发过来（状态帧已解码成可读文本 text）。
-		# 无 text 的非状态帧回退显示原始 payload hex。
-		var p: Variant = data.get("params")
-		var line := ""
-		if p is Dictionary:
-			var pm := p as Dictionary
-			var txt: Variant = pm.get("text")
-			if txt is String and not (txt as String).is_empty():
-				line = txt as String
-			else:
-				line = "%02X" % int(pm.get("cmd", 0))
-				var hx: Variant = pm.get("hex")
-				if hx is Array:
-					var parts := PackedStringArray()
-					for b in hx:
-						parts.append("%02X" % int(b))
-					line += " " + " ".join(parts)
-		_chat_panel.chat("执行板", line)
-		return
-	if t != "status":
-		return
-	# status：尽量展示人类可读字段（reason / reply），纯机器状态略
-	var params: Variant = data.get("params")
-	var line := ""
-	if params is Dictionary:
-		var r: Variant = (params as Dictionary).get("reason")
-		if r is String and not (r as String).is_empty():
-			line = r as String
-	elif data.has("reply"):
-		var rp: Variant = data.get("reply")
-		if rp is String and not (rp as String).is_empty():
-			line = rp as String
-	if line != "":
-		_chat_panel.chat("板", line)
+	match t:
+		"pong":
+			_chat_panel.chat("板", "pong")
+		"ai_result":
+			_chat_panel.show_ai_result(data)
+		"ai_log":
+			# 板端 AI 调试/延迟日志回推（/ai_log on 开启）：展示并落盘（chat() 统一写日志）。
+			var alt: Variant = data.get("params")
+			var line := ""
+			if alt is Dictionary:
+				var tv: Variant = (alt as Dictionary).get("text")
+				if tv is String:
+					line = tv as String
+			if line != "":
+				_chat_panel.chat("AI日志", line)
+		"state":
+			# get_state 回传：同步直控按钮（灯/夹爪/AI 运行态）。
+			_apply_state(data)
+		"exec_status":
+			_chat_panel.chat("执行板", _exec_status_text(data.get("params")))
+		"status":
+			# status 回执：展示可读 reason，并按其附带的状态位（bits，若存在）同步直控按钮
+			# （reset / ai_cancel / light 等"会触发动作重置"的回执都自动带上 bits）。
+			var line2 := ""
+			var pm: Variant = data.get("params")
+			if pm is Dictionary:
+				var pd := pm as Dictionary
+				if pd.has("reason"):
+					line2 = str(pd.get("reason"))
+				var b: Variant = pd.get("bits")
+				# Godot JSON 解析把数字存成 float（typeof=3），兼容 int/float。
+				if b is int or b is float:
+					_apply_state_bits(int(b))
+			if line2 != "":
+				_chat_panel.chat("板", line2)
+		_:
+			return false
+	return true
 
 func _on_stream_toggled(on: bool) -> void:
 	_apply_stream(on)

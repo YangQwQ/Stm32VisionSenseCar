@@ -24,10 +24,12 @@ const STATUS_UUID := "0000C0E6-0000-1000-8000-00805F9B34FB"
 ## 广播名，与固件一致（固件扫描/过滤可用它或 Service UUID c0de）
 const ADVERT_NAME := "VisionS3"
 
-## 兜底控制黑名单：WS 掉线时除列出的类型外，其余词表指令都允许经 BLE cmd 特征下发。
-## 仅真正依赖 WiFi 的类型才需拦：stream 图传（需 UDP/抓帧）、ai_goal/ai_oneshot（板需 WiFi
-## 直连云端）。其余控制/调试/状态类一律支持蓝牙兜底。
-const BLOCKED_TYPES := ["stream", "ai_goal", "ai_oneshot"]
+## BLE 可选发类型黑名单（send_command 走 BLE 时拦截）。
+## 仅真正依赖 WiFi 链路的类型才拦：stream 图传（需 UDP/抓帧，纯蓝牙无 UDP 对端）。
+## ai_goal/ai_oneshot 放行：板端 AI worker 直连云端，不依赖手机侧 WS——只要板子 WiFi STA
+## 在线（即便 WS 断开/禁用），BLE 即可下发目标、AI 结果经 BLE status 通知回传；板子断网时
+## 会回执明确失败，不静默。其余控制/调试/状态类一律支持蓝牙兜底。
+const BLOCKED_TYPES := ["stream"]
 
 ## 16-bit 短值拼全量（小写输入，统一大写输出），如 uuid("c0e5")
 static func uuid(short: String) -> String:

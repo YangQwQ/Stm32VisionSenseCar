@@ -322,8 +322,11 @@ func write_cmd(cmd: Dictionary) -> bool:
 		return false
 	return _write_char(BP.CMD_UUID, JSON.stringify(cmd).to_utf8_buffer())
 
-## 写 Wi-Fi 配置（配网）。两特征都下发成功才返回 true。
+## 写 Wi-Fi 配置（配网）。板端要求 SSID/PASS 两特征凑齐才生效，故任一项为空即不写任何
+## 特征（"为空就不修改"，避免空包覆盖板端缓存的另一半）；两项都非空时才真正下发。
 func write_wifi(ssid: String, password: String) -> bool:
+	if ssid.is_empty() or password.is_empty():
+		return false
 	if not is_device_connected():
 		return false
 	var ok1 := _write_char(BP.SSID_UUID, ssid.to_utf8_buffer())
