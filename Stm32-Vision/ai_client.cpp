@@ -1246,7 +1246,7 @@ static void ai_worker(void*) {
           hint = "";
         }
         PsaBuf body;
-        char st[96];  // exec 状态缓冲（含限位提示，需足量避免截断）
+        char st[192];  // exec 状态缓冲（含不可达诊断，需足量避免截断）
         const char* stp = exec::read_state(st, sizeof(st)) ? st : "";  // 本地直驱状态（无执行板，状态本地合成）
         // 每轮取一次插话（一次性消费，读完清空）：推入历史环作 user 消息，随环一起保留/冲掉。
         char chat_now[256] = {0};

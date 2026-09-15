@@ -157,6 +157,20 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
+  if (!strcmp(type, "nz_read")) {
+    // I2C 诊断（只读，不下发指令）：探测哪吒从机是否在线。写地址 ACK=从机活着且总线可用；
+    // 两项皆无 = 总线/从机掉电或拉死（常见硬件故障，此时回正与控制全无响应）。
+    uint8_t lb = 0;
+    uint8_t st = nezha::probe(&lb);
+    char buf[120];
+    const char* core = (st & 1u) ? ((st & 2u) ? "哪吒在线(写ACK✓ 读ACK✓)" : "哪吒在位 读应答✗")
+                                 : "哪吒无响应(写地址无ACK)";
+    if ((st & 3u) == 3u) snprintf(buf, sizeof(buf), "%s 首字节=0x%02X -> I2C/从机正常", core, lb);
+    else snprintf(buf, sizeof(buf), "%s -> 检查I2C连线/从机供电/总线是否被拉死", core);
+    reply_status(doc, reply, reply_ctx, buf);
+    return;
+  }
+
   if (!strcmp(type, "get_state")) {
     // 主动查询当前状态（供手机重连后同步控制按钮）：回状态位字节，手机端按位解析灯/夹爪/AI 运行态。
     JsonDocument out;

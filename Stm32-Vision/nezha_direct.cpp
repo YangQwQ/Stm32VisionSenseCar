@@ -96,6 +96,56 @@ static void led_frame(uint8_t cmd) {
   i2c_start(); send_byte(NZ_ADDR); send_byte(0x00); send_byte(cmd); i2c_stop();
 }
 
+// ================= I2C 只读探测（诊断用） =================
+// 发地址字节（写 0x80 / 读 0x81）的第 9 个时钟：把 SDA 转输入上拉读 ACK 位（从机应答拉低=ACK）。
+static bool send_addr_ack(uint8_t ab) {
+  for (int i = 0; i < 8; i++) {
+    if (ab & (0x80 >> i)) sda_hi(); else sda_lo();
+    scl_hi(); delayMicroseconds(NZ_UNIT_US);
+    scl_lo(); delayMicroseconds(NZ_UNIT_US);
+  }
+  pinMode(NZ_SDA, INPUT_PULLUP);          // 第 9 时钟释放 SDA，从机可应答
+  scl_hi(); delayMicroseconds(NZ_UNIT_US);
+  bool ack = (digitalRead(NZ_SDA) == LOW); // 低=ACK
+  scl_lo(); delayMicroseconds(NZ_UNIT_US);
+  pinMode(NZ_SDA, OUTPUT); sda_hi();       // 恢复驱动
+  return ack;
+}
+
+// 读 1 字节（SDA 保持输入，主控 NACK 收尾）：尽力返回 8 位值。
+static bool read_byte_nack(uint8_t* out) {
+  pinMode(NZ_SDA, INPUT_PULLUP);
+  uint8_t v = 0;
+  for (int i = 0; i < 8; i++) {
+    scl_hi(); delayMicroseconds(NZ_UNIT_US);
+    v = (uint8_t)((v << 1) | (digitalRead(NZ_SDA) ? 1u : 0u));
+    scl_lo(); delayMicroseconds(NZ_UNIT_US);
+  }
+  pinMode(NZ_SDA, OUTPUT); sda_hi();       // 主控发 NACK（保持高）
+  scl_hi(); delayMicroseconds(NZ_UNIT_US);
+  scl_lo(); delayMicroseconds(NZ_UNIT_US);
+  pinMode(NZ_SDA, OUTPUT); sda_hi();
+  *out = v;
+  return true;
+}
+
+uint8_t nezha::probe(uint8_t* lb) {
+  init();
+  bool wack = false, rack = false;
+  uint8_t data = 0xFF;
+  i2c_start();
+  wack = send_addr_ack(NZ_ADDR);           // 写地址探测
+  i2c_stop();
+  i2c_start();
+  rack = send_addr_ack(NZ_ADDR | 0x01);    // 读地址探测
+  if (rack) read_byte_nack(&data);
+  i2c_stop();
+  pinMode(NZ_SDA, OUTPUT); sda_hi();       // 复位总线到空闲高
+  pinMode(NZ_SCL, OUTPUT); scl_hi();
+  if (lb) *lb = data;
+  return (uint8_t)((wack ? 1u : 0u) | (rack ? 2u : 0u));
+}
+
 // 前灯 0x2D/0x2E；氛围灯 0x36/0x37；尾灯=左右一起 0x30/0x31 + 0x33/0x34。
 bool nezha::led(const char* kind, bool on) {
   if (!strcmp(kind, "front")) { led_frame(on ? 0x2D : 0x2E); return true; }

@@ -37,6 +37,8 @@ static func parse(text: String) -> Dictionary:
 			return _cmd(CP.exec_log(_on_explicit(_arg(pieces))))
 		"/ai_log":
 			return _cmd(CP.ai_log(_on_explicit(_arg(pieces))))
+		"/nz_read":
+			return _cmd(CP.nz_read())
 		"/light":
 			return _light(pieces)
 		"/stop":

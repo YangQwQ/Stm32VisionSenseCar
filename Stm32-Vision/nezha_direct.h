@@ -20,4 +20,9 @@ bool set_motor(uint8_t channel, uint16_t a, uint16_t b);
 // 直驱灯光：kind = front(前灯) / vibe(氛围灯) / back(尾灯=左右一起)。返回是否被识别。
 bool led(const char* kind, bool on);
 
+// I2C 诊断探测（只读，不下发指令）：确认哪吒从机是否在线。lb 接收尽力读到的首字节
+//（读不通时保持 0xFF）。返回位域：bit0=写地址 ACK、bit1=读地址 ACK。
+// 写地址 ACK 是「从机活着且总线可用」的最直接证据；两项皆无 = 总线/从机掉电或拉死。
+uint8_t probe(uint8_t* lb = nullptr);
+
 }  // namespace nezha

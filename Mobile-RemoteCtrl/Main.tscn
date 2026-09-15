@@ -1,12 +1,10 @@
 [gd_scene format=3 uid="uid://djeb0cuoeaeet"]
 
 [ext_resource type="Script" uid="uid://d1tmutexp2vuy" path="res://Main.gd" id="1_main"]
-[ext_resource type="Script" path="res://ui/bluetooth/ScanPanel.gd" id="14_scan"]
 [ext_resource type="Texture2D" uid="uid://dcyjjrs18hhhd" path="res://res/bg.jpg" id="2_trn2v"]
 [ext_resource type="Texture2D" uid="uid://bx6teaav65tma" path="res://res/scan_devices.png" id="5_j4qnp"]
 [ext_resource type="Script" uid="uid://ccoaatpwj6ivp" path="res://ui/chat/ChatPanel.gd" id="5_kjvhd"]
 [ext_resource type="Script" uid="uid://c7y01patjmc1s" path="res://ui/video/VideoView.gd" id="5_trn2v"]
-[ext_resource type="Script" path="res://ui/video/GridOverlay.gd" id="13_grid"]
 [ext_resource type="Script" uid="uid://dmgue5hwo2dt3" path="res://ui/control/DirectControl.gd" id="6_03owx"]
 [ext_resource type="Texture2D" uid="uid://cojg54jdu10rk" path="res://res/delete.png" id="6_sc1dx"]
 [ext_resource type="Texture2D" uid="uid://btk412diyh6ht" path="res://res/device.png" id="7_20pc6"]
@@ -20,6 +18,8 @@
 [ext_resource type="Texture2D" uid="uid://dni0iuv07coxu" path="res://res/SYF.jpg" id="10_5tuhn"]
 [ext_resource type="Texture2D" uid="uid://ck1coptjcgrlb" path="res://res/settings_a.png" id="11_fpfj3"]
 [ext_resource type="Texture2D" uid="uid://1uxvy1j5nvue" path="res://res/settings.png" id="12_sc1dx"]
+[ext_resource type="Script" uid="uid://dugospfdag2u2" path="res://ui/video/GridOverlay.gd" id="13_grid"]
+[ext_resource type="Script" uid="uid://dgct6qpk5wr7s" path="res://ui/bluetooth/ScanPanel.gd" id="14_scan"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_03owx"]
 content_margin_left = 20.0

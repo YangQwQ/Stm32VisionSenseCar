@@ -36,6 +36,11 @@ static func get_state() -> Dictionary:
 	# 主动查询当前状态（车灯/夹爪等），用于重连后同步控制按钮。板端回 {"type":"state",params:{...}}。
 	return {"type": "get_state", "params": {}, "id": _new_id()}
 
+static func nz_read() -> Dictionary:
+	# 诊断：让板子经 I2C 探测哪吒从机是否在线，回执写/读 ACK 与读到的首字节。
+	# 用于区分「从机/总线问题」vs「软件控制问题」；仅探测，不改从机状态。
+	return {"type": "nz_read", "params": {}, "id": _new_id()}
+
 
 
 static func config_wifi(ssid: String, password: String) -> Dictionary:
@@ -130,6 +135,7 @@ const COMMAND_HINTS := {
 	"/stop [wheels|arm]": "停车",
 	"/exec_log [on|off]": "实时状态推送开关（默认关）",
 	"/ai_log [on|off]": "AI日志推送开关（默认关，开启后AI调试/延迟日志发手机）",
+	"/nz_read": "I2C诊断：探测哪吒从机在线状态(写/读ACK)",
 	"/light <front|vibe|back> <0|1>": "直驱灯开关(前/氛围/尾)",
 	"/config <WiFi名> <密码>": "配网",
 	"/ai [goal|oneshot|cancel] <目标>": "AI 目标 / 单轮 / 取消",

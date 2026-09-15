@@ -1,33 +1,14 @@
 #include "direct_exec.h"
 #include "nezha_direct.h"
+#include "bivar.h"
 #include <math.h>
 #include <string.h>
 
-// ================= 二连杆 IK 标定（挖掘机式机械臂） =================
-// 几何：第一节(A)长 L1，第二节(B)长 L2，右舵机控 A 相对水平角 α，左舵机(推杆)控两臂夹角 β。
-// 轴(肩)高于地面 AXIS_H cm；末端夹爪位置 = f(α,β)。L1=L2=7.5cm（转轴到转轴）。
-// AXIS_X_OFF：肩轴转轴在小车车头后方 cm。坐标统一用"车头系"：FK 输出 x 加该偏移，
-// arm_pose 输入 x 也按车头系（减回偏移再反解）。2026-09-13 实测 17 点拟合标定：
-// α/β 角度表经最小二乘反解得出（AH/XO 为拟合等效值，非真实机械尺寸；表域内 FK/IK 精确互逆闭环）。
-#define IK_L1       7.5f
-#define IK_L2       7.5f
-#define AXIS_H      2.0f   // 拟合等效肩轴高（22 实测点反解）
-#define AXIS_X_OFF  3.5f   // 拟合等效：肩轴在小车车头后方 cm
-#define RMIN        0.5f   // 可达最近（防 r→0 除零；真实最近由标定表域兜底）
-#define RMAX        15.0f  // 理论最远 L1+L2
+// ================= 机械臂夹心坐标（车头系） =================
+// 末端夹心位置 = f(移爪pwm, 抬落pwm)。机械臂为"两连杆+曲柄非线性"，纯解析难以精确，
+// 故用实测标定点散点反距离加权插值(IDW)：数据在 arm_cal.cpp（只读 flash），FK/IK 由 bivar 查插。
 
-// 标定映射（实测 22 点拟合）：表按横轴升序排列。纵轴出界自动夹到首尾。
-// 注：真实机械为 7cm 两连杆 + 曲柄连杆驱动第二节 + 夹爪水平延伸约7cm/低0.75cm（肩轴车头后6.5cm、离地10.5cm），
-// 但实测数据与纯二连杆几何不完全吻合，故采用等效模型（L=7.5 二连杆 + 拟合 AH/XO + 角度表），
-// 表域内 FK/IK 精确互逆闭环、22 点残差 <2cm。表域=实际可达域，表外命令判"不可达"。
-// α(第一节与水平夹角, 度) → 右舵机 pwm（角度升序、pwm 降序）
-const float ALPHA_X[] = { 59.8f, 72.2f, 112.7f, 125.6f };
-const float ALPHA_PWM[] = { 220.f, 200.f, 150.f, 130.f };
-// β(两臂夹角, 度) → 左舵机 pwm（均升序）
-const float BETA_X[] = { 15.6f, 47.6f, 64.0f, 102.0f };
-const float BETA_PWM[] = { 130.f, 150.f, 180.f, 230.f };
-
-// 分段线性插值（查表），横轴需升序
+// 分段线性插值（查表），横轴需升序。仍被 move/spin 时长表复用。
 static float plerp(const float* xs, const float* ys, int n, float x) {
   if (x <= xs[0]) return ys[0];
   for (int i = 1; i < n; i++) {
@@ -39,40 +20,9 @@ static float plerp(const float* xs, const float* ys, int n, float x) {
   return ys[n-1];
 }
 
-// 反查表：已知 pwm 求对应角度。ys（PWM）可为升序（BETA）或降序（ALPHA：α 越大 PWM 越小）。
-// 旧版只按升序逻辑查，对降序表把所有中间值塌到端点 → 状态里高/前中间不变、抬落方向颠倒。
-static float inv_plerp(const float* xs, const float* ys, int n, float y) {
-  if (ys[0] <= ys[n - 1]) {                  // 升序
-    if (y <= ys[0]) return xs[0];
-    for (int i = 1; i < n; i++) {
-      if (y <= ys[i]) {
-        float t = (y - ys[i-1]) / (ys[i] - ys[i-1]);
-        return xs[i-1] + t * (xs[i] - xs[i-1]);
-      }
-    }
-    return xs[n-1];
-  } else {                                   // 降序（如 ALPHA_PWM）
-    if (y >= ys[0]) return xs[0];
-    for (int i = 1; i < n; i++) {
-      if (y >= ys[i]) {
-        float t = (y - ys[i-1]) / (ys[i] - ys[i-1]);
-        return xs[i-1] + t * (xs[i] - xs[i-1]);
-      }
-    }
-    return xs[n-1];
-  }
-}
-
-// 机械臂末端前端坐标（前向运动学）：由当前左右舵机 pwm 反解 α/β，得末端相对轴(前方cm, 向上cm)。
-// 挖斗式两连杆：第一节 A 与水平夹角 α，A 与 B 内夹 β（在关节处靠反向折叠）；
-// 由 arm_pose 反解验证得 tip = A头 − L2·e^{i(α+β)}（A头=L1·e^{iα}）。
+// 机械臂末夹心坐标（车头系：x=前方cm / h=离地cm）→ bivar 散点插值；失败时置 0，由调用方限位提示兜底。
 static void arm_fk(int16_t reach_pwm, int16_t lift_pwm, float* x_out, float* h_out) {
-  float a = inv_plerp(ALPHA_X, ALPHA_PWM, 4, (float)lift_pwm) * PI / 180.0f;
-  float b = inv_plerp(BETA_X,  BETA_PWM,  4, (float)reach_pwm) * PI / 180.0f;
-  float x = IK_L1 * cosf(a) - IK_L2 * cosf(a + b) + AXIS_X_OFF;  // 车头系轴前方 cm
-  float z = IK_L1 * sinf(a) - IK_L2 * sinf(a + b);   // 相对轴，向上+
-  *x_out = x;
-  *h_out = z + AXIS_H;                                // 离地高度 cm
+  if (!bivar::arm_fk((float)reach_pwm, (float)lift_pwm, x_out, h_out)) { *x_out = 0; *h_out = 0; }
 }
 
 // ================= 舵机限位 / 回中（移植自执行板官方机械臂驱动，勿随意改） =================
@@ -82,7 +32,7 @@ static void arm_fk(int16_t reach_pwm, int16_t lift_pwm, float* x_out, float* h_o
 #define STEER_CENTER  150
 #define STEER_LO      120
 #define STEER_HI      180
-// Servo2 前后移爪（reach/左舵机·推杆）：有效行程按实测 β 表 130..230，留余量 120..250
+// Servo2 前后移爪（reach/左舵机·推杆）
 #define REACH_CENTER  200
 #define REACH_LO      120
 #define REACH_HI      250
@@ -91,18 +41,21 @@ static void arm_fk(int16_t reach_pwm, int16_t lift_pwm, float* x_out, float* h_o
 #define GRIP_CLOSE    50
 #define GRIP_LO       50
 #define GRIP_HI       140
-// Servo4 抬落（lift/右舵机·第一节）：有效行程按实测 α 表 130..220，留余量 115..250
+// Servo4 抬落（lift/右舵机·第一节）
 #define LIFT_CENTER   180
 #define LIFT_LO       115
 #define LIFT_HI       250
-// 连续动作每拍末端步进（联动模式）：loop 约 10ms 一拍 → 0.06cm/拍 ≈ 6cm/s 末端速度，
-// 过快（原 0.25cm/拍=25cm/s）机械臂会抖、AI 难以精确到位。约 16 拍/cm
-#define ARM_STEP_CM    0.06f
-#define ARM_CNT_PER_CM 16
-// fold 折叠姿态（查 IK 标定表）：右舵机 α=90°（第一节竖直）→ 130；左舵机 β 最小（第二节折回）→ 130。
-// 区别于 reset 回中（臂仍前伸、盲区大），折叠态摄像头最高、视野最大。
+// 持续动作（lift_up/down、reach_forward/backward）：每拍让夹心沿目标轴平动一小步（另一维不动），
+// 经 FK→步进→arm_pose 联动两舵机反解下发。步长须大到散点 IDW 反解能推进（0.06 会卡死不前进）。
+#define ARM_STEP_CM     0.5f   // 每拍夹心平动 cm ≈ 50cm/s（loop 约 10ms 一拍）
+#define ARM_CNT_PER_CM  2      // 定距 dist_cm 折算拍数（粗近似，拍数≈步长/步数）
+// fold 折叠姿态：抬落/移爪舵机都收到 130（收臂折叠）。区别于 reset 回中（臂仍前伸、盲区大），
+// 折叠态摄像头最高、视野最大。
 #define FOLD_LIFT_PWM  130
 #define FOLD_REACH_PWM 130
+// S 形（正弦）速度峰值(PWM/拍，loop 约 10ms 一拍)：两端 0=缓出缓入、中段峰值 2。
+// 离散到位(fold / arm_pose / reset)统一走该曲线，避免一次性跳舵机把整车带震。
+#define ARM_SMOOTH_PEAK 2.0f
 
 // AI 微操的"时长近似"换算（无里程计，只能按时长模拟距离/角度）。系数来自真机实测标定：
 // 移动 actual_cm≈v(throttle)*t_s+c(throttle)，车速对油门不敏感（≈10..12.5cm/s），高油门带起停余量；
@@ -120,16 +73,38 @@ static const float SPIN_MSDEG_X[] = { 700.0f, 800.0f, 900.0f, 1000.0f };
 static const float SPIN_MSDEG_Y[] = { 53.5f,  28.1f,  13.9f,  8.65f };
 
 // ================= 内部状态 =================
-// 当前各舵机 pwm（写板前跟踪，随指令/步进更新）
+// 当前各舵机 PWM（写板前跟踪，随指令/步进更新）
 static int16_t s_steer = STEER_CENTER;
 static int16_t s_reach = REACH_CENTER;
 static int16_t s_lift  = LIFT_CENTER;
 static int16_t s_grip  = GRIP_CENTER;
 
+// 缓动分离：s_reach/s_lift = 目标(逻辑/状态读取用)，s_reach_w/s_lift_w = 实际写入板的 PWM。
+// 离散定位(fold/arm_pose/reset/init)在 update_tick 里用 S 形曲线把 s_*_w 追向 s_*；
+// 持续动作仍逐拍小步、不经缓动。t0 为缓动曲线行程锚点（新指令跳远时重置）。夹爪不参与。
+static int16_t s_reach_w = REACH_CENTER;
+static int16_t s_lift_w  = LIFT_CENTER;
+static int32_t s_reach_t0 = 0;
+static int32_t s_lift_t0  = 0;
+
 // 小车行驶状态（本地合成用）：0 停 / 1 前 / 2 后
 static int s_car_motion = 0;
 static int s_steer_dir  = 0;  // 0 正前 / 1 左 / 2 右
 static int s_spin = 0;        // 原地旋转：0 无 / 1 左进右退(右转/顺时针) / -1 左退右进(左转/逆时针)
+
+// 夹心逻辑位置（车头系：x 前方cm / h 离地cm）。持续按钮在它之上步进后经 arm_pose 单点定位，
+// 不再依赖 FK→微步→反解的连续闭环（散点 IDW 下该闭环会卡住）。由 每次臂指令 同步重置。
+static float s_claw_x = 0, s_claw_h = 0;
+
+// 最近一次 arm_pose 撞边界/不可达诊断：记录被拒/被夹紧的目标位姿，供 read_state 反馈。
+// 撞边界已被 arm_clamp 夹到盒内最近合法点并继续移动（reason=1），不再拒绝。
+static struct {
+  bool armed;     // 有未消费的诊断
+  int  reason;    // 1=撞边界已夹紧到最近合法点 / 2=移爪越限 / 3=抬落越限
+  float x, h;     // 请求的目标夹心坐标（未夹紧前）
+  float cx, ch;   // reason=1 时夹紧后的实际落点
+  int rr, ll;     // reason=2/3 时反解出的 target pwm
+} s_arm_rej = { false, -1, 0, 0, 0, 0, 0 };
 
 // 灯状态记忆（供 get_state 查询同步手机按钮）：仅记录是否开，开关动作由 nezha::led 落地。
 static bool s_light_front = false;
@@ -197,10 +172,25 @@ static void send_spin(const JsonObjectConst& p) {
 
 static void clear_active(void) { s_active.axis = -1; s_active.budget = 0; }
 
+// S 形缓动一步：把"已写 cur"平滑追向"目标 tgt"。速度按正弦分布（两端 0=缓出缓入、中段峰值），
+// 目标显著跳远(新指令)会重新锚定行程并本拍不动作为缓入；到位直接落定，避免往返抖动。
+static void advance_smooth(int16_t* cur, int16_t tgt, int32_t* t0) {
+  int32_t gap = (int32_t)tgt - (int32_t)*cur;
+  if (gap == 0) { *t0 = 0; return; }
+  int32_t rem = gap < 0 ? -gap : gap;
+  if (rem > *t0) { *t0 = rem; return; }             // 目标跳远 → 缓入起点，本拍不动
+  float p = (float)(*t0 - rem) / (float)*t0;        // 已完成比例 0..1
+  if (p > 1.0f) p = 1.0f;
+  int16_t step = (int16_t)(ARM_SMOOTH_PEAK * sinf((float)PI * p) + 0.5f);
+  if (step < 1) step = 1;                           // 保底，确保最终必到
+  if (rem <= step) { *cur = tgt; *t0 = 0; return; }
+  *cur += (gap > 0 ? step : -step);
+}
+
 static void write_steer(void) { nezha::set_servo(1, (uint16_t)s_steer); }
-static void write_reach(void) { nezha::set_servo(2, (uint16_t)s_reach); }
+static void write_reach(void) { nezha::set_servo(2, (uint16_t)s_reach_w); }
 static void write_grip(void)  { nezha::set_servo(3, (uint16_t)s_grip); }
-static void write_lift(void)  { nezha::set_servo(4, (uint16_t)s_lift); }
+static void write_lift(void)  { nezha::set_servo(4, (uint16_t)s_lift_w); }
 
 static void set_steer_pwm(int16_t p) {
   if (p < STEER_LO) p = STEER_LO;
@@ -211,6 +201,7 @@ static void set_steer_pwm(int16_t p) {
 
 void exec::init(void) {
   // 惰性：nezha::init 幂等。回中四个舵机 + 电机 0。
+  bivar::arm_init();   // 校验机械臂夹心标定散点并置 ready（setup 期调用一次，幂等）
   set_steer_pwm(STEER_CENTER);
   s_reach = REACH_CENTER;  write_reach();
   s_lift  = LIFT_CENTER;   write_lift();
@@ -223,6 +214,7 @@ void exec::reset(void) {
   s_spin = 0;
   s_move_cap_until = 0;
   clear_active();
+  s_arm_rej.armed = false;  // 回正清掉旧的"目标不可达"诊断，避免状态残留误导
   exec::init();
 }
 
@@ -234,19 +226,30 @@ void exec::update_tick(void) {
     s_car_motion = 0;
     s_spin = 0;  // 原地旋转定角到点也一并复位，避免状态误报"仍在原地转"
   }
-  if (s_active.axis < 0) return;
-  // 联动步进：读当前末端 fk，沿目标轴步进 0.25cm、保持另一维，反解联动双舵机下发。
-  // 这样 reach 保持高度平移、lift 保持 x 升降，而不是单舵机造成的 x/h 同时漂移。
-  float fx = 0, fh = 0;
-  arm_fk(s_reach, s_lift, &fx, &fh);
-  float tx = fx, th = fh;
+  if (s_active.axis < 0) {
+    // 无活跃持续动作：离散定位（fold / arm_pose / reset / init）经 S 形缓动把已写值追向目标，
+    // 避免一次性跳舵机把整车带震。夹爪不参与，仍即时到位。
+    int16_t nr = s_reach_w, nl = s_lift_w;
+    advance_smooth(&nr, s_reach, &s_reach_t0);
+    advance_smooth(&nl, s_lift,  &s_lift_t0);
+    if (nr != s_reach_w || nl != s_lift_w) { s_reach_w = nr; s_lift_w = nl; write_reach(); write_lift(); }
+    return;
+  }
+  // 夹心持续平动：在逻辑位置 s_claw 上沿目标轴步进、保持另一维，再 arm_pose 单点定位。
+  // 用维护的 xh 逻辑状态做增量，避免沿 FK→微步→反解的连续闭环（散点 IDW 下该闭环卡死不前进）。
+  if (s_claw_x < 1.f && s_claw_h < 1.f) {   // 逻辑位置未初始化（reset 后首动）：从当前舵机反算
+    arm_fk(s_reach, s_lift, &s_claw_x, &s_claw_h);
+  }
+  float tx = s_claw_x, th = s_claw_h;
   if (s_active.axis == 0) tx += ARM_STEP_CM * s_active.dir;   // 前伸/缩回：x 变，h 不变
   else                    th += ARM_STEP_CM * s_active.dir;   // 抬/落：h 变，x 不变
-  if (!exec::arm_pose(tx, th)) { clear_active(); return; }    // 超出可达域：到边即停
-  // 机械限位/反解 clamp 导致末端没实际移动时停止，避免持续空转
-  float nx = 0, nh = 0;
-  arm_fk(s_reach, s_lift, &nx, &nh);
-  if (fabsf(nx - fx) < 0.005f && fabsf(nh - fh) < 0.005f) { clear_active(); return; }
+  // 撞边界先夹到盒内合法点（继续移动，不拒绝）
+  bivar::arm_clamp(&tx, &th);
+  if (!exec::arm_pose(tx, th)) { clear_active(); return; }    // 夹紧后仍不可达（物理限位）：到边即停
+  s_reach_w = s_reach; s_lift_w = s_lift; write_reach(); write_lift();
+  // 逻辑位置直接用"目标坐标"推进（已夹）：IDW 下 FK∘IK 不互逆，若用实际 pwm 反算当起点，
+  // 每步会被反算回拽（h 荡在 4.75~5.2），表现为按钮降不下去；目标坐标推进等价多次小步 move。
+  s_claw_x = tx; s_claw_h = th;
   if (s_active.budget > 0) {
     if (--s_active.budget <= 0) clear_active();
   }
@@ -281,8 +284,8 @@ static void send_arm(const JsonObjectConst& p) {
     clear_active();
     s_grip = GRIP_HI; write_grip();
   } else if (!strcmp(act_, "fold")) {
-    // 收臂折叠回平台（一次性离散）：右舵机 α=90° 竖直、左舵机 β 最小折回、夹爪回中；
-    // 摄像头到最高位扩大视野、避开盲区。不动车轮（区别于 reset 的全停）。
+    // 收臂折叠回平台（一次性离散）：抬落 + 移爪都收到 130、夹爪回中；摄像头到最高位扩大视野、避开盲区。
+    // 不动车轮（区别于 reset 的全停）。
     clear_active();
     s_lift  = FOLD_LIFT_PWM;  write_lift();
     s_reach = FOLD_REACH_PWM; write_reach();
@@ -356,32 +359,22 @@ bool exec::set_servo(uint8_t logical, uint16_t pwm) {
 }
 
 bool exec::arm_pose(float x, float h) {
-  // 给末端目标位姿：x=车头系轴前方 cm，h=地面以上高度 cm。
-  // 相对臂基坐标 z = h - AXIS_H、xa = x - AXIS_X_OFF；二连杆反解 → (α,β) → 查表得两舵机 pwm。
-  float z = h - AXIS_H;
-  float xa = x - AXIS_X_OFF;
-  float r2 = xa * xa + z * z;
-  if (r2 < RMIN * RMIN || r2 > RMAX * RMAX) return false;  // 目标不可达
-  float r = sqrtf(r2);
-  float d = (IK_L1*IK_L1 + IK_L2*IK_L2 - r2) / (2.f*IK_L1*IK_L2);
-  d = d > 1.f ? 1.f : (d < -1.f ? -1.f : d);
-  float beta = acosf(d) * 180.f / PI;
-  float ph = (IK_L1*IK_L1 + r2 - IK_L2*IK_L2) / (2.f*IK_L1*r);
-  ph = ph > 1.f ? 1.f : (ph < -1.f ? -1.f : ph);
-  float phi0 = acosf(ph) * 180.f / PI;               // 原点处基线与第一节夹角
-  float psi  = atan2f(z, xa) * 180.f / PI;           // 原点指向目标的方位角
-  float alpha = psi + phi0;
-  // 反解角度超出标定表域 = 超出实测可达范围，明确判不可达（表外插值不闭环、会送到错误位置）。
-  if (alpha < ALPHA_X[0] - 1.f || alpha > ALPHA_X[3] + 1.f ||
-      beta  < BETA_X[0]  - 1.f || beta  > BETA_X[3]  + 1.f)
-    return false;
-
-  int pr = (int)roundf(plerp(ALPHA_X, ALPHA_PWM, 4, alpha));
-  int pl = (int)roundf(plerp(BETA_X,  BETA_PWM,  4, beta));
-  pr = pr < 50 ? 50 : (pr > 250 ? 250 : pr);
-  pl = pl < 50 ? 50 : (pl > 250 ? 250 : pl);
+  // 给末端目标位姿：x=夹心车头前方 cm，h=夹心离地高度 cm。反解走 bivar 散点插值。
+  // 目标在标定可达盒内直接反解；超出盒(撞边界)则先夹到盒内最近的合法点再反解——不拒绝，
+  // 而是移到最接近的合法位姿。夹紧后仍不可达（物理舵机限位）才会拒绝并记录诊断。
+  s_arm_rej.x = x; s_arm_rej.h = h;
+  bool clamped = bivar::arm_clamp(&x, &h);
+  // 夹到盒内后戳地(h<0)已不可达（盒 h 最小>0），这里仅兜底负高度竖直挤压情形。
+  float reach = 0, lift = 0;
+  if (!bivar::arm_ik(x, h, &reach, &lift)) return false;  // 夹紧后仍出盒/不可达
+  int rr = (int)roundf(reach), ll = (int)roundf(lift);     // 左=移爪 reach / 右=抬落 lift
+  // 越物理限位判不可达并记录诊断（盒内点一般不至于，但角区外插可能跑到）
+  if (rr < REACH_LO || rr > REACH_HI) { s_arm_rej.armed = true; s_arm_rej.reason = 2; return false; }
+  if (ll < LIFT_LO  || ll > LIFT_HI ) { s_arm_rej.armed = true; s_arm_rej.reason = 3; return false; }
+  if (clamped) { s_arm_rej.armed = true; s_arm_rej.reason = 1; s_arm_rej.cx = x; s_arm_rej.ch = h; }
+  else         { s_arm_rej.armed = false; }
   // 联动：一次同时给左右两舵机目标。set_servo 内部会限 pwm 并同步状态。
-  bool ok = set_servo(1, (uint16_t)pl) & set_servo(2, (uint16_t)pr);
+  bool ok = set_servo(1, (uint16_t)rr) & set_servo(2, (uint16_t)ll);
   return ok;
 }
 
@@ -393,7 +386,7 @@ bool exec::act(const char* type, const JsonObjectConst& params) {
   if (!strcmp(type, "stop"))   { send_stop(params); return true; }
   if (!strcmp(type, "arm"))    { send_arm(params);  return true; }
   if (!strcmp(type, "arm_pose")) {
-    // AI/手动指定位姿：x=轴前方 cm，h=夹爪中心离地高度 cm；不可达返回 false（不动）。
+    // AI/手动指定位姿：x=夹心车头前方 cm，h=夹心离地高度 cm；不可达返回 false（不动）。
     return arm_pose(params["x"] | 0.0f, params["h"] | 0.0f);
   }
   if (!strcmp(type, "light")) {
@@ -464,5 +457,18 @@ bool exec::read_state(char* buf, size_t cap) {
   if (fk_x < 0) fk_x = 0;
   snprintf(buf, cap, "小车:%s %s | 抓手:前%.0fcm(%d) 高%.0fcm(%d) 爪:%s%s",
     car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, lim);
+  // 撞边界/不可达诊断：反馈"想去哪、实际落到哪/反解成多少"，帮用户/AI 判断机械臂边界
+  // （exec_log 推给手机）。reason=1 表示撞边界但已夹到最近合法点继续移动，非错误。
+  if (s_arm_rej.armed) {
+    char d[96];
+    if (s_arm_rej.reason == 1) {
+      snprintf(d, sizeof(d), " | 撞边界[已移至最近点(%.1f,%.1f)]", s_arm_rej.cx, s_arm_rej.ch);
+    } else {
+      const char* rc = s_arm_rej.reason == 2 ? "移爪越限" : "抬落越限";
+      snprintf(d, sizeof(d), " | 目标(%.1f,%.1f)不可达[%s] 反解reach=%d lift=%d",
+        s_arm_rej.x, s_arm_rej.h, rc, s_arm_rej.rr, s_arm_rej.ll);
+    }
+    if (strlen(buf) + strlen(d) + 1 < cap) strcat(buf, d);
+  }
   return buf[0] != '\0';
 }
