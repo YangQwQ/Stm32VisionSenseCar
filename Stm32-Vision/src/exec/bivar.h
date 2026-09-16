@@ -10,7 +10,7 @@
 // 无需规则网格，超出实测范围（距最近点过远）判不可达返回 false。
 namespace bivar {
 
-// 机械臂标定散点：手感内可线性移动的实测点（数据源在 arm_cal.cpp，只读 flash）
+// 机械臂标定散点：手感内可线性移动的实测点（数据在 Calibration.h 的 kArmPts，只读）
 typedef struct {
   float r, l;   // 舵机 PWM：r=移爪 reach / l=抬落 lift
   float x, h;   // 夹心坐标：x=车头前向 cm / h=离地 cm
@@ -21,7 +21,7 @@ typedef struct {
   const CalPt* pts;   // 散点数组
 } ArmSet;
 
-// 数据源接入点：返回标定散点集（实现于 arm_cal.cpp）
+// 数据源接入点：返回标定散点集（实现于 Calibration.cpp）
 const ArmSet* arm_set(void);
 
 // setup 期调用一次：校验点数足够、计算特征尺寸（平均最近邻间距）供范围判定，置 ready。

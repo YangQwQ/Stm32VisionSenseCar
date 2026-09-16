@@ -1,9 +1,9 @@
-#include "ble.h"
-#include "command.h"
-#include "board_log.h"
-#include "config.h"
-#include "wifi_net.h"
-#include "ai_client.h"
+#include "src/net/ble.h"
+#include "src/core/command.h"
+#include "src/core/board_log.h"
+#include "src/net/config.h"
+#include "src/net/wifi_net.h"
+#include "src/ai/ai_client.h"
 
 #include <ArduinoJson.h>
 

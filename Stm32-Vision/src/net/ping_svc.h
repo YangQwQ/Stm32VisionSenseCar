@@ -1,5 +1,5 @@
 #pragma once
-#include "command.h"
+#include "src/core/command.h"
 
 // ping 服务：对 IP/域名发起异步 ICMP echo（esp_ping），结果经 cmd 回复通道回报。
 // 用在 /ping <目标>（如 /ping 192.168.1.1 或 /ping baidu.com）：板子去 ping 目标并

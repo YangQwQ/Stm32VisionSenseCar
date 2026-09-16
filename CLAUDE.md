@@ -30,18 +30,21 @@
 | 文件 | 作用 |
 |---|---|
 | `Stm32-Vision.ino` | 入口（setup 按序初始化，loop 调各模块 update + `exec::update_tick`） |
-| `camera(.h/.cpp)` `camera_pins.h` | 摄像头初始化 + JPEG 双缓冲抓帧（图传与 AI 并发取帧，抓帧模式 `WHEN_EMPTY`；画面已在 init 回正）；引脚定义唯一配置点在 `camera.h` 顶部选 `CAMERA_MODEL_*` |
-| `camera_index.h` | Web 前端页面（源自例程，现基本不用） |
-| `config(.h/.cpp)` | WiFi / AI 接口参数，NVS 持久化 |
-| `wifi_net(.h/.cpp)` | STA 连接 + 断线重连（namespace `net`，勿改回 `network`） |
-| `direct_exec(.h/.cpp)` | **执行器直驱层**：move/stop/arm/arm_pose/light/reset/spin 落地到哪吒板；机械臂二连杆 IK + 连续动作步进 + `fold` 收臂；定距/定角到点自停；本地合成状态文本（含正运动学末端位置） |
-| `nezha_direct(.h/.cpp)` | 哪吒扩展板软 I2C 驱动（舵机 / 电机 / 灯），协议与硬件一致 |
-| `command(.h/.cpp)` | 统一词表 JSON 分发（与传输解耦）；手动指令先 `ai::cancel` 打断 AI 再落地；`ai_goal` 触发 `ai::set_goal` 闭环；统一日志指令 `log`（`blog` 模块）、`get_state` 查询回包 |
-| `board_log(.h/.cpp)` | 统一日志模块（namespace `blog`）：所有串口调试统一经 `logf`（带来源标记），按 `/log` 开关（exec/ai/all）经队列+转发任务把 `{type:"log",params:{src,text}}` 发手机（WS+BLE） |
-| `ping_svc(.h/.cpp)` | `/ping <目标>` 异步 ICMP 探测（无目标则就地回 pong） |
-| `ble(.h/.cpp)` | BLE GATT Server：配网 + 兜底控制 + status 通知（广播名 VisionS3） |
-| `app_httpd.cpp` | HTTP（MJPEG/拍照/LED）+ WS（端口 81 文本 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（`ws_stream` 任务栈 8192） |
-| `ai_client(.h/.cpp)` | 板载多模态 AI（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait；HTTPClient + keep-alive TLS 复用重试、PSRAM 缓冲；单应标定 + 空间记忆 + 车姿态；默认单帧、按 `carry_prev` 附带上一帧；WS 文本出口做 UTF-8 消毒防手机端 1007 断链） |
+| `src/cam/camera(.h/.cpp)` `camera_pins.h` | 摄像头初始化 + JPEG 双缓冲抓帧（图传与 AI 并发取帧，抓帧模式 `WHEN_EMPTY`；画面已在 init 回正）；引脚定义唯一配置点在 `camera.h` 顶部选 `CAMERA_MODEL_*` |
+| `src/cam/camera_index.h` | Web 前端页面（源自例程，现基本不用） |
+| `src/net/config(.h/.cpp)` | WiFi / AI 接口参数，NVS 持久化 |
+| `src/net/wifi_net(.h/.cpp)` | STA 连接 + 断线重连（namespace `net`，勿改回 `network`） |
+| `src/exec/direct_exec(.h/.cpp)` | **执行器直驱层**：move/stop/arm/arm_pose/light/reset/spin 落地到哪吒板；机械臂二连杆 IK + 连续动作步进 + `fold` 收臂；定距/定角到点自停；本地合成状态文本（含正运动学末端位置） |
+| `src/exec/nezha_direct(.h/.cpp)` | 哪吒扩展板软 I2C 驱动（舵机 / 电机 / 灯），协议与硬件一致 |
+| `src/exec/bivar(.h/.cpp)` | 机械臂夹心坐标散点反距离加权(IDW) 双向插值（FK/IK）；散点 `kArmPts` 与 `arm_set()` 在根 `Calibration.h/.cpp` |
+| `src/core/command(.h/.cpp)` | 统一词表 JSON 分发（与传输解耦）；手动指令先 `ai::cancel` 打断 AI 再落地；`ai_goal` 触发 `ai::set_goal` 闭环；统一日志指令 `log`（`blog` 模块）、`get_state` 查询回包 |
+| `src/core/board_log(.h/.cpp)` | 统一日志模块（namespace `blog`）：所有串口调试统一经 `logf`（带来源标记），按 `/log` 开关（exec/ai/all）经队列+转发任务把 `{type:"log",params:{src,text}}` 发手机（WS+BLE） |
+| `src/net/ping_svc(.h/.cpp)` | `/ping <目标>` 异步 ICMP 探测（无目标则就地回 pong） |
+| `src/net/ble(.h/.cpp)` | BLE GATT Server：配网 + 兜底控制 + status 通知（广播名 VisionS3） |
+| `src/net/app_httpd.cpp` | HTTP（MJPEG/拍照/LED）+ WS（端口 81 文本 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（`ws_stream` 任务栈 8192） |
+| `src/ai/ai_client(.h/.cpp)` | 板载多模态 AI（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait；HTTPClient + keep-alive TLS 复用重试、PSRAM 缓冲；单应标定 + 空间记忆 + 车姿态；默认单帧、按 `carry_prev` 附带上一帧；WS 文本出口做 UTF-8 消毒防手机端 1007 断链） |
+| `src/ai/ground_proj(.h/.cpp)` | 屏幕→地面单应换算（namespace `ground`），供 AI 用 |
+| `Calibration.h/.cpp` | **手动校准数据集中区**（根目录）：舵机限位/机械臂参数、定距/定角移动时长表、屏幕→地面单应标定点 `kGroundCal`、机械臂夹心散点 `kArmPts`；`bivar::arm_set()` 实现在 Calibration.cpp |
 | `partitions.csv` | 分区表（3MB APP，需 `huge_app`） |
 
 ### Mobile-RemoteCtrl/ — 手机遥控 App（Godot 工程）

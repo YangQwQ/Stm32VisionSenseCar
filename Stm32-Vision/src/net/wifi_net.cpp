@@ -1,7 +1,7 @@
-#include "wifi_net.h"
-#include "config.h"
+#include "src/net/wifi_net.h"
+#include "src/net/config.h"
 #include <WiFi.h>
-#include "board_log.h"
+#include "src/core/board_log.h"
 
 // 单次连接尝试超时：begin 后此期间视为"正在尝试"，静默等待连接结果不重复 begin。
 // ESP32 内置 autoconnect 本身会断线重连；手动周期 begin 与它打架会反复打

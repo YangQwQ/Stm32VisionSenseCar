@@ -3,34 +3,10 @@
 // 求解用 Householder QR：正规方程法在 ESP32 单精度 FPU 下条件数平方放大会崩
 // （曾算出 H=(480,-567)）；QR 不放大条件数，double 软件模拟也够。
 
-// ================== 实测标定点（改镜头/移相机后重测此表） ==================
-// 每行一个坐标对：(屏幕归一化 u, v) → (车头系地面 x右+, y前+ cm)。
-// 屏幕归一化：左上(0,0)、右下(1,1)；纵轴越往下越近（v 大→近），横轴 u 小→车左。
-// 锚点参考：屏幕中心 (0.5,0.5)→车前正对 (0,52)；下方中线 (0.5,0.75)→车前偏左 (-8,21)。
-// 增删点保持 ≥4 且尽量覆盖屏幕区域；加测点直接往表里加即可。
-static const double CAL[][4] = {
-  {0.75, 0.125,  78,  85},
-  {0.50, 0.25,   40, 134},
-  {0.75, 0.25,   45,  55},
-  {0.25, 0.375, -50, 242},
-  {0.25, 0.5,   -45, 112},
-  {0.50, 0.5,    0,   52},
-  {0.75, 0.5,    16,  26},
-  {1.0,  0.5,    23,  13},
-  {0.0,  0.75,  -105, 90},
-  {0.25, 0.75,  -38,  48},
-  {0.50, 0.75,  -8,   21},
-  {0.75, 0.75,   1.5, 12},
-  {1.0,  0.75,   7,    6},
-  {0.0,  1.0,   -64,  36},
-  {0.25, 1.0,   -34,  23},
-  {0.50, 1.0,   -15,  14}
-};
-#define CAL_N (int)(sizeof(CAL) / sizeof(CAL[0]))
-
-#include "ground_proj.h"
+#include "Calibration.h"   // 屏幕→地面单应标定点（Calibration.h 集中，加测点改那里即可）
+#include "src/ai/ground_proj.h"
+#include "src/core/board_log.h"
 #include <math.h>  // sqrt/fabs
-#include "board_log.h"
 
 // 当前生效的单应 + 归一化参数（QR 求解后为动态值）
 static double H[8];
@@ -39,9 +15,9 @@ static bool s_ready = false;
 
 // Householder QR 求解超定最小二乘 Ah≈b（m=2N 方程, n=8 未知）→ h 写回 H。
 // A 按列主元反射逐步上三角化，b 同步施加反射，最后回代。返回 false=奇异/数值失败。
-static bool qr_fit(const double A[2 * CAL_N][8], const double b[2 * CAL_N], double h[8]) {
-  const int m = 2 * CAL_N, n = 8;
-  double R[32][8];   // m×n 工作副本（CAL_N≤16 时 m≤32）
+static bool qr_fit(const double A[2 * kGroundCalN][8], const double b[2 * kGroundCalN], double h[8]) {
+  const int m = 2 * kGroundCalN, n = 8;
+  double R[32][8];   // m×n 工作副本（kGroundCalN≤16 时 m≤32）
   double qb[32];
   for (int i = 0; i < m; i++) { for (int j = 0; j < n; j++) R[i][j] = A[i][j]; qb[i] = b[i]; }
   for (int k = 0; k < n; k++) {
@@ -78,20 +54,20 @@ static bool qr_fit(const double A[2 * CAL_N][8], const double b[2 * CAL_N], doub
 bool ground::init(void) {
   // 归一化参数（均值 + 平均绝对偏差）
   double um = 0, vm = 0, xm = 0, ym = 0;
-  for (int i = 0; i < CAL_N; i++) { um += CAL[i][0]; vm += CAL[i][1]; xm += CAL[i][2]; ym += CAL[i][3]; }
-  um /= CAL_N; vm /= CAL_N; xm /= CAL_N; ym /= CAL_N;
+  for (int i = 0; i < kGroundCalN; i++) { um += kGroundCal[i][0]; vm += kGroundCal[i][1]; xm += kGroundCal[i][2]; ym += kGroundCal[i][3]; }
+  um /= kGroundCalN; vm /= kGroundCalN; xm /= kGroundCalN; ym /= kGroundCalN;
   double us = 0, vs = 0, xs = 0, ys = 0;
-  for (int i = 0; i < CAL_N; i++) {
-    us += fabs(CAL[i][0] - um); vs += fabs(CAL[i][1] - vm);
-    xs += fabs(CAL[i][2] - xm); ys += fabs(CAL[i][3] - ym);
+  for (int i = 0; i < kGroundCalN; i++) {
+    us += fabs(kGroundCal[i][0] - um); vs += fabs(kGroundCal[i][1] - vm);
+    xs += fabs(kGroundCal[i][2] - xm); ys += fabs(kGroundCal[i][3] - ym);
   }
-  us = us / CAL_N; vs = vs / CAL_N; xs = xs / CAL_N; ys = ys / CAL_N;
+  us = us / kGroundCalN; vs = vs / kGroundCalN; xs = xs / kGroundCalN; ys = ys / kGroundCalN;
   if (us < 1e-9) us = 1; if (vs < 1e-9) vs = 1; if (xs < 1e-9) xs = 1; if (ys < 1e-9) ys = 1;
 
   double A[32][8], b[32];
-  for (int i = 0; i < CAL_N; i++) {
-    double u = (CAL[i][0] - um) / us, v = (CAL[i][1] - vm) / vs;
-    double x = (CAL[i][2] - xm) / xs, y = (CAL[i][3] - ym) / ys;
+  for (int i = 0; i < kGroundCalN; i++) {
+    double u = (kGroundCal[i][0] - um) / us, v = (kGroundCal[i][1] - vm) / vs;
+    double x = (kGroundCal[i][2] - xm) / xs, y = (kGroundCal[i][3] - ym) / ys;
     A[2 * i][0] = u; A[2 * i][1] = v; A[2 * i][2] = 1; A[2 * i][3] = 0;
     A[2 * i][4] = 0; A[2 * i][5] = 0; A[2 * i][6] = -u * x; A[2 * i][7] = -v * x; b[2 * i] = x;
     A[2 * i + 1][0] = 0; A[2 * i + 1][1] = 0; A[2 * i + 1][2] = 0; A[2 * i + 1][3] = u;
@@ -106,11 +82,11 @@ bool ground::init(void) {
   SU_MU = um; SU_S = us; SV_MU = vm; SV_S = vs; SX_MU = xm; SX_S = xs; SY_MU = ym; SY_S = ys;
   s_ready = true;
   float maxerr = 0;
-  for (int i = 0; i < CAL_N; i++) {
+  for (int i = 0; i < kGroundCalN; i++) {
     float ex, ey;
-    screen_to_world((float)CAL[i][0], (float)CAL[i][1], &ex, &ey);
-    float e = sqrtf((ex - (float)CAL[i][2]) * (ex - (float)CAL[i][2]) +
-                    (ey - (float)CAL[i][3]) * (ey - (float)CAL[i][3]));
+    screen_to_world((float)kGroundCal[i][0], (float)kGroundCal[i][1], &ex, &ey);
+    float e = sqrtf((ex - (float)kGroundCal[i][2]) * (ex - (float)kGroundCal[i][2]) +
+                    (ey - (float)kGroundCal[i][3]) * (ey - (float)kGroundCal[i][3]));
     if (e > maxerr) maxerr = e;
   }
   if (maxerr <= 5.f) { blog::logf(blog::CAM, "单应QR求解成功 回验最大误差=%.1fcm", maxerr); return true; }

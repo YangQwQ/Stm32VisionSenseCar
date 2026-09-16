@@ -1,11 +1,11 @@
-#include "command.h"
-#include "config.h"
-#include "wifi_net.h"
-#include "ai_client.h"
-#include "direct_exec.h"
-#include "ping_svc.h"
-#include "nezha_direct.h"
-#include "board_log.h"
+#include "src/core/command.h"
+#include "src/net/config.h"
+#include "src/net/wifi_net.h"
+#include "src/ai/ai_client.h"
+#include "src/exec/direct_exec.h"
+#include "src/net/ping_svc.h"
+#include "src/exec/nezha_direct.h"
+#include "src/core/board_log.h"
 
 // 应答格式遵循架构 §5.1：板 → 手机文本 = {type:status/pong, params:{...}, id:<回填>}。
 // move/stop/arm 是高频手动指令，只在 UART 层记录，不回文本（避免刷屏）。

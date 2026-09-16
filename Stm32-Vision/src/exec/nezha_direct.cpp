@@ -1,4 +1,4 @@
-#include "nezha_direct.h"
+#include "src/exec/nezha_direct.h"
 
 // 哪吒 I2C 引脚（本板空闲脚，见 CLAUDE.md 引脚占用）。SCL=47 / SDA=14。
 #define NZ_SCL  47

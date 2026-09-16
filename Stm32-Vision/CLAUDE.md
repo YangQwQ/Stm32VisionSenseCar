@@ -17,32 +17,34 @@
 
 ## 代码库结构
 
-源自 Espressif 官方 `CameraWebServer` 例程，已按功能模块拆分重构（文件均在 sketch 根目录）：
+源自 Espressif 官方 `CameraWebServer` 例程，已按功能模块拆分。**源码全部位于 `src/` 下按模块分的子目录**（`Stm32-Vision.ino`、`partitions.csv`、`build_opt.h` 仍在 sketch 根目录）。源码内的本项目头文件 include 一律以 `src/` 为根的相对路径（如 `#include "net/wifi_net.h"`）书写——Arduino 只把 `src/`（不含其子目录）加入 include path，子目录会递归编译但不进搜索路径，因此不要改回无前缀形式：
 
 | 文件 | 作用 |
 | --- | --- |
 | `Stm32-Vision.ino` | 入口：setup 按 cfg→ble→exec→cam→net→web→ai 初始化；loop 调各模块 update + `exec::update_tick()` |
-| `camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`；抓帧模式 `CAMERA_GRAB_WHEN_EMPTY`——图传与 AI 是两个并发取帧方，用 `LATEST` 会与之抢缓冲导致取帧卡死）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`；画质参数（分辨率/JPEG 质量）与画面回正（`vflip`/`hmirror`，使所见即真实方位）集中在 `camera.cpp` `init()` 顶部，推流帧率在 `app_httpd.cpp`（`WS_STREAM_FPS`，图传走 UDP） |
-| `camera_pins.h` | 各摄像头型号 GPIO 引脚定义（按 `CAMERA_MODEL_*` 分支） |
-| `camera_index.h` | Web 前端页面（HTML/JS 内嵌数组，源自例程，现基本不用） |
-| `config.h/.cpp` | WiFi / AI 接口配置，NVS 持久化（不再写死 ssid/password） |
-| `wifi_net.h/.cpp` | STA 连接 + 断线重连 + 在线换网 `net::reconnect`（namespace `net`）。⚠️ 勿改回 `network`：会与核心库 `Network.h` 在 Windows 大小写不敏感 FS 上遮蔽冲突 |
-| `nezha_direct.h/.cpp` | 哪吒扩展板软 I2C 直驱底座：`set_servo(ch,pwm)` / `set_motor(ch,a,b)` / `led(kind,on)`；从机 `0x80`，协议与哪吒硬件一致 |
-| `direct_exec.h/.cpp` | **执行层**：`act()` 分发 move/stop/arm/arm_pose/light/reset/spin、连续机械臂动作步进 `update_tick()`（兼管定距/定角到点自停）、二连杆 IK `arm_pose()`、本地合成状态 `read_state()`（含末端前/高与爪限位）、持续型判定 `is_continuous()` |
-| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；手动指令先 `ai::cancel` 打断 AI 闭环再落地；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal` 触发板载 AI；`log` 统一日志指令走 `blog` 开关；`get_state` 回灯/夹爪当前态 |
-| `board_log.h/.cpp` | 统一日志模块（namespace `blog`）：`logf(cat,...)` 统一串口调试输出（带 `[类]` 前缀），按 `/log` 开关（exec/ai/all）把 `{type:"log",params:{src,text}}` 入队，由转发任务（栈 8192）经 app_httpd 注册的转发器（WS 广播+BLE status）发手机 |
-| `ai_client.h/.cpp` | 板载多模态 AI HTTP 调用（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait，动作最终走 `exec::act`）：HTTPClient + keep-alive TLS 复用与失败重试、PSRAM 缓冲；物体空间记忆 + 车姿态累积，换算到车头局部系后喂回模型（屏幕→地面换算走 `ground_proj`）；默认单帧，仅当上轮 `carry_prev:true` 才附带上一帧做运动对比；WS 文本出口统一过 `sanitize_ws_utf8` 消毒（云端偶发残缺 UTF-8，原样进 TEXT 帧会让手机端以 `1007` 断链）；发往云端的长字符串按 UTF-8 边界截断（截半个中文字节会被判 400）；服务端持续无有效响应则逐轮退避，超限中止任务并回报手机 |
-| `ground_proj.h/.cpp` | 屏幕→地面坐标换算（namespace `ground`）：实测标定点拟合单应，`ground::screen_to_world(px,py,&x,&y)`；标定点以 (u,v)→(x,y) 坐标对放在文件头部，加测点直接往表里加 |
-| `ping_svc.h/.cpp` | `/ping <目标>` 异步 ICMP echo（esp_ping），结果经 cmd 回复通道回报；无目标仍由 command 就地回 `pong` |
-| `ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知；广播开关随 `set_transmission`（真在推帧即停）（UUID 见下「协议参考」）|
-| `app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（默认关，`/log exec on` 开启后约 400ms 一条；状态缓冲须容下含抓手前端的整行，改状态行时同步核对）。注册 `blog` 日志转发器（WS+BLE）。`ws_stream` 任务栈 8192（推流 + 状态上报共用）。人脸检测/识别已停用（宏置 0） |
+| `src/cam/camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`；抓帧模式 `CAMERA_GRAB_WHEN_EMPTY`——图传与 AI 是两个并发取帧方，用 `LATEST` 会与之抢缓冲导致取帧卡死）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`；画质参数（分辨率/JPEG 质量）与画面回正（`vflip`/`hmirror`，使所见即真实方位）集中在 `camera.cpp` `init()` 顶部，推流帧率在 `net/app_httpd.cpp`（`WS_STREAM_FPS`，图传走 UDP） |
+| `src/cam/camera_pins.h` | 各摄像头型号 GPIO 引脚定义（按 `CAMERA_MODEL_*` 分支） |
+| `src/cam/camera_index.h` | Web 前端页面（HTML/JS 内嵌数组，源自例程，现基本不用） |
+| `src/net/config.h/.cpp` | WiFi / AI 接口配置，NVS 持久化（不再写死 ssid/password） |
+| `src/net/wifi_net.h/.cpp` | STA 连接 + 断线重连 + 在线换网 `net::reconnect`（namespace `net`）。⚠️ 勿改回 `network`：会与核心库 `Network.h` 在 Windows 大小写不敏感 FS 上遮蔽冲突 |
+| `src/exec/nezha_direct.h/.cpp` | 哪吒扩展板软 I2C 直驱底座：`set_servo(ch,pwm)` / `set_motor(ch,a,b)` / `led(kind,on)`；从机 `0x80`，协议与哪吒硬件一致 |
+| `src/exec/direct_exec.h/.cpp` | **执行层**：`act()` 分发 move/stop/arm/arm_pose/light/reset/spin、连续机械臂动作步进 `update_tick()`（兼管定距/定角到点自停）、二连杆 IK `arm_pose()`、本地合成状态 `read_state()`（含末端前/高与爪限位）、持续型判定 `is_continuous()` |
+| `src/exec/bivar.h/.cpp` | 机械臂"夹心坐标"双向散点反距离加权(IDW)插值：FK 用 pwm 距、IK 用 x/h 距；散点表 `kArmPts` 在 Calibration.h，`arm_set()` 实现在 Calibration.cpp |
+| `src/core/command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；手动指令先 `ai::cancel` 打断 AI 闭环再落地；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal` 触发板载 AI；`log` 统一日志指令走 `blog` 开关；`get_state` 回灯/夹爪当前态 |
+| `src/core/board_log.h/.cpp` | 统一日志模块（namespace `blog`）：`logf(cat,...)` 统一串口调试输出（带 `[类]` 前缀），按 `/log` 开关（exec/ai/all）把 `{type:"log",params:{src,text}}` 入队，由转发任务（栈 8192）经 app_httpd 注册的转发器（WS 广播+BLE status）发手机 |
+| `src/ai/ai_client.h/.cpp` | 板载多模态 AI HTTP 调用（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait，动作最终走 `exec::act`）：HTTPClient + keep-alive TLS 复用与失败重试、PSRAM 缓冲；物体空间记忆 + 车姿态累积，换算到车头局部系后喂回模型（屏幕→地面换算走 `ground_proj`）；默认单帧，仅当上轮 `carry_prev:true` 才附带上一帧做运动对比；WS 文本出口统一过 `sanitize_ws_utf8` 消毒（云端偶发残缺 UTF-8，原样进 TEXT 帧会让手机端以 `1007` 断链）；发往云端的长字符串按 UTF-8 边界截断（截半个中文字节会被判 400）；服务端持续无有效响应则逐轮退避，超限中止任务并回报手机 |
+| `src/ai/ground_proj.h/.cpp` | 屏幕→地面坐标换算（namespace `ground`）：实测标定点拟合单应，`ground::screen_to_world(px,py,&x,&y)`；标定点 `kGroundCal` 在 Calibration.h，加测点改那里 |
+| `src/net/ping_svc.h/.cpp` | `/ping <目标>` 异步 ICMP echo（esp_ping），结果经 cmd 回复通道回报；无目标仍由 command 就地回 `pong` |
+| `src/net/ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知；广播开关随 `set_transmission`（真在推帧即停）（UUID 见下「协议参考」）|
+| `src/net/app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（默认关，`/log exec on` 开启后约 400ms 一条；状态缓冲须容下含抓手前端的整行，改状态行时同步核对）。注册 `blog` 日志转发器（WS+BLE）。`ws_stream` 任务栈 8192（推流 + 状态上报共用）。人脸检测/识别已停用（宏置 0） |
+| `Calibration.h/.cpp` | **手动校准数据集中区**（根目录）：舵机限位/机械臂参数（STEER/REACH/GRIP/LIFT、ARM_*）、小车定距/定角移动时长表（MV_*/SPIN_MSDEG_*/SPIN_MIN_SPEED/ARM_CNT_PER_CM）、屏幕→地面单应标定点 `kGroundCal`、机械臂夹心散点 `kArmPts`；`bivar::arm_set()` 实现在 Calibration.cpp |
 | `partitions.csv` | 分区表：app0 约 3.8MB，需选带 3MB+ APP 空间的开发板分区选项 |
 
 ## 直驱执行层要点（`exec` / `nezha`）
 
 - **接线**：哪吒 SCL ← GPIO47，SDA ← GPIO14；I2C 速率 ≤200kHz，软 I2C 开漏实现。
 - **物理映射**：四轮 M1左后 / M2右后 / M3右前 / M4左前（左轮 `a` 正前、右轮 `b` 正前）；舵机 Servo1 转向 / Servo2 移爪 / Servo3 夹爪 / Servo4 抬落。
-- **标定限位**（`direct_exec.cpp` 顶部宏，实测）：转向 150/120/180；移爪中位 200（120..250）；夹爪紧 50 / 松 140；抬落中位 180（115..250）。
+- **标定限位**（`Calibration.h`，实测）：转向 150/120/180；移爪中位 200（120..250）；夹爪紧 50 / 松 140；抬落中位 180（115..250）。
 - **连续动作**：`lift_up/down`、`reach_forward/backward` 为持续型——`update_tick()` 每拍按 `ARM_STEP_CM`(0.06cm) 沿目标轴步进并保持另一维（reach 保持高度 h、lift 保持 x），经 `arm_pose` 反解联动双舵机下发；到可达域边界/机械限位（末端无实际移动）自动停，收到 `stop(scope="arm")` 或离散动作时清除；`clip/release` 为离散置端，`fold` 收臂折叠回平台位。
 - **二连杆 IK**：`arm_pose(x,h)`（x=轴前方 cm，h=地面以上 cm）反解 α/β 后查标定表联动左右两舵机；L1=L2=7.5cm、肩轴离地 9.5cm、可达半径 4..15cm。
 - **无里程计（电机无编码器）**：定距/定角不做闭环，一律按**实测标定表的时长近似**到点自停——`move` 带 `distance_cm` 时按 `MV_SPEED_X/Y`（油门→cm/s）与 `MV_COAST_X/Y`（起停余量）换算时长（需 `cm>0` 且油门非零）；`spin` 带 `angle_deg` 时按 `SPIN_MSDEG_X/Y` 换算；`arm` 的 `dist_cm` 按每 cm ≈ `ARM_CNT_PER_CM` 拍近似。不带定距/定角即为持续动作，靠 `stop` 收尾；AI 侧对无 `distance_cm` 的持续 move 另设 `AI_MOVE_CAP_MS` 上限兜底。
@@ -115,4 +117,4 @@ BLE UUID / 广播名与手机 `../Mobile-RemoteCtrl/net/ble/BleProfile.gd` **逐
 - 指令协议、注释保持简洁；避免在注释里写死具体数值（参数调整时容易忘改）。
 - **串口日志卫生**：手动指令只在类型切换时打一行「收到手动指令」，避免摇杆高频帧刷屏并阻塞控制时序；IDF 系统日志 `esp_log_level_set("*", ESP_LOG_WARN)` 默认静到 WARN，避免与手动指令 ack 争用同一 UART0。
 - 大模型返回的指令必须严格校验后再执行，防止异常 JSON 导致小车误动作。
-- 硬件标定值（舵机限位、IK 几何）集中在 `direct_exec.cpp` 顶部宏，改动前确认已实测。
+- 硬件标定值（舵机限位、IK 几何、移动时长表）集中在 `Calibration.h`，改动前确认已实测。

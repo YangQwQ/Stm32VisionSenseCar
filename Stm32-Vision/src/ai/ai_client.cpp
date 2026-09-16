@@ -1,10 +1,10 @@
-#include "ai_client.h"
-#include "config.h"
-#include "camera.h"
-#include "direct_exec.h"
-#include "wifi_net.h"
-#include "ground_proj.h"
-#include "board_log.h"
+#include "src/ai/ai_client.h"
+#include "src/net/config.h"
+#include "src/cam/camera.h"
+#include "src/exec/direct_exec.h"
+#include "src/net/wifi_net.h"
+#include "src/ai/ground_proj.h"
+#include "src/core/board_log.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>

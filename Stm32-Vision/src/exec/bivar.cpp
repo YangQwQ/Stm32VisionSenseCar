@@ -1,8 +1,8 @@
-#include "bivar.h"
+#include "src/exec/bivar.h"
 #include <math.h>  // fabs/hypotf
 
 // 机械臂"夹心坐标"双向散点反距离加权(IDW)插值。
-// 数据源 arm_cal.cpp（只读 flash）由 arm_set() 提供。FK 用 pwm 距、IK 用 x/h 距做加权。
+// 数据源 Calibration.h 的 kArmPts（只读）由 arm_set() 提供。FK 用 pwm 距、IK 用 x/h 距做加权。
 // 可达域判定用标定点各轴范围（正向/反向包围盒）：索引点在已标定区间内即视为可达
 // （网格很密，IDW 插值可靠）；区间外才判不可达。不用"平均最近邻×K"——那会把网格角区
 // 内、距最近点仅 1~2cm 的合法点误判为超范围。

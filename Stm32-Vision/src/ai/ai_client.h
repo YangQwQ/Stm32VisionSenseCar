@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include "command.h"
+#include "src/core/command.h"
 
 // ai_client 模块：DIRECT 链路板载 AI 客户端。
 // worker 任务负责 HTTP 调用（阻塞不卡 loop）；单槽"最新目标优先"+ 代际号实现

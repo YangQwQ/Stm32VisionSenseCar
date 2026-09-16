@@ -18,8 +18,8 @@
 #include "fb_gfx.h"
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
-#include "camera_index.h"
 #include "lwip/sockets.h"
+#include "src/cam/camera_index.h"
 // lwip 的 inet.h 把 INADDR_NONE/IPADDR_NONE 定义为宏，而 Arduino core 的 IPAddress.h
 // 声明同名全局对象（extern const IPAddress INADDR_NONE），宏会在声明处展开破坏语法；
 // lwip 为预编译库，此处撤销宏不影响其编译期使用。
@@ -107,12 +107,12 @@ static void tune_socket(int fd)
 #ifdef CONFIG_HTTPD_WS_SUPPORT
 // =================== WebSocket（端口 81 根路径，手机 App WSCarClient 通道） ===================
 #include "ArduinoJson.h"
-#include "camera.h"
-#include "command.h"
-#include "ble.h"
-#include "ai_client.h"
-#include "direct_exec.h"
-#include "board_log.h"
+#include "src/cam/camera.h"
+#include "src/core/command.h"
+#include "src/net/ble.h"
+#include "src/ai/ai_client.h"
+#include "src/exec/direct_exec.h"
+#include "src/core/board_log.h"
 
 #define WS_STREAM_FPS 10
 #define WS_EDIT_IMG_MAX (128 * 1024)  // 编辑图（二进制上行）上限，与 ai_client 一致

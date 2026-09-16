@@ -1,12 +1,12 @@
-#include "direct_exec.h"
-#include "nezha_direct.h"
-#include "bivar.h"
+#include "src/exec/direct_exec.h"
+#include "src/exec/nezha_direct.h"
+#include "src/exec/bivar.h"
+#include "Calibration.h"   // 集中式校准数据（舵机限位/移动表/标定点）
 #include <math.h>
 #include <string.h>
 
-// ================= 机械臂夹心坐标（车头系） =================
-// 末端夹心位置 = f(移爪pwm, 抬落pwm)。机械臂为"两连杆+曲柄非线性"，纯解析难以精确，
-// 故用实测标定点散点反距离加权插值(IDW)：数据在 arm_cal.cpp（只读 flash），FK/IK 由 bivar 查插。
+// 机械臂夹心坐标（车头系）：末端夹心 = f(移爪pwm, 抬落pwm)，两连杆+曲柄非线性，
+// 用实测散点反距离加权插值(IDW)（数据在 Calibration.h 的 kArmPts），FK/IK 由 bivar 查插。
 
 // 分段线性插值（查表），横轴需升序。仍被 move/spin 时长表复用。
 static float plerp(const float* xs, const float* ys, int n, float x) {
@@ -24,53 +24,6 @@ static float plerp(const float* xs, const float* ys, int n, float x) {
 static void arm_fk(int16_t reach_pwm, int16_t lift_pwm, float* x_out, float* h_out) {
   if (!bivar::arm_fk((float)reach_pwm, (float)lift_pwm, x_out, h_out)) { *x_out = 0; *h_out = 0; }
 }
-
-// ================= 舵机限位 / 回中（移植自执行板官方机械臂驱动，勿随意改） =================
-// 大圣机械臂(有方NeZha)三舵机：Servo2=左舵机(前后移爪) Servo3=前舵机(夹爪) Servo4=右舵机(抬落)。
-// 每个舵机为一个独立自由度，非左右联动；正负方向见各舵机注释。
-// Servo1 转向：150 正前 / 120 左死 / 180 右死
-#define STEER_CENTER  150
-#define STEER_LO      120
-#define STEER_HI      180
-// Servo2 前后移爪（reach/左舵机·推杆）
-#define REACH_CENTER  200
-#define REACH_LO      120
-#define REACH_HI      250
-// Servo3 夹爪（grip）：夹紧 50 / 松 140 / 回正初始 140
-#define GRIP_CENTER   140
-#define GRIP_CLOSE    50
-#define GRIP_LO       50
-#define GRIP_HI       140
-// Servo4 抬落（lift/右舵机·第一节）
-#define LIFT_CENTER   180
-#define LIFT_LO       115
-#define LIFT_HI       250
-// 持续动作（lift_up/down、reach_forward/backward）：每拍让夹心沿目标轴平动一小步（另一维不动），
-// 经 FK→步进→arm_pose 联动两舵机反解下发。步长须大到散点 IDW 反解能推进（0.06 会卡死不前进）。
-#define ARM_STEP_CM     0.5f   // 每拍夹心平动 cm ≈ 50cm/s（loop 约 10ms 一拍）
-#define ARM_CNT_PER_CM  2      // 定距 dist_cm 折算拍数（粗近似，拍数≈步长/步数）
-// fold 折叠姿态：抬落/移爪舵机都收到 130（收臂折叠）。区别于 reset 回中（臂仍前伸、盲区大），
-// 折叠态摄像头最高、视野最大。
-#define FOLD_LIFT_PWM  130
-#define FOLD_REACH_PWM 130
-// S 形（正弦）速度峰值(PWM/拍，loop 约 10ms 一拍)：两端 0=缓出缓入、中段峰值 2。
-// 离散到位(fold / arm_pose / reset)统一走该曲线，避免一次性跳舵机把整车带震。
-#define ARM_SMOOTH_PEAK 2.0f
-
-// AI 微操的"时长近似"换算（无里程计，只能按时长模拟距离/角度）。系数来自真机实测标定：
-// 移动 actual_cm≈v(throttle)*t_s+c(throttle)，车速对油门不敏感（≈10..12.5cm/s），高油门带起停余量；
-// 原地转角用时 ms/度 随转速骤升，转速低于拖得动线（约700）基本无法平稳转动，故带角度统一抬到可靠转速。
-#define SPIN_MIN_SPEED 800   // 低于此转速原地旋转拖不动，抬升到可靠值
-
-// 移动：v(cm/s) / 起停余量 c(cm)，按油门插值
-static const float MV_SPEED_X[] = { 0.25f, 0.5f,  1.0f };
-static const float MV_SPEED_Y[] = { 10.3f, 11.3f, 12.5f };
-static const float MV_COAST_X[] = { 0.25f, 0.5f,  1.0f };
-static const float MV_COAST_Y[] = { 0.0f,  1.7f,  1.75f };
-
-// 原地旋转：每度用时 ms/度，按转速插值
-static const float SPIN_MSDEG_X[] = { 700.0f, 800.0f, 900.0f, 1000.0f };
-static const float SPIN_MSDEG_Y[] = { 53.5f,  28.1f,  13.9f,  8.65f };
 
 // ================= 内部状态 =================
 // 当前各舵机 PWM（写板前跟踪，随指令/步进更新）

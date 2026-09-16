@@ -1,6 +1,6 @@
-#include "config.h"
+#include "src/net/config.h"
+#include "src/core/board_log.h"
 #include <Preferences.h>
-#include "board_log.h"
 
 static const char* k_ns = "vision";
 
