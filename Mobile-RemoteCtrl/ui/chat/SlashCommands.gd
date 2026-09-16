@@ -34,9 +34,11 @@ static func parse(text: String) -> Dictionary:
 		"/append", "/append_image", "/append image":
 			return _local("append")
 		"/exec_log":
-			return _cmd(CP.exec_log(_on_explicit(_arg(pieces))))
+			return _log_parse(_arg(pieces), "exec")
 		"/ai_log":
-			return _cmd(CP.ai_log(_on_explicit(_arg(pieces))))
+			return _log_parse(_arg(pieces), "ai")
+		"/log":
+			return _log_parse(_arg(pieces), "")
 		"/nz_read":
 			return _cmd(CP.nz_read())
 		"/light":
@@ -215,12 +217,32 @@ static func _light(pieces: Array) -> Dictionary:
 static func _arg(pieces: Array) -> String:
 	return (pieces[1] as String).strip_edges() if pieces.size() > 1 else ""
 
+## /log 统一日志开关：/log <exec|ai|all> [on|off]；缺省 on。旧 /exec_log /ai_log 映射到对应类别。
+static func _log_parse(args: String, forced_cat: String) -> Dictionary:
+	var cat := forced_cat
+	var on := true
+	if forced_cat != "":
+		# 别名 /exec_log|/ai_log：剩参仅开关词（on/off/空）。
+		on = _on_explicit(args)
+	else:
+		var ap := args.split(" ", false) if args != "" else PackedStringArray()
+		if ap.is_empty() or ap[0].is_empty() or ap[0].to_lower() not in ["exec", "ai", "all"]:
+			return _hint("用法: /log <exec|ai|all> [on|off]")
+		cat = ap[0].to_lower()
+		if ap.size() > 1:
+			var av := ap[1].strip_edges().to_lower()
+			if av in ["off", "0", "false"]:
+				on = false
+			elif av not in ["on", "1", "true"]:
+				return _hint("用法: /log <exec|ai|all> [on|off]")
+	return _cmd(CP.log_switch(cat, on))
+
 ## /stream /grid 语义：缺省开；参数为 off/0/false 才关。
 static func _off_unless(rest: String) -> bool:
 	var a := rest.to_lower()
 	return a != "off" and a != "0" and a != "false"
 
-## /exec_log /ai_log 语义：显式 on/1/true 才开；无参数默认开。
+## /log 语义：显式 on/1/true 才开；无参数默认开。
 static func _on_explicit(rest: String) -> bool:
 	var a := rest.to_lower()
 	return a.is_empty() or a in ["on", "1", "true"]

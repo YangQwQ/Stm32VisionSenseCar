@@ -23,7 +23,7 @@
 | WiFi UDP | 图传 JPEG 分片（低延迟；缺片/超时自愈） | 真实（`UDPVideoClient.gd`，分片协议与板侧 `udp_send_frame` 对齐） |
 | 云端多模态 AI | DIRECT：板子直调云端，手机只下发 `ai_goal` | DIRECT（不经手机侧） |
 
-- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `fold` 收臂折叠回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角）/ `light` / `reset` / `stream` / `exec_log` / `ai_log` / `get_state` / `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel`，另含调试直驱 `servo / motor / drive / arm_pose`。
+- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `fold` 收臂折叠回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角）/ `light` / `reset` / `stream` / `log`（`cat=exec|ai|all`,`on` 统一日志转发，替代原 `exec_log`/`ai_log`）/ `get_state` / `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel`，另含调试直驱 `servo / motor / drive / arm_pose`。
 - **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）。`ai_oneshot` = 只执行一轮决策即收尾。
 - **定距 / 定角**：`move` 的 `distance_cm`、`spin` 的 `angle_deg` 由板端按**时长近似**到点自停（无里程计，靠实测标定表插值），非闭环，供微操与标定粗用；不带则持续动作，靠 `stop` 收尾。
 - **调试与本地指令**：移动/直驱按族收敛——`/move rotate|spin|fore|back|arm`（转向舵三档 / 原地旋转 / 定距前进后退 / 机械臂位姿）与 `/drive motor|servo`（单轮电机或 n=0 全车 / 直驱舵机）经词表下发；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点。

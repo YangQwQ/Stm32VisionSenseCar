@@ -112,6 +112,7 @@ static void tune_socket(int fd)
 #include "ble.h"
 #include "ai_client.h"
 #include "direct_exec.h"
+#include "board_log.h"
 
 #define WS_STREAM_FPS 10
 #define WS_EDIT_IMG_MAX (128 * 1024)  // 编辑图（二进制上行）上限，与 ai_client 一致
@@ -255,7 +256,7 @@ static void ws_handle_text(const char *json, int fd)
         bool on = doc["params"]["on"] | false;
         int port = doc["params"]["udp_port"] | 0;
         const char *src_ip = doc["params"]["src_ip"] | "";
-        Serial.printf("[udp] stream on=%d port=%d src_ip=%s\n", on, port, src_ip);
+        blog::logf(blog::WS, "stream on=%d port=%d src_ip=%s", on, port, src_ip);
         if (on && port > 0) {
             struct sockaddr_in src;
             socklen_t sl = sizeof(src);
@@ -273,12 +274,12 @@ static void ws_handle_text(const char *json, int fd)
             } else if (lwip_getpeername(fd, (struct sockaddr *)&src, &sl) == 0) {
                 udp_peer_set(src.sin_addr.s_addr, (uint16_t)port);
             }
-            Serial.printf("[udp] peer set -> %u.%u.%u.%u:%d\n",
-                          (uint8_t)(peer_ip), (uint8_t)(peer_ip >> 8),
-                          (uint8_t)(peer_ip >> 16), (uint8_t)(peer_ip >> 24), port);
+            blog::logf(blog::WS, "peer set -> %u.%u.%u.%u:%d",
+                        (uint8_t)(peer_ip), (uint8_t)(peer_ip >> 8),
+                        (uint8_t)(peer_ip >> 16), (uint8_t)(peer_ip >> 24), port);
         } else {
             udp_peer_clear();
-            Serial.printf("[udp] peer cleared (on=%d port=%d)\n", on, port);
+            blog::logf(blog::WS, "peer cleared (on=%d port=%d)", on, port);
         }
     }
     // 统一词表：move/stop/arm/config/stream/ai_goal/ai_cancel 等交给 command
@@ -373,6 +374,14 @@ static void ws_send_text_to_ws_clients(const char *text)
     }
 }
 
+// 统一日志模块的转发器：WS 广播 + BLE status 通知（在 blog 转发任务线程执行）。
+// 由 startCameraServer 注册，供 blog::logf 排队后统一发手机。
+static void send_log_to_phone(const char *json)
+{
+    ws_send_text_to_ws_clients(json);
+    ble::send_status(json);
+}
+
 // 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧；
 // 同时探测 WS 客户端存在性喂给 ble::set_ws_connected（status.ws），并做对端活体探测：
 // 连续 WS_IDLE_PING_MS 无上行 → 发探测 ping；再 WS_PING_TIMEOUT_MS 无任意上行 → 判死，
@@ -399,7 +408,7 @@ static void ws_stream_task(void *arg)
                 s_ws_ping_pending = true;
                 s_ws_ping_at_ms = now;
                 ws_ping_all();
-                Serial.println("[ws] idle 超时，发探测 ping");
+                blog::logf(blog::WS, "idle 超时，发探测 ping");
             } else if (s_ws_ping_pending &&
                        (int32_t)(now - s_ws_ping_at_ms) >= (int32_t)WS_PING_TIMEOUT_MS) {
                 // 探测后仍无上行 → 判死：踢 fd，下轮 has_client 回落 → 尾部恢复广播
@@ -407,7 +416,7 @@ static void ws_stream_task(void *arg)
                 s_ws_last_rx_ms = 0;
                 has_client = false;
                 ws_kick_all();
-                Serial.println("[ws] 探测超时，判定断线，恢复广播");
+                blog::logf(blog::WS, "探测超时，判定断线，恢复广播");
             }
         } else {
             s_ws_ping_pending = false;  // 无 WS 挂载时复位探测态
@@ -421,17 +430,17 @@ static void ws_stream_task(void *arg)
             s_ws_had_client = false;
             cmd::set_streaming(false);
             udp_peer_clear();  // WS 会话失效，随普通图传一起停掉 UDP 对端
-            Serial.println("[ws] 客户端离线，停止推流");
+            blog::logf(blog::WS, "客户端离线，停止推流");
         }
 
         ble::set_ws_connected(has_client);
-        // 本地直驱状态 → 手机（exec_log 开启时实时推送；替代原执行板上行帧镜像）。
+        // 本地直驱状态 → 手机（/log exec on 开启时实时推送；替代原执行板上行帧镜像）。
         // 不依赖 WS 客户端在位：纯蓝牙（WS 未连）时经 BLE status 通知也可直达手机。
         // 默认关：空闲不刷屏。开启后约 400ms 推一条 exec::read_state 合成的状态文本；
         // 状态文本与上次完全相同时跳过（防刷屏，只有变化才推）。
         static uint32_t s_last_status_ms = 0;
         static char s_last_state[192] = {0};
-        if (cmd::exec_log() &&
+        if (blog::enabled(blog::EXEC) &&
             (int32_t)(now - s_last_status_ms) >= (int32_t)400) {
             s_last_status_ms = now;
             char st[192];  // 状态含抓手前端 XZ 与 PWM + 不可达诊断，需足量避免截断
@@ -1727,6 +1736,9 @@ void startCameraServer()
     };
 
     ra_filter_init(&ra_filter, 20);
+
+    // 统一日志模块转发器：WS 广播 + BLE 通知，供 /log 开启后把板端日志发手机。
+    blog::set_forwarder(send_log_to_phone);
 
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
     recognizer.set_partition(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fr");

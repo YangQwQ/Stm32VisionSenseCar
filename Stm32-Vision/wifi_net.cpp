@@ -1,6 +1,7 @@
 #include "wifi_net.h"
 #include "config.h"
 #include <WiFi.h>
+#include "board_log.h"
 
 // 单次连接尝试超时：begin 后此期间视为"正在尝试"，静默等待连接结果不重复 begin。
 // ESP32 内置 autoconnect 本身会断线重连；手动周期 begin 与它打架会反复打
@@ -13,7 +14,7 @@ void net::init() {
   // 后续 httpd_start() 建 socket 会因空互斥量 assert 崩溃。
   WiFi.mode(WIFI_STA);
   if (cfg::wifi_ssid().isEmpty()) {
-    Serial.println("[net] 未配置 WiFi，等待配网");
+    blog::logf(blog::NET, "未配置 WiFi，等待配网");
     return;
   }
   WiFi.setSleep(false);
@@ -29,7 +30,7 @@ void net::update() {
   static bool s_was_connected = false;
   bool connected = WiFi.status() == WL_CONNECTED;
   if (connected && !s_was_connected) {
-    Serial.printf("[net] 已连接 %s, IP: %s, RSSI: %d dBm\n",
+    blog::logf(blog::NET, "已连接 %s, IP: %s, RSSI: %d dBm",
                   cfg::wifi_ssid().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
   }
   s_was_connected = connected;

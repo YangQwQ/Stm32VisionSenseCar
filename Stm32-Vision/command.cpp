@@ -5,13 +5,12 @@
 #include "direct_exec.h"
 #include "ping_svc.h"
 #include "nezha_direct.h"
+#include "board_log.h"
 
 // 应答格式遵循架构 §5.1：板 → 手机文本 = {type:status/pong, params:{...}, id:<回填>}。
 // move/stop/arm 是高频手动指令，只在 UART 层记录，不回文本（避免刷屏）。
 
 static bool g_streaming = false;         // 图传开关全局状态（WS 推流任务读取）
-static bool g_exec_log = false;          // exec_log 开关（默认关；开启后周期性推本地状态）
-static bool g_ai_log = false;            // ai_log 开关（默认关；开启后 AI 调试信息同时推往手机）
 
 static bool has_id(const JsonDocument& doc) {
   return doc["id"].is<int>() || doc["id"].is<long>();
@@ -34,7 +33,7 @@ static uint8_t make_state_bits() {
 static void reply_status(JsonDocument& src, cmd::ReplyFn reply, void* ctx,
                          const char* reason) {
   if (!reply) {
-    Serial.printf("[cmd] (无回复通道) %s\n", reason);
+    blog::logf(blog::CMD, "(无回复通道) %s", reason);
     return;
   }
   JsonDocument out;
@@ -65,14 +64,14 @@ static void log_manual_throttled(const char* type) {
   static String s_last;
   if (s_last != type) {
     s_last = type;
-    Serial.printf("[cmd] 收到手动指令 %s\n", type);
+    blog::logf(blog::CMD, "收到手动指令 %s", type);
   }
 }
 
 void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_ctx) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) {
-    Serial.printf("[cmd] bad json: %s\n", json);
+    blog::logf(blog::CMD, "bad json: %s", json);
     return;
   }
   const char* type = doc["type"] | "";
@@ -94,7 +93,7 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     }
     // drive/spin/servo/motor/arm_pose/reset 继续走下方各自分支（取消后落各自直驱逻辑）。
   } else {
-    Serial.printf("[cmd] type=%s has_frames=%u\n", type, has_frames);
+    blog::logf(blog::CMD, "type=%s has_frames=%u", type, has_frames);
   }
 
   if (!strcmp(type, "config")) {
@@ -139,21 +138,18 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
-  if (!strcmp(type, "exec_log")) {
-    // 本地直驱状态实时推送开关（默认关，避免空闲刷屏）：开启后 app_httpd 周期性推
-    // exec::read_state 合成的状态文本给手机，替代原执行板上行帧镜像。
+  if (!strcmp(type, "log")) {
+    // 统一日志转发开关：/log <exec|ai|all> on|off。
+    // 默认全关；exec = 直驱执行日志+周期状态推送，ai = AI 调试日志，
+    // all = 板端串口所有输出全部转发手机（经统一日志队列）。
+    const char* cat = params["cat"] | "";
     bool on = params["on"] | false;
-    set_exec_log(on);
-    reply_status(doc, reply, reply_ctx, on ? "状态实时推送已开启" : "状态实时推送已关闭");
-    return;
-  }
-
-  if (!strcmp(type, "ai_log")) {
-    // AI 调试信息回推开关（默认关）：开启后 ai_client 的关键延迟/时序日志同时发手机
-    // （仍保留串口）。便于板子装上车后现场看握手/发包延迟。
-    bool on = params["on"] | false;
-    set_ai_log(on);
-    reply_status(doc, reply, reply_ctx, on ? "AI日志推送已开启" : "AI日志推送已关闭");
+    const char* cfg = nullptr;
+    if (!strcmp(cat, "all")) { blog::set_all(on); cfg = on ? "全部日志转发已开启" : "全部日志转发已关闭"; }
+    else if (!strcmp(cat, "exec")) { blog::enable(blog::EXEC, on); cfg = on ? "执行日志转发已开启" : "执行日志转发已关闭"; }
+    else if (!strcmp(cat, "ai")) { blog::enable(blog::AI, on); cfg = on ? "AI日志转发已开启" : "AI日志转发已关闭"; }
+    else { cfg = "log: cat 需 exec|ai|all"; }
+    reply_status(doc, reply, reply_ctx, cfg);
     return;
   }
 
@@ -359,17 +355,9 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
 
 void cmd::apply_network() {
   net::reconnect();  // 在线重建 STA，不整板重启（BLE 保活，配网后无需重连）
-  Serial.println("[cmd] 已在线上网生效（未重启）");
+  blog::logf(blog::NET, "已在线上网生效（未重启）");
 }
 
 bool cmd::streaming() { return g_streaming; }
 
 void cmd::set_streaming(bool on) { g_streaming = on; }
-
-bool cmd::exec_log() { return g_exec_log; }
-
-void cmd::set_exec_log(bool on) { g_exec_log = on; }
-
-bool cmd::ai_log() { return g_ai_log; }
-
-void cmd::set_ai_log(bool on) { g_ai_log = on; }

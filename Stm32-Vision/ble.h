@@ -9,7 +9,7 @@ namespace ble {
 void init();    // 开机调用一次：注册服务/特征，开始广播。不因未连手机而失败。
 void update();  // loop 中调用：WiFi 状态变化时刷新 status 通知
 void reply(const char* text);  // 经 status 特征把应答文本通知给已连手机（cmd::Reply 用）
-void send_status(const char* text);  // status 特征直接通知一段独立 JSON（exec_log 周期状态推送，不依赖 WS）
+void send_status(const char* text);  // status 特征直接通知一段独立 JSON（周期状态推送 /log exec，不依赖 WS）
 void set_ws_connected(bool on);  // WS 客户端连上/断开时由 app_httpd 调，用于 status.ws
 void set_transmission(bool on);  // 任一图传通道活跃时停广播（让 WiFi 独占射频）；全部安静后恢复
 

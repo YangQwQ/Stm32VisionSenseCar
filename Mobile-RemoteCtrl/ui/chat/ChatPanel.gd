@@ -50,7 +50,7 @@ func _ready() -> void:
 
 # ============================== 消息日志（Main 外部调用） ==============================
 
-## 追加一条聊天消息。who 取值：本机 / 板 / AI / 提示 / 执行板。
+## 追加一条聊天消息。who 取值：本机 / 板 / AI / AI日志 / 提示 / 日志 / 执行板。
 func chat(who: String, msg: String) -> void:
 	if who == "本机":
 		_chat_log.append_text("[b]本机[/b]: %s\n" % msg)
@@ -62,6 +62,8 @@ func chat(who: String, msg: String) -> void:
 		_chat_log.append_text("[color=#9ad0ff]AI日志[/color]: %s\n" % msg)
 	elif who == "提示":
 		_chat_log.append_text("[color=#ffd75e]系统[/color]: %s\n" % msg)
+	elif who == "日志":
+		_chat_log.append_text("[color=#c8c8c8]日志[/color]: %s\n" % msg)
 	elif who == "执行板":
 		_chat_log.append_text("[color=#b39ddb]执行板[/color]: %s\n" % msg)
 	else:

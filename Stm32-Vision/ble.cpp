@@ -1,5 +1,6 @@
 #include "ble.h"
 #include "command.h"
+#include "board_log.h"
 #include "config.h"
 #include "wifi_net.h"
 #include "ai_client.h"
@@ -112,9 +113,9 @@ class CharCB : public BLECharacteristicCallbacks {
         s_pass = "";
         if (changed) {
           cmd::apply_network();  // 在线重建 STA（不重启，BLE 保持连接）
-          Serial.println("[ble] wifi 已更新，正在连接");
+          blog::logf(blog::BLE, "wifi 已更新，正在连接");
         } else {
-          Serial.println("[ble] wifi 未变化，跳过");
+          blog::logf(blog::BLE, "wifi 未变化，跳过");
         }
       }
     } else if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ai_url)) ||
@@ -134,7 +135,7 @@ class CharCB : public BLECharacteristicCallbacks {
       else if (BLEUUID(c->getUUID()).equals(BLEUUID(k_ai_key))) a_key = v;
       else a_model = v;
       cfg::set_ai(a_url, a_key, a_model);
-      Serial.println("[ble] ai 配置已写");
+      blog::logf(blog::BLE, "ai 配置已写");
     }
   }
   void onRead(BLECharacteristic* c) override {
@@ -147,7 +148,7 @@ class CharCB : public BLECharacteristicCallbacks {
 
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
-    Serial.println("[ble] 手机已连接");
+    blog::logf(blog::BLE, "手机已连接");
     // 连上后主动推一次状态（含 IP），供手机配网闭环 / 兜底观察
     notify_status("");
   }
@@ -156,7 +157,7 @@ class ServerCB : public BLEServerCallbacks {
     // 任一图传通道活跃（WS 客户端/MJPEG/streaming）时保持低调，不恢复广播以免抢 WiFi 射频；
     // 否则(纯兜底/配网)恢复可发现，供再次连接。
     if (s && !g_transmission) s->startAdvertising();
-    Serial.printf("[ble] 手机断开 ws=%d adv=%d\n", g_ws_connected ? 1 : 0, adv);
+    blog::logf(blog::BLE, "手机断开 ws=%d adv=%d", g_ws_connected ? 1 : 0, adv);
   }
 };
 
@@ -205,7 +206,7 @@ void ble::init() {
   adv->setMinPreferred(0x06);
   adv->setMaxPreferred(0x12);
   BLEDevice::startAdvertising();
-  Serial.println("[ble] GATT server 就绪，广播中 (VisionS3)");
+  blog::logf(blog::BLE, "GATT server 就绪，广播中 (VisionS3)");
   g_last_net = net::is_connected();
 }
 
@@ -214,7 +215,7 @@ void ble::reply(const char* text) {
 }
 
 void ble::send_status(const char* text) {
-  notify_raw(text);  // 直接推一段独立 JSON（exec_log 周期状态），不套 build_status 的 reply 包装
+  notify_raw(text);  // 直接推一段独立 JSON（周期状态 /log exec），不套 build_status 的 reply 包装
 }
 
 void ble::set_ws_connected(bool on) {
@@ -234,7 +235,7 @@ void ble::set_transmission(bool on) {
   else    { if (!before) BLEDevice::startAdvertising(); }
   bool after = BLEDevice::getAdvertising()->isAdvertising();
   if (before != after)
-    Serial.printf("[ble] 图传=%s 广播%s\n", on ? "on" : "off", after ? "已启动" : "已停止");
+    blog::logf(blog::BLE, "图传=%s 广播%s", on ? "on" : "off", after ? "已启动" : "已停止");
 }
 
 void ble::update() {

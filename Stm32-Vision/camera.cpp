@@ -1,6 +1,7 @@
 #include <Arduino.h>  // psramFound / Serial / pinMode
 #include "camera.h"    // 内含 CAMERA_MODEL_* 与 camera_pins.h
 #include "camera_pins.h"
+#include "board_log.h"
 
 namespace cam {
 
@@ -50,7 +51,7 @@ bool init() {
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("[cam] init failed: 0x%x\n", err);
+    blog::logf(blog::CAM, "init failed: 0x%x", err);
     return false;
   }
 

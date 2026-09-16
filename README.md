@@ -54,7 +54,7 @@
 | # | 链路 | 说明 |
 |---|---|---|
 | ① | BLE | 手机 → 大脑板：一次性配网（WiFi SSID/密码、AI 接口参数）+ 兜底控制。连接后让出 2.4G 射频，断线自动恢复 |
-| ② | WiFi WebSocket | 大脑板 ⇄ 手机：指令 JSON 下行 + `status`/`ai_result`/`exec_status`/`ai_log`（调试）/`state`（查询回包）上行 |
+| ② | WiFi WebSocket | 大脑板 ⇄ 手机：指令 JSON 下行 + `status`/`ai_result`/`exec_status`/`log`（调试）/`state`（查询回包）上行 |
 | ③ | WiFi UDP | 大脑板 → 手机：JPEG 图传分片（每数据报 14B 大端头 + 载荷） |
 | ④ | 云端 AI | 大脑板 ⇄ 模型：DIRECT 直调（板子自己上传画面、解析指令、执行闭环） |
 | ⑤ | 软件 I2C | 大脑板 → 哪吒板：舵机/电机/灯光命令，**本板即执行器** |
@@ -147,7 +147,7 @@
 2. **App 配网**：连接该广播，写入 WiFi 账号密码与 AI 接口参数（URL/Key/模型）。
 3. **连上 WiFi**：App 经 WebSocket（端口 81）取得指令/状态通道，按需开启图传（UDP）。
 4. **遥控**：摇杆驱车（可在「关于」页切换为原地旋转式转向）、按钮控机械臂/灯光；或在聊天区直接输入文字下发 AI 目标。
-5. **调试**：`/exec_log on` 看板端状态推送、`/ai_log on` 看 AI 时序日志（聊天区内容统一落盘 `user://logs/app.log`）、`/grid on` 叠加图传标定网格。
+5. **调试**：`/log exec on` 看板端状态推送与执行日志、`/log ai on` 看 AI 时序日志、`/log all on` 转发板端全部串口输出（聊天区内容统一落盘 `user://logs/app.log`）、`/grid on` 叠加图传标定网格。
 
 ---
 

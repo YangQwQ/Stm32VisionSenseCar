@@ -30,6 +30,7 @@ static const double CAL[][4] = {
 
 #include "ground_proj.h"
 #include <math.h>  // sqrt/fabs
+#include "board_log.h"
 
 // 当前生效的单应 + 归一化参数（QR 求解后为动态值）
 static double H[8];
@@ -98,7 +99,7 @@ bool ground::init(void) {
   }
 
   if (!qr_fit(A, b, H)) {
-    Serial.println("[ground] 单应QR求解失败，像素观测禁用（px/py 观测将回退 rel_deg）");
+    blog::logf(blog::CAM, "单应QR求解失败，像素观测禁用（px/py 观测将回退 rel_deg）");
     s_ready = false;
     return false;
   }
@@ -112,8 +113,8 @@ bool ground::init(void) {
                     (ey - (float)CAL[i][3]) * (ey - (float)CAL[i][3]));
     if (e > maxerr) maxerr = e;
   }
-  if (maxerr <= 5.f) { Serial.printf("[ground] 单应QR求解成功 回验最大误差=%.1fcm\n", maxerr); return true; }
-  Serial.printf("[ground] 单应QR回验超差(%.1fcm)，像素观测禁用\n", maxerr);
+  if (maxerr <= 5.f) { blog::logf(blog::CAM, "单应QR求解成功 回验最大误差=%.1fcm", maxerr); return true; }
+  blog::logf(blog::CAM, "单应QR回验超差(%.1fcm)，像素观测禁用", maxerr);
   s_ready = false;
   return false;
 }

@@ -7,6 +7,7 @@
 #include "command.h"
 #include "ble.h"
 #include "ai_client.h"
+#include "board_log.h"
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -33,6 +34,7 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_WARN);
 
   cfg::init();
+  blog::init();  // 统一日志队列与转发任务（setup 早期拉起，供任意任务 logf 使用）
 
   // BLE GATT Server 不依赖摄像头/WiFi——配网阶段无网可用，也要先能连上手机
   ble::init();
@@ -40,7 +42,7 @@ void setup() {
   exec::init();  // 直驱执行器：哪吒舵机回中 + 电机 0（不再经执行板）
 
   if (!cam::init()) {
-    Serial.println("Camera init failed (继续：BLE 配网/控制仍可用)");
+    blog::logf(blog::CAM, "Camera init failed (继续：BLE 配网/控制仍可用)");
   } else {
 // Setup LED FLash if LED pin is defined in camera_pins.h
 #if defined(LED_GPIO_NUM)
@@ -53,7 +55,7 @@ void setup() {
 
   ai::init();  // AI worker 任务（DIRECT 链路；依赖 WiFi 与摄像头）
 
-  Serial.println("Ready!");
+  blog::logf(blog::SYS, "Ready!");
 }
 
 void loop() {

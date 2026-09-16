@@ -1,5 +1,6 @@
 #include "config.h"
 #include <Preferences.h>
+#include "board_log.h"
 
 static const char* k_ns = "vision";
 
@@ -70,7 +71,7 @@ bool cfg::set_ai(const String& url, const String& key, const String& model) {
   prefs.putString("ai_model", model);
   prefs.end();
   // 写入即打印实际生效值，便于排查云端 404/401（key 只显示状态，不泄露）
-  Serial.printf("[cfg] AI 配置写入：url=%s key=%s model=%s\n",
+  blog::logf(blog::NET, "AI 配置写入：url=%s key=%s model=%s",
                 u.c_str(), key.isEmpty() ? "空" : "已配置", model.c_str());
   return true;
 }

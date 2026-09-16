@@ -499,16 +499,15 @@ func _handle_board_msg(data: Dictionary) -> bool:
 			_chat_panel.chat("板", "pong")
 		"ai_result":
 			_chat_panel.show_ai_result(data)
-		"ai_log":
-			# 板端 AI 调试/延迟日志回推（/ai_log on 开启）：展示并落盘（chat() 统一写日志）。
-			var alt: Variant = data.get("params")
-			var line := ""
-			if alt is Dictionary:
-				var tv: Variant = (alt as Dictionary).get("text")
-				if tv is String:
-					line = tv as String
-			if line != "":
-				_chat_panel.chat("AI日志", line)
+		"log":
+			# 板端统一日志模块回推（/log <exec|ai|all> on 开启）：来源+文本，展示并落盘。
+			# 板端发 {type:"log", params:{src:"exec|ai|...", text:"..."}}。
+			var lp: Variant = data.get("params")
+			if lp is Dictionary:
+				var lsrc := str((lp as Dictionary).get("src", ""))
+				var ltv: Variant = (lp as Dictionary).get("text")
+				if ltv is String:
+					_chat_panel.chat("日志", "[%s] %s" % [lsrc, ltv as String])
 		"state":
 			# get_state 回传：同步直控按钮（灯/夹爪/AI 运行态）。
 			_apply_state(data)

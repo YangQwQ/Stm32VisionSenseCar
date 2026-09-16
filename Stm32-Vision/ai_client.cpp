@@ -4,6 +4,7 @@
 #include "direct_exec.h"
 #include "wifi_net.h"
 #include "ground_proj.h"
+#include "board_log.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -155,11 +156,6 @@ static volatile int g_last_cont_type = 0;
 static volatile int g_stop_mode = (int)ai::StopMode::All;
 static volatile uint64_t g_last_wait_fb_ms = 0;  // wait 反馈节流时间戳
 
-// ai_log 回推 sink：worker 任务起点捕获当前回传通道（t.fn/t.ctx），供 logf 复用
-// （enqueue_result 会堆拷贝 ctx，跨任务排空安全）。
-static cmd::ReplyFn g_log_fn = nullptr;
-static void* g_log_ctx = nullptr;
-
 static void enqueue_result(const char* text, cmd::ReplyFn fn, void* ctx);
 
 // ---------------- 结果队列（worker → loop） ----------------
@@ -204,7 +200,7 @@ void enqueue_result(const char* text, cmd::ReplyFn fn, void* ctx) {
   if (xQueueSend(g_result_q, &it, 0) != pdTRUE) { free(it->text); free(it->ctx); free(it); }
 }
 
-// AI 调试日志：始终写串口；ai_log 开关开启且任务通道在位时，同时推手机当前行。
+// AI 调试日志：经 board_log（blog::AI）统一输出；/log ai（或 all）时转发手机。
 void ai::logf(const char* fmt, ...) {
   char buf[256];
   va_list ap;
@@ -212,14 +208,8 @@ void ai::logf(const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, ap);
   buf[sizeof(buf) - 1] = 0;  // 截断防越界
   va_end(ap);
-  Serial.printf("%s\n", buf);
-  if (!cmd::ai_log() || !g_log_fn) return;
-  JsonDocument d(&g_js_alloc);
-  d["type"] = "ai_log";
-  d["params"]["text"] = buf;
-  String s;
-  serializeJson(d, s);
-  enqueue_result(s.c_str(), g_log_fn, g_log_ctx);
+  // 统一走板端日志模块：始终写串口（带 [ai] 前缀）；/log ai on 时经日志队列转发手机。
+  blog::logf(blog::AI, "%s", buf);
 }
 
 void ai::update() {
@@ -246,7 +236,7 @@ void ai::set_edited_image(const uint8_t* data, size_t len) {
     g_edited_ts = esp_timer_get_time();
   }
   xSemaphoreGive(g_img_mtx);
-  Serial.printf("[ai] 收到编辑图 %u B\n", (unsigned)len);
+  blog::logf(blog::AI, "收到编辑图 %u B", (unsigned)len);
 }
 
 static bool take_edited(uint8_t* buf, size_t cap, size_t* out_len) {
@@ -784,10 +774,10 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
     unsigned long ts = millis();
     size_t w = g_client.write(bp + sent, n);
     unsigned long dt = millis() - ts;
-    if (w > 0) { seg++; sent += w; t_last_write = millis(); if (dt > 100) Serial.printf("[ai] seg %u sent=%u ~%u ms\n", seg, (unsigned)sent, (unsigned)dt); continue; }
+    if (w > 0) { seg++; sent += w; t_last_write = millis(); if (dt > 100) blog::logf(blog::AI, "seg %u sent=%u ~%u ms", seg, (unsigned)sent, (unsigned)dt); continue; }
     // 返回 0 或负：发送卡住/失败。连续 3s 无进展即视为连接已死，弃连让上层重建。
     if (millis() - t_last_write > 3000) {
-      Serial.printf("[ai] 发送停滞 sent=%u/%u，弃连\n", (unsigned)sent, (unsigned)blen);
+      blog::logf(blog::AI, "发送停滞 sent=%u/%u，弃连", (unsigned)sent, (unsigned)blen);
       return false;
     }
     if (millis() - t_start > AI_HTTP_TIMEOUT_MS) break;
@@ -838,7 +828,7 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
     int cr = hdr.indexOf('\r');
     String status = cr > 0 ? hdr.substring(0, cr) : hdr;
     ai::logf("[ai] HTTP 非200 %s 响应体:%.100s", status.c_str(), errbody.c_str());
-    Serial.printf("[ai] HTTP %s body=%s", hdr.c_str(), errbody.c_str());
+    blog::logf(blog::AI, "HTTP %s body=%s", hdr.c_str(), errbody.c_str());
     return false;
   }
   // 响应体用 PsaBuf（PSRAM）累积，避免逐字符 String grow 在内部堆反复 realloc 制造碎片。
@@ -855,7 +845,7 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
       if (!g_client.connected()) break;  // 服务端提前关连接
       delay(5);
     }
-    if ((int)pb.len < cl) { Serial.printf("[ai] HTTP body 未读完 got=%d cl=%d\n", (int)pb.len, cl); return false; }
+    if ((int)pb.len < cl) { blog::logf(blog::AI, "HTTP body 未读完 got=%d cl=%d", (int)pb.len, cl); return false; }
   } else if (chunked) {
     // chunked 解码（严格、无投机）：每个字节/行按独立空闲超时读取，逐字节精确计数。
     // 上一版用「全局 30s 时钟 + 块尾字节压回(pend) + size 行前向重同步」做容错，但这些
@@ -905,10 +895,10 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
     };
     for (;;) {                        // 循环解析各块
       String line;
-      if (read_line_strict(line, 64) < 0) { Serial.println("[ai] chunked size 行读取失败"); return false; }
+      if (read_line_strict(line, 64) < 0) { blog::logf(blog::AI, "chunked size 行读取失败"); return false; }
       int sz = 0;
       if (!parse_size(line, &sz)) {
-        Serial.printf("[ai] chunked size 行异常: '%.32s'\n", line.c_str());
+        blog::logf(blog::AI, "chunked size 行异常: '%.32s'", line.c_str());
         return false;
       }
       if (sz == 0) {
@@ -916,20 +906,20 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
         for (;;) { String t; if (read_line_strict(t, 256) < 0) break; if (t.length() == 0) break; }
         break;
       }
-      if (sz < 0 || sz > 262144) { Serial.println("[ai] chunked 块过大"); return false; }
+      if (sz < 0 || sz > 262144) { blog::logf(blog::AI, "chunked 块过大"); return false; }
       for (int i = 0; i < sz; i++) {        // 逐字节精确读块数据，缺一字节即失败
         int c = read_byte_idle();
-        if (c < 0) { Serial.printf("[ai] HTTP chunked 中断 got=%d\n", (int)pb.len); return false; }
+        if (c < 0) { blog::logf(blog::AI, "HTTP chunked 中断 got=%d", (int)pb.len); return false; }
         pb.put((char)c);
       }
       // 块尾：严格 \r\n（或仅 \n）。不完整即失败，不猜字节、不压回。
       int t1 = read_byte_idle();
-      if (t1 < 0) { Serial.println("[ai] chunked 块尾缺失"); return false; }
+      if (t1 < 0) { blog::logf(blog::AI, "chunked 块尾缺失"); return false; }
       if (t1 == '\r') {
         int t2 = read_byte_idle();
-        if (t2 < 0 || t2 != '\n') { Serial.println("[ai] chunked 块尾缺失"); return false; }
+        if (t2 < 0 || t2 != '\n') { blog::logf(blog::AI, "chunked 块尾缺失"); return false; }
       } else if (t1 != '\n') {
-        Serial.println("[ai] chunked 块尾错位"); return false;
+        blog::logf(blog::AI, "chunked 块尾错位"); return false;
       }
     }
     ai::logf("[ai] HTTP chunked 解码 %d B", (int)pb.len);
@@ -972,7 +962,7 @@ static bool http_exchange(const String& host_s, const char* key, const char* pat
       if (!g_client.connected()) break;
       delay(5);
     }
-    Serial.printf("[ai] 原始读取 %d B\n", (int)pb.len);
+    blog::logf(blog::AI, "原始读取 %d B", (int)pb.len);
   }
   resp = pb.p ? pb.p : "";
   return pb.len > 0;
@@ -1037,7 +1027,7 @@ static bool http_post(const char* url, const char* key, const char* body, String
     HTTPClient http;
     http.setReuse(true);                    // 成功即保留连接供下轮复用
     http.collectAllHeaders(true);           // 保存响应头，供判断 Transfer-Encoding（默认不收集）
-    if (!http.begin(g_client, url)) { Serial.println("[ai] HTTPClient begin 失败"); return false; }
+    if (!http.begin(g_client, url)) { blog::logf(blog::AI, "HTTPClient begin 失败"); return false; }
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", String("Bearer ") + String(key));
     int code = http.POST(body);             // body 为 PSRAM C 串；流式发送、不整体拷内部堆
@@ -1192,7 +1182,6 @@ static void ai_worker(void*) {
 
     // 纯导航任务（/move to）：不调云端，直接本地巡航到目标坐标即回报。
     if (t.nav) {
-      g_log_fn = t.fn; g_log_ctx = t.ctx;
       m_busy = true;
       if (!t.nav_global) { s_car_x = 0; s_car_y = 0; s_car_heading = 0; }  // local=以当前位姿为新原点
       NavR r = navigate_to(t.generation, t.nav_x, t.nav_y, NAV_STOP_CM_GOTO);
@@ -1203,15 +1192,12 @@ static void ai_worker(void*) {
       f["params"]["done"] = (r == NavR::Reached);
       String s; serializeJson(f, s);
       enqueue_result(s.c_str(), t.fn, t.ctx);
-      Serial.printf("[ai] 导航结束 rel=%d\n", (int)r);
+      blog::logf(blog::AI, "导航结束 rel=%d", (int)r);
       if (t.ctx) delete (int*)t.ctx;
-      g_log_fn = nullptr; g_log_ctx = nullptr;
       m_busy = false;
       continue;
     }
 
-    g_log_fn = t.fn;            // ai_log 回推通道：本任务周期内有效
-    g_log_ctx = t.ctx;
     g_last_continuous = false;  // 本任务尚未下发过持续指令（防上一任务残留标志误判）
     g_last_cont_type = 0;
     m_busy = true;
@@ -1299,7 +1285,7 @@ static void ai_worker(void*) {
       const char* scope = (g_stop_mode == (int)ai::StopMode::Wheels && g_last_cont_type == 1) ? "wheels" : "all";
       JsonDocument d; d["scope"] = scope;   // d 即 stop 的 params 对象
       exec::act("stop", d.as<JsonObjectConst>());
-      Serial.printf("[ai] 兜底 stop scope=%s\n", scope);
+      blog::logf(blog::AI, "兜底 stop scope=%s", scope);
       g_last_continuous = false;
     };
 
@@ -1307,7 +1293,7 @@ static void ai_worker(void*) {
       uint64_t step_ts = esp_timer_get_time();  // 本轮起点（周期控制基准）
       fail = nullptr;  // 每轮重置，避免沿用上轮错误文本误导日志/回报
       // 中止检查（代际号变化即本任务作废）；兜底停统一在任务出口解析。
-      if (t.generation != m_generation) { Serial.println("[ai] 被新目标/手动中断"); interrupted = true; break; }
+      if (t.generation != m_generation) { blog::logf(blog::AI, "被新目标/手动中断"); interrupted = true; break; }
       if (!net::is_connected()) { snprintf(err_buf, sizeof(err_buf), "WiFi 掉线"); fail = err_buf; break; }
       if (cfg::ai_key().isEmpty()) { snprintf(err_buf, sizeof(err_buf), "未配置 AI Key"); fail = err_buf; break; }
 
@@ -1399,7 +1385,7 @@ static void ai_worker(void*) {
             fail = "云端拒绝(4xx)，疑似参数或限流";
             break;
           }
-          if (nr < 2) { vTaskDelay(pdMS_TO_TICKS(500 << nr)); Serial.printf("[ai] 网络失败重试 %d\n", nr + 1); }
+          if (nr < 2) { vTaskDelay(pdMS_TO_TICKS(500 << nr)); blog::logf(blog::AI, "网络失败重试 %d", nr + 1); }
         }
         if (done) break;
         if (!http_ok) { if (!fail) fail = "AI 请求失败"; break; }
@@ -1409,7 +1395,7 @@ static void ai_worker(void*) {
         bool body_broken = false;
         if (!extract_content(resp, content, &body_broken)) {
           // 解码成功但无有效内容（瞬态错误体/空 content 等）：打印原始片段便于定位
-          Serial.printf("[ai] 响应无内容，原始(前120B): %s\n", resp.substring(0, 120).c_str());
+          blog::logf(blog::AI, "响应无内容，原始(前120B): %s", resp.substring(0, 120).c_str());
           fail = "AI 响应无内容";
           if (body_broken) g_client.stop();  // 传输层截断/残留：弃用复用连接，下次全新握手防污染
           continue;  // 空内容→重试，不终止
@@ -1494,7 +1480,7 @@ static void ai_worker(void*) {
           // 死循环防线：连续多轮下发相同指令 → 下轮注入引导语让 AI 主动变化
           fmt_last(cur_cmd, sizeof(cur_cmd), type, params);
           if (strcmp(cur_cmd, last_cmd)) { stall = 0; stall_hint = false; }
-          else if (++stall >= 3 && !stall_hint) { stall_hint = true; Serial.println("[ai] 多轮无进展，注入引导"); }
+          else if (++stall >= 3 && !stall_hint) { stall_hint = true; blog::logf(blog::AI, "多轮无进展，注入引导"); }
           snprintf(last_cmd, sizeof(last_cmd), "%s", cur_cmd);
           // AI 显式要求保留上一帧（锁定/追踪）：下轮带上 prev；否则按兜底节奏走
           want_prev = cmdD["carry_prev"].is<bool>() && cmdD["carry_prev"].as<bool>();
@@ -1548,12 +1534,12 @@ static void ai_worker(void*) {
           if (!strcmp(type, "stop") && cmdD["done"].is<bool>() && cmdD["done"].as<bool>()) {
             done = true;
             sent_done = true;   // 已向手机确报终态，任务出口不再补发
-            Serial.println("[ai] AI 判定任务完成（stop+done）");
+            blog::logf(blog::AI, "AI 判定任务完成（stop+done）");
           }
           got = true;
           break;
         } else {
-          Serial.printf("[ai] 校验: %s\n", verr);
+          blog::logf(blog::AI, "校验: %s", verr);
           fail = verr;  // 重试一次前暂存
         }
       }
@@ -1587,7 +1573,7 @@ static void ai_worker(void*) {
           sent_done = true;
           String s = build_feedback(t.id, e);
           enqueue_result(s.c_str(), t.fn, t.ctx);
-          Serial.println("[ai] 连续网络失败超限，任务中止");
+          blog::logf(blog::AI, "连续网络失败超限，任务中止");
           break;
         }
         int wait = g_last_status == 429 ? 30000 : (3000 << (net_fail > 3 ? 3 : net_fail - 1));
@@ -1634,8 +1620,7 @@ static void ai_worker(void*) {
     if (prev) free(prev);        // 上一帧 PSRAM 副本
     for (int i = 0; i < AI_HIST_N; i++) free(hist_text[i]);   // 历史环 PSRAM
     if (t.ctx) delete (int*)t.ctx;  // 任务期 sink fd
-    ai::logf("[ai] 任务结束 gen=%lu", t.generation);   // 先于注销通道，确保此行也能回推
-    g_log_fn = nullptr; g_log_ctx = nullptr;  // 注销 ai_log 回推通道
+    ai::logf("[ai] 任务结束 gen=%lu", t.generation);
     free(t.text); free(t.ann);
     resolve_stop();   // 统一兜底：持续指令残留即补停
     m_busy = false;
@@ -1656,14 +1641,14 @@ static void ai_tls_free(void* p) { heap_caps_free(p); }
 
 void ai::init() {
   if (g_worker) return;
-  Serial.println("[ai] build=hwaes_int8192_v4  （TLS: 硬件AES/INTERNAL/8192；ws_stream/ping_svc 栈已调大）");
+  blog::logf(blog::AI, "build=hwaes_int8192_v4  （TLS: 硬件AES/INTERNAL/8192；ws_stream/ping_svc 栈已调大）");
   ground::init();   // 屏幕→地面单应拟合 + 诊断日志（见 ground_proj）
   g_mtx = xSemaphoreCreateMutex();
   g_notify = xSemaphoreCreateBinary();
   g_img_mtx = xSemaphoreCreateMutex();
   g_result_q = xQueueCreate(8, sizeof(ResultItem*));
   xTaskCreatePinnedToCore(ai_worker, "ai_worker", 16384, nullptr, 2, &g_worker, 1);
-  Serial.println("[ai] worker 就绪");
+  blog::logf(blog::AI, "worker 就绪");
 }
 
 void ai::set_goal(const char* text, bool use_image, const char* annotation, long id,
@@ -1729,7 +1714,7 @@ void ai::cancel(StopMode m) {
   xSemaphoreGive(g_mtx);
   g_client.stop();
   g_stop_mode = (int)m;   // 手动 move/stop 接管=None（不补停）；arm=Wheels；ai_cancel=All
-  if (was_active) Serial.println("[ai] cancel");
+  if (was_active) blog::logf(blog::AI, "cancel");
 }
 
 bool ai::busy() { return m_busy; }
@@ -1742,7 +1727,7 @@ bool ai::append_chat(const char* text) {
     strncpy(g_chat, text, sizeof(g_chat) - 1);
     g_chat[sizeof(g_chat) - 1] = 0;
     g_chat_has = true;
-    Serial.printf("[ai] 插话入队: %s\n", text);
+    blog::logf(blog::AI, "插话入队: %s", text);
   }
   xSemaphoreGive(g_mtx);
   return fed;

@@ -35,8 +35,8 @@ bool busy();                              // 是否有任务进行中（BLE stat
 // 返回是否有任务在跑（true=已入队，worker 下一轮连同 prompt 一起喂给模型）。
 bool append_chat(const char* text);
 
-// AI 调试日志：始终写串口；ai_log 开关开启且任务回传通道在位时，同时把该行
-// 以 {"type":"ai_log","text":..} 推送当前手机（复用 ai_result 的回传队列）。
+// AI 调试日志：统一经 board_log 模块（blog::AI 来源）——始终写串口；`/log ai on`（或 all）
+// 时以 {type:"log",params:{src:"ai",text}} 经统一队列转发手机（WS+BLE）。
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // 暂存一张编辑图（WS 二进制上行，裸 JPEG，覆盖式）。TTL 见常量。

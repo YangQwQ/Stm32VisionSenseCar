@@ -29,12 +29,13 @@
 | `wifi_net.h/.cpp` | STA 连接 + 断线重连 + 在线换网 `net::reconnect`（namespace `net`）。⚠️ 勿改回 `network`：会与核心库 `Network.h` 在 Windows 大小写不敏感 FS 上遮蔽冲突 |
 | `nezha_direct.h/.cpp` | 哪吒扩展板软 I2C 直驱底座：`set_servo(ch,pwm)` / `set_motor(ch,a,b)` / `led(kind,on)`；从机 `0x80`，协议与哪吒硬件一致 |
 | `direct_exec.h/.cpp` | **执行层**：`act()` 分发 move/stop/arm/arm_pose/light/reset/spin、连续机械臂动作步进 `update_tick()`（兼管定距/定角到点自停）、二连杆 IK `arm_pose()`、本地合成状态 `read_state()`（含末端前/高与爪限位）、持续型判定 `is_continuous()` |
-| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；手动指令先 `ai::cancel` 打断 AI 闭环再落地；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal` 触发板载 AI；`exec_log` 控制状态周期推送、`ai_log` 把 AI 日志经回传通道上抛；`get_state` 回灯/夹爪当前态 |
+| `command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；手动指令先 `ai::cancel` 打断 AI 闭环再落地；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal` 触发板载 AI；`log` 统一日志指令走 `blog` 开关；`get_state` 回灯/夹爪当前态 |
+| `board_log.h/.cpp` | 统一日志模块（namespace `blog`）：`logf(cat,...)` 统一串口调试输出（带 `[类]` 前缀），按 `/log` 开关（exec/ai/all）把 `{type:"log",params:{src,text}}` 入队，由转发任务（栈 8192）经 app_httpd 注册的转发器（WS 广播+BLE status）发手机 |
 | `ai_client.h/.cpp` | 板载多模态 AI HTTP 调用（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait，动作最终走 `exec::act`）：HTTPClient + keep-alive TLS 复用与失败重试、PSRAM 缓冲；物体空间记忆 + 车姿态累积，换算到车头局部系后喂回模型（屏幕→地面换算走 `ground_proj`）；默认单帧，仅当上轮 `carry_prev:true` 才附带上一帧做运动对比；WS 文本出口统一过 `sanitize_ws_utf8` 消毒（云端偶发残缺 UTF-8，原样进 TEXT 帧会让手机端以 `1007` 断链）；发往云端的长字符串按 UTF-8 边界截断（截半个中文字节会被判 400）；服务端持续无有效响应则逐轮退避，超限中止任务并回报手机 |
 | `ground_proj.h/.cpp` | 屏幕→地面坐标换算（namespace `ground`）：实测标定点拟合单应，`ground::screen_to_world(px,py,&x,&y)`；标定点以 (u,v)→(x,y) 坐标对放在文件头部，加测点直接往表里加 |
 | `ping_svc.h/.cpp` | `/ping <目标>` 异步 ICMP echo（esp_ping），结果经 cmd 回复通道回报；无目标仍由 command 就地回 `pong` |
 | `ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知；广播开关随 `set_transmission`（真在推帧即停）（UUID 见下「协议参考」）|
-| `app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（默认关，`exec_log` 开启后约 400ms 一条；状态缓冲须容下含抓手前端的整行，改状态行时同步核对）。`ws_stream` 任务栈 8192（推流 + 状态上报共用）。人脸检测/识别已停用（宏置 0） |
+| `app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（默认关，`/log exec on` 开启后约 400ms 一条；状态缓冲须容下含抓手前端的整行，改状态行时同步核对）。注册 `blog` 日志转发器（WS+BLE）。`ws_stream` 任务栈 8192（推流 + 状态上报共用）。人脸检测/识别已停用（宏置 0） |
 | `partitions.csv` | 分区表：app0 约 3.8MB，需选带 3MB+ APP 空间的开发板分区选项 |
 
 ## 直驱执行层要点（`exec` / `nezha`）
@@ -93,8 +94,7 @@
 | `reset` | — | 四舵机回中 + 电机 0 |
 | `servo` / `motor` / `drive` / `arm_pose` | 见 `command.cpp` | 调试直驱（绕过上层语义） |
 | `stream` | `on`、可选 `udp_port` `src_ip` | 图传开关（UDP 目标由板子据此建立） |
-| `exec_log` | `on` | 状态周期推送开关（默认关） |
-| `ai_log` | `on` | AI 内部日志经任务回传通道上抛（默认关；无 AI 任务运行时无输出） |
+| `log` | `cat`=exec/ai/all，`on` | 统一日志转发开关（默认全关；exec=执行日志+周期状态推送、ai=AI 调试日志、all=板端串口全部输出转发手机；经 `blog` 统一队列 `{type:"log",params:{src,text}}` 上抛）。替代原 `exec_log`/`ai_log` |
 | `get_state` | — | 回 `{"type":"state"}`，含灯光与夹爪当前态（手机重连后同步按钮用） |
 | `config` | `ssid` `password` | NVS + 在线换网 |
 | `ping` | 可选 `target` | 无目标回 `pong`；有目标走 `ping_svc` |

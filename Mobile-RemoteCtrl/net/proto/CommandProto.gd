@@ -24,13 +24,10 @@ static func stream(on: bool, udp_port: int = 0, src_ip: String = "") -> Dictiona
 		params["src_ip"] = src_ip
 	return {"type": "stream", "params": params, "id": _new_id()}
 
-static func exec_log(on: bool) -> Dictionary:
-	# 本地直驱状态实时推送开关（默认关）：开启后板端周期性推送 exec_status（视觉板合成状态）。
-	return {"type": "exec_log", "params": {"on": on}, "id": _new_id()}
-
-static func ai_log(on: bool) -> Dictionary:
-	# AI 调试信息回推开关（默认关）：开启后板端把关键 AI 延迟/时序日志同时推送手机（仍保留串口）。
-	return {"type": "ai_log", "params": {"on": on}, "id": _new_id()}
+static func log_switch(cat: String, on: bool) -> Dictionary:
+	# 统一日志转发开关：/log <exec|ai|all> on|off。默认全关。
+	#   exec = 直驱执行日志+周期状态推送；ai = AI 调试日志；all = 板端串口全部输出转发手机。
+	return {"type": "log", "params": {"cat": cat, "on": on}, "id": _new_id()}
 
 static func get_state() -> Dictionary:
 	# 主动查询当前状态（车灯/夹爪等），用于重连后同步控制按钮。板端回 {"type":"state",params:{...}}。
@@ -141,8 +138,7 @@ const COMMAND_HINTS := {
 	"/stream [on|off]": "图传开关",
 	"/grid [on|off]": "图传叠加标定网格（本地，不下发板子）",
 	"/stop [wheels|arm]": "停车",
-	"/exec_log [on|off]": "实时状态推送开关（默认关）",
-	"/ai_log [on|off]": "AI日志推送开关（默认关，开启后AI调试/延迟日志发手机）",
+	"/log <exec|ai|all> [on|off]": "统一日志转发开关（默认关；exec=执行日志+周期状态, ai=AI日志, all=板端全部输出）",
 	"/nz_read": "I2C诊断：探测哪吒从机在线状态(写/读ACK)",
 	"/light <front|vibe|back> <0|1>": "直驱灯开关(前/氛围/尾)",
 	"/config <WiFi名> <密码>": "配网",
