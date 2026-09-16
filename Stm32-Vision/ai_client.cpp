@@ -33,6 +33,15 @@
 #define AI_MAX_NET_FAIL 4         // 连续"无有效输出"轮数上限：超过即中止任务并回报（防云端持续无响应时无限空转）
 #define AI_HIST_N 8               // 历史环条数（AI 决策 + 插话共用，满员淘汰最旧）
 
+// 本地巡航（approach / /move to）参数：定距段长、初对齐阈值、单次转向上限等。
+#define AI_APPROACH_STOP_CM 15   // AI 自动靠近的到位距离（之后交给 AI 微操）
+#define NAV_STOP_CM_GOTO 6       // /move to 的到位容差 cm（无里程计开环，留一点松量）
+#define NAV_ALIGN_DEG 25         // 目标偏角超过此值先原地转向对齐，否则直行推进
+#define NAV_MAX_SPIN_DEG 60      // 单次原地转向的角度上限（分步收敛）
+#define NAV_MAX_SEG_CM 25        // 单次定距推进上限 cm（分步收敛、防冲）
+#define NAV_MAX_ITERS 200        // 巡航最大迭代步数（防死循环）
+#define NAV_WAIT_LOOPS 120       // 每段等待轮子停下的检测循环数（约 50ms 一拍）
+
 // ArduinoJson 内存池改用 PSRAM，避免其小分配每轮在内部堆上反复申请/释放，
 // 与 TLS 缓冲交错把内部堆切成碎块（导致握手 -17040/-32512 失败）。
 struct PsramAllocator : public ArduinoJson::Allocator {
@@ -54,6 +63,9 @@ struct TaskLocal {
   cmd::ReplyFn fn = nullptr;
   void* ctx = nullptr;    // 任务期 sink ctx（WS=堆 int*，BLE=nullptr）
   bool active = false;    // 槽是否已被 set_goal 激活
+  float nav_x = 0, nav_y = 0;  // goto_target 目标坐标 / frame
+  bool nav = false;             // 纯导航任务（/move to），不走 AI 闭环
+  bool nav_global = false;      // true=沿用全局系；false=以当前车位姿为新原点
 };
 
 // 结果队列项：每项独立持有消息文本与恢复用的（fn, 本次堆拷贝 ctx）。
@@ -112,6 +124,14 @@ static struct {
   uint8_t hn, hi;                    // 已存数量 / 写指针
 } g_mem[AI_MEM_MAX];
 static const float AI_PI = 3.14159265358979f;
+
+// 角度归一化到 (-180,180]（方向计算统一口径）。
+static float wrap180f(float a) {
+  a = fmodf(a, 360.0f);
+  if (a > 180.0f) a -= 360.0f;
+  else if (a < -180.0f) a += 360.0f;
+  return a;
+}
 
 // 取数组前 n 个元素的中位数（n≤AI_OBS_N，插入排序后取中间，仅用于观测融合）
 static float median_n(const float* a, int n) {
@@ -444,6 +464,65 @@ static void mem_feed(char* buf, size_t cap) {
   ai::logf("[ai] 记忆 %s", buf);   // 喂回内容同步到 ai_log，便于观察 AI 看到的物体位置理解
 }
 
+// 在物体记忆表里定位目标全局坐标：name 非空=精确/近似名匹配（找不到返回 false）；
+// name 空=取当前最近的合法记忆。均跳过过期(>20轮)。
+static bool mem_find(const char* name, float* tx, float* ty) {
+  int best = -1; float bd = 0.0f;
+  for (int i = 0; i < AI_MEM_MAX; i++) {
+    if (!g_mem[i].valid || g_mem[i].stale > 20) continue;
+    if (name && name[0]) {
+      if (name_same_obj(g_mem[i].name, name)) { *tx = g_mem[i].gx; *ty = g_mem[i].gy; return true; }
+      continue;
+    }
+    float dx = g_mem[i].gx - s_car_x, dy = g_mem[i].gy - s_car_y;
+    float d = dx * dx + dy * dy;
+    if (best < 0 || d < bd) { bd = d; best = i; }
+  }
+  if (name && name[0]) return false;   // 指定的名字不在记忆里
+  if (best < 0) return false;          // 无任何可用记忆
+  *tx = g_mem[best].gx; *ty = g_mem[best].gy;
+  return true;
+}
+
+// 等待本轮定距/定角到段自停（loop 的 update_tick 会按时长停轮）；中断或超时即退出。
+static void wait_wheels(unsigned long gen) {
+  for (int i = 0; i < NAV_WAIT_LOOPS; i++) {
+    if (gen != m_generation) return;
+    if (!exec::wheels_moving()) return;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// 本地巡航核心（纯本地，不调云端）：把车从当前位姿导航到全局目标 (tx,ty)，距目标 ≤stop_cm 停。
+// 无里程计：按定距/定角时长近似 + 姿态累积做开环死航；到位后剩余误差交给 AI 视觉微操兜底。
+// 返回 Reached（到位）/ Interrupted（被新任务/手动打断）/ TimedOut（迭代超限收敛）。
+enum class NavR : uint8_t { Reached, Interrupted, TimedOut };
+static NavR navigate_to(unsigned long gen, float tx, float ty, float stop_cm) {
+  const float throttle = 0.5f;   // 巡航推进油门（中速）
+  for (int it = 0; it < NAV_MAX_ITERS; it++) {
+    if (gen != m_generation) return NavR::Interrupted;
+    float dx = tx - s_car_x, dy = ty - s_car_y;
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist <= stop_cm) { JsonDocument s(&g_js_alloc); s["scope"] = "all"; exec::act("stop", s.as<JsonObjectConst>()); return NavR::Reached; }
+    float thg = atan2f(dx, dy) * 180.0f / AI_PI;        // 目标全局方位（heading=0 时朝 Y+）
+    float rel = wrap180f(s_car_heading + thg);          // 目标相对车头偏角，正=右
+    if (fabsf(rel) > NAV_ALIGN_DEG) {                   // 偏太多先原地转向对齐
+      int ang = (int)fminf(fabsf(rel), (float)NAV_MAX_SPIN_DEG);
+      JsonDocument p(&g_js_alloc); p["dir"] = rel > 0 ? 1 : -1; p["speed"] = 850; p["angle_deg"] = ang;
+      exec::act("spin", p.as<JsonObjectConst>()); car_update_pose("spin", p.as<JsonObjectConst>());
+      wait_wheels(gen);
+    } else {                                            // 否则定距直行一段（分步收敛）
+      float seg = fminf(dist - stop_cm, (float)NAV_MAX_SEG_CM);
+      if (seg < 1.0f) seg = 1.0f;
+      JsonDocument p(&g_js_alloc); p["throttle"] = throttle; p["steering"] = 0; p["distance_cm"] = (int)seg;
+      exec::act("move", p.as<JsonObjectConst>()); car_update_pose("move", p.as<JsonObjectConst>());
+      wait_wheels(gen);
+    }
+  }
+  JsonDocument s(&g_js_alloc); s["scope"] = "all"; exec::act("stop", s.as<JsonObjectConst>());   // 迭代超限：停稳收敛
+  return NavR::TimedOut;
+}
+
 // 构建请求 body 的结构说明：
 // goal 当前任务目标（可被插话/ task_goal 热替换）；hrole/htext/hn = 历史环条目（角色+文本，
 // 同时含 assistant=AI 决策 与 user=插话），逐条作为独立消息回喂，构成真多轮对话记录；
@@ -466,6 +545,7 @@ static void build_body(PsaBuf& b, const char* goal, const char* ann, const char*
   sys.put("或 {\"type\":\"arm_pose\",\"params\":{\"x\":10,\"h\":4},\"reason\":\"..\"} 直接把夹爪末端移动到指定位姿：x=车头前方 cm（可达约4..15），h=夹爪中心离地高度 cm（越高夹爪越抬、越低越贴近地面）。夹取前最推荐用它把夹爪调到与目标高度匹配；不可达时不会移动，请改 x/h 重试；");
   sys.put("或 {\"type\":\"stop\",\"params\":{\"scope\":\"all\"},\"reason\":\"..\",\"done\":true} 立即停车并结束当前任务：任务完成/目标达成/需完全收手时带 done:true；仅临时停车继续观察则不带 done：");
   sys.put("或 {\"type\":\"wait\",\"reason\":\"..\"} 空操作，用于不执行移动操作跳过本轮，不会停止正在进行的移动；");
+  sys.put("或 {\"type\":\"approach\",\"params\":{\"target\":\"对象名或空\"},\"reason\":\"..\"} 自动靠近已锁定目标到约15cm再交还你微操：target=已用 observe 记下的对象名（空=就近目标）；只有确定记忆里那物且需长距离直行时才用，否则仍用 move/spin 自行逼近；目标不在记忆里时不要用，先 observe 或直接靠近；");
   sys.put("可选附加字段（可加在任意指令 JSON 里）：\"carry_prev\":true（下轮带上本帧做前后对比，用于锁定/追踪）；\"task_goal\":\"新目标文字\"（把插话/新意图提升为当前任务目标，程序会把该文字更新到目标位置并每轮喂回）；\"observe\":{\"name\":\"物体名字\",\"px\":0.36,\"py\":0.62,\"visible\":true} 记录物体位置：name=物体名（同一物体务必保持同名），px/py=物体在画面上的归一化坐标 左上(0,0)右下(1,1)，visible=false=当前不在画面；优先用 px/py（坐标口径见规则12），无法给出像素时用 \"rel_deg\":-20,\"dist_cm\":25 兜底；\"task_note\":\"目标外观/备注\"（任务开始写一次，程序每轮喂回）；\"tasks\":[{\"name\":\"出门\",\"done\":true},{\"name\":\"右转\",\"done\":false}]（新建/重写整个任务列表，低频）；\"task_done\":{\"index\":1,\"done\":true}（标记第N项完成/未完成，index从1起，高频轻量、不用重写列表）；");
   sys.put("规则: \
 	1. 只输出 JSON, 每次只规划一步，若任务不要求实际行动可以 stop; 回复务必简短——思考放在 reason。\
@@ -602,10 +682,12 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
   }
   const char* type = doc["type"] | "";
   if (strcmp(type, "move") && strcmp(type, "stop") && strcmp(type, "arm") &&
-      strcmp(type, "wait") && strcmp(type, "spin") && strcmp(type, "arm_pose")) {
+      strcmp(type, "wait") && strcmp(type, "spin") && strcmp(type, "arm_pose") &&
+      strcmp(type, "approach")) {
     return "AI 输出非法 type";
   }
-  if (!doc["params"].is<JsonObject>() && strcmp(type, "stop") && strcmp(type, "wait")) {
+  if (!doc["params"].is<JsonObject>() && strcmp(type, "stop") && strcmp(type, "wait") &&
+      strcmp(type, "approach")) {
     return "AI 输出缺 params";
   }
   if (!strcmp(type, "arm")) {
@@ -646,6 +728,8 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
     float ph = doc["params"]["h"] | 0.0f;
     if (src["x"].is<float>() || src["x"].is<int>()) p["x"] = constrain(px, 0.0f, 20.0f);
     if (src["h"].is<float>() || src["h"].is<int>()) p["h"] = constrain(ph, -2.0f, 25.0f);
+    const char* tgt = doc["params"]["target"] | "";
+    if (tgt[0]) p["target"] = tgt;
   }
   const char* reason = doc["reason"] | "";
   if (reason[0]) out["reason"] = reason;
@@ -1104,7 +1188,28 @@ static void ai_worker(void*) {
       g_slot.text = nullptr; g_slot.ann = nullptr; g_slot.ctx = nullptr; g_slot.active = false;
     }
     xSemaphoreGive(g_mtx);
-    if (!t.text) continue;
+    if (!t.text && !t.nav) continue;
+
+    // 纯导航任务（/move to）：不调云端，直接本地巡航到目标坐标即回报。
+    if (t.nav) {
+      g_log_fn = t.fn; g_log_ctx = t.ctx;
+      m_busy = true;
+      if (!t.nav_global) { s_car_x = 0; s_car_y = 0; s_car_heading = 0; }  // local=以当前位姿为新原点
+      NavR r = navigate_to(t.generation, t.nav_x, t.nav_y, NAV_STOP_CM_GOTO);
+      JsonDocument f(&g_js_alloc);
+      f["type"] = "ai_result";
+      if (t.id) f["id"] = (long)t.id;
+      f["params"]["reason"] = r == NavR::Reached ? "已到达目标坐标" : "导航被中断";
+      f["params"]["done"] = (r == NavR::Reached);
+      String s; serializeJson(f, s);
+      enqueue_result(s.c_str(), t.fn, t.ctx);
+      Serial.printf("[ai] 导航结束 rel=%d\n", (int)r);
+      if (t.ctx) delete (int*)t.ctx;
+      g_log_fn = nullptr; g_log_ctx = nullptr;
+      m_busy = false;
+      continue;
+    }
+
     g_log_fn = t.fn;            // ai_log 回推通道：本任务周期内有效
     g_log_ctx = t.ctx;
     g_last_continuous = false;  // 本任务尚未下发过持续指令（防上一任务残留标志误判）
@@ -1315,6 +1420,33 @@ static void ai_worker(void*) {
         if (!verr) {
           const char* type = cmdD["type"] | "";
           JsonObjectConst params = cmdD["params"].as<JsonObjectConst>();
+          if (!strcmp(type, "approach")) {
+            // 本地自动靠近：不点云端，直接按记忆目标巡航到近距，交还 AI 继续微操。
+            const char* tgt = params["target"] | "";
+            float tx, ty;
+            bool found = mem_find(tgt[0] ? tgt : nullptr, &tx, &ty);
+            const char* why = nullptr;
+            bool arrived = false;
+            if (!found) {
+              why = tgt[0] ? "approach 目标不在记忆里，请先 observe 锁定" : "approach 无可用目标记忆，请先 observe";
+            } else {
+              NavR r = navigate_to(t.generation, tx, ty, AI_APPROACH_STOP_CM);
+              if (r == NavR::Interrupted) { interrupted = true; done = true; break; }   // 被接管：本任务作废
+              arrived = (r == NavR::Reached);
+              why = arrived ? "已自动靠近目标，交还你微操" : "靠近收敛结束，由你继续";
+              last_act_ms = (unsigned long)(esp_timer_get_time() / 1000);
+            }
+            JsonDocument cmdF(&g_js_alloc);
+            cmdF["type"] = "approach";
+            cmdF["reason"] = why;
+            cmdF["params"]["target"] = tgt[0] ? tgt : "(最近)";
+            String fb = build_feedback(t.id, cmdF);
+            enqueue_result(fb.c_str(), t.fn, t.ctx);
+            stall = 0; stall_hint = false;    // 本地巡航视为有意推进，不复位死循环判据
+            got = true;
+            net_fail = 0;
+            break;
+          }
           if (!strcmp(type, "wait")) {
             // wait=空操作：不下发执行板，保持当前动作，任务继续观察。
             // 视为有意进展：复位死循环计数，避免"等待"被当成无进展注入引导。
@@ -1551,11 +1683,37 @@ void ai::set_goal(const char* text, bool use_image, const char* annotation, long
   g_slot.generation = m_generation;
   g_slot.fn = reply;
   g_slot.ctx = reply_ctx;   // WS: 堆 int*；BLE: nullptr
+  g_slot.nav = false;       // 新 AI 目标覆盖可能的纯导航残留
   g_slot.active = true;
   xSemaphoreGive(g_mtx);
   // 尝试掐断在途请求，让 worker 尽快回到循环取新槽
   g_client.stop();
   g_stop_mode = (int)StopMode::All;   // 新目标打断旧任务：残留持续指令在旧任务出口补停
+  xSemaphoreGive(g_notify);
+}
+
+// /move to x y：板端本地巡航到坐标（不调 AI）。local=以当前位姿为新原点；
+// global=沿用当前全局系（可与 AI/历史导航共用坐标系）。手动接管类：打断在途任务。
+void ai::goto_target(float x, float y, bool frame_global, long id, cmd::ReplyFn reply, void* reply_ctx) {
+  xSemaphoreTake(g_mtx, portMAX_DELAY);
+  ++m_generation;               // 新导航接管：在途 AI/导航作废
+  g_chat_has = false;           // 清上一任务残留插话
+  if (g_slot.text) free(g_slot.text);
+  if (g_slot.ann) free(g_slot.ann);
+  if (g_slot.ctx) delete (int*)g_slot.ctx;
+  g_slot.nav = true;
+  g_slot.nav_x = x; g_slot.nav_y = y;
+  g_slot.nav_global = frame_global;
+  g_slot.text = nullptr; g_slot.ann = nullptr;
+  g_slot.use_image = false; g_slot.one_shot = false;
+  g_slot.id = id;
+  g_slot.generation = m_generation;
+  g_slot.fn = reply;
+  g_slot.ctx = reply_ctx;   // 直接接管 command.cpp 预建的堆 fd（对齐 set_goal），由 nav 分支释放
+  g_slot.active = true;
+  xSemaphoreGive(g_mtx);
+  g_client.stop();              // 掐断在途 AI 请求，worker 尽快回到循环取导航槽
+  g_stop_mode = (int)StopMode::All;
   xSemaphoreGive(g_notify);
 }
 
@@ -1566,6 +1724,7 @@ void ai::cancel(StopMode m) {
   if (g_slot.text) { free(g_slot.text); g_slot.text = nullptr; }
   if (g_slot.ann) { free(g_slot.ann); g_slot.ann = nullptr; }
   if (g_slot.ctx) { delete (int*)g_slot.ctx; g_slot.ctx = nullptr; }
+  g_slot.nav = false;
   g_slot.active = false;
   xSemaphoreGive(g_mtx);
   g_client.stop();

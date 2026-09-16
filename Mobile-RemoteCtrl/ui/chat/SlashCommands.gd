@@ -135,8 +135,21 @@ static func _move_parse(args: String) -> Dictionary:
 				return _hint("用法: /move arm <x=车头系前方cm> <h=离地高度cm> | reset | fold")
 			# 校准用：不限制数值范围（可为负/超界），不可达由板端可达域检查拦截。
 			return _cmd(CP.arm_pose(mv[1].to_float(), mv[2].to_float()), true)
+		"to":
+			# /move to <x> <y> [global|local]：板端本地导航到坐标（手动接管，打断 AI）。
+			# local 原点=当前位姿（y前正 x右正）；global=沿用全局系。
+			if mv.size() < 3 or not mv[1].is_valid_float() or not mv[2].is_valid_float():
+				return _hint("用法: /move to <x> <y> [global|local]")
+			var fx := mv[1].to_float()
+			var fy := mv[2].to_float()
+			var frame := "local"
+			if mv.size() > 3:
+				frame = mv[3].strip_edges().to_lower()
+				if frame != "local" and frame != "global":
+					return _hint("用法: /move to <x> <y> [global|local]")
+			return _cmd(CP.goto(fx, fy, frame), true)
 		_:
-			return _hint("用法: /move rotate|spin|fore|back|arm <参数>")
+			return _hint("用法: /move rotate|spin|fore|back|to|arm <参数>")
 
 ## /drive 直驱控制族：motor 电机 / servo 舵机。
 static func _drive_parse(args: String) -> Dictionary:

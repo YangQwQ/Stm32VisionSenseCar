@@ -19,6 +19,11 @@ void update();                  // loop 中调用：排空结果队列（发送 
 void set_goal(const char* text, bool use_image, const char* annotation, long id,
               cmd::ReplyFn reply, void* reply_ctx, bool one_shot = false);
 
+// 纯本地导航任务（/move to x y）：不调云端，直接巡航到坐标 (x,y)。frame_global：
+// false=以当前车位置为原点/车头为 Y(前)、x 右正；true=沿用当前全局系。手动接管类。
+void goto_target(float x, float y, bool frame_global, long id,
+                 cmd::ReplyFn reply, void* reply_ctx);
+
 // 中止任务的兜底 stop 模式：None=被用户指令接管（执行板已被新指令覆盖，不补发）；
 // Wheels=手动 arm 打断（只停轮子）；All=取消/任务终结（全停）。
 enum class StopMode : uint8_t { None, Wheels, All };

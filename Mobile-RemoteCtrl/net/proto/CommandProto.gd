@@ -118,6 +118,14 @@ static func move_dist(throttle: float, cm: int, steering: float = 0.0) -> Dictio
 	# 定距移动：油门+距离cm，板端按时长近似到时自停（无里程计，粗略，供微操/标定）。
 	return {"type": "move", "params": {"throttle": throttle, "steering": steering, "distance_cm": cm}, "id": _new_id()}
 
+static func goto(x: float, y: float, frame: String = "local") -> Dictionary:
+	# 本地巡航到坐标（板端不调 AI 自动执行）：frame=local（默认，原点=当前位姿，y向前 x向右）/
+	# global（沿用全局系）。无里程计开环，近点到停，用于测导航。
+	var params: Dictionary = {"x": x, "y": y}
+	if frame == "global":
+		params["frame"] = "global"
+	return {"type": "goto", "params": params, "id": _new_id()}
+
 ## /help 文案：由 COMMAND_HINTS 生成（唯一事实源，避免重复维护）；特殊说明在此追加。
 static func help_lines() -> PackedStringArray:
 	var out := PackedStringArray()
@@ -146,6 +154,7 @@ const COMMAND_HINTS := {
 	"/move rotate <dir=-1/0/1>": "转向舵三档(左/回正/右)",
 	"/move spin <角度> [speed]": "原地旋转(正=右转, 负=左转; 0=停; 板端时长近似到点自停)",
 	"/move fore|back <距离cm> [油门%]": "定距前进/后退(时长近似到点自停)",
+	"/move to <x> <y> [global]": "板端本地导航到坐标(local原点=当前位姿,y向前x向右; global=沿用全局系)",
 	"/move arm <x> <h>": "机械臂末端到指定位姿(车头系前方cm, 离地高度cm)",
 	"/drive motor <n=1..4|0=all> <pwm>": "直驱单轮电机(n=0 全车drive)",
 	"/drive servo <n=0转向/1左/2右/3前> <pwm=50..250>": "直驱舵机(可超标定限位)",

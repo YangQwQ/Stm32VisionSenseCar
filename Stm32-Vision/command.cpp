@@ -247,6 +247,25 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
+  if (!strcmp(type, "goto")) {
+    // /move to x y [global|local]：板端本地巡航到坐标（不调 AI，手动接管类）。
+    // 需 x,y；frame=local（默认，原点=当前位姿，y向前 x向右）/global（沿用全局系）。
+    bool has_x = params["x"].is<float>() || params["x"].is<int>();
+    bool has_y = params["y"].is<float>() || params["y"].is<int>();
+    if (!has_x || !has_y) {
+      reply_status(doc, reply, reply_ctx, "goto: 需 x,y 坐标（local 原点=当前位姿，y向前 x向右；frame=global 沿用全局系）");
+      return;
+    }
+    float x = params["x"] | 0.f;
+    float y = params["y"] | 0.f;
+    bool global = !strcmp((const char*)(params["frame"] | "local"), "global");
+    void* actx = reply_ctx ? new int(*(int*)reply_ctx) : nullptr;
+    long id = has_id(doc) ? doc["id"].as<long>() : 0;
+    ai::goto_target(x, y, global, id, reply, actx);
+    reply_status(doc, reply, reply_ctx, "开始导航到坐标");
+    return;
+  }
+
   if (!strcmp(type, "servo")) {
     // 调试直驱：绕过执行板，本板软件 I2C 直接驱动哪吒舵机（逻辑通道 n=0转向/1左(前后)/2右(抬落)/3前(夹爪)）。
     // 直接写原始 pwm（50..250），不过标定限位，用于探机械极限/标定；走 exec::set_servo 同步内部状态。

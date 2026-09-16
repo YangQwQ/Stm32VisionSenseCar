@@ -424,6 +424,8 @@ bool exec::is_continuous(const char* type, const JsonObjectConst& p) {
   return false;
 }
 
+bool exec::wheels_moving() { return s_car_motion != 0 || s_spin != 0; }
+
 bool exec::grip_closing() { return s_grip == GRIP_CLOSE; }
 
 void exec::set_move_cap_ms(int ms) {
