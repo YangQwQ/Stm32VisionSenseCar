@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本文档基准：仓库 HEAD `6d1e3bf`（2026-09-12）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `5bb3b63`（2026-09-16）。只覆盖已提交内容；未提交改动不收录。
 
 本项目维护指南，供后续编码助手 / 会话快速对齐上下文。
 
@@ -14,7 +14,7 @@
 
 ## 通信架构（链路）
 
-连接策略统一收口在 `net/DeviceConn.gd`（**单一事实源**；Main 只订阅其统一信号，不在别处另写一套）。它自建并持有 BLE / WS / UDP 三个传输并派生统一 `state`；**WS 优先、BLE 兜底**（`BLOCKED_TYPES` 黑名单外的类型均可蓝牙，仅图传/ai 云端直连被拦）。信道切换：WS 上连让出 BLE 射频；WS 下连保 BLE / 双断自动重扫 → 发现最近设备自连 →「连上停扫」。`BLEClient` / `WSCarClient` / `UDPVideoClient` 只做纯传输，不做连接策略。
+连接策略统一收口在 `net/DeviceConn.gd`（**单一事实源**；Main 只订阅其统一信号，不在别处另写一套）。它自建并持有 BLE / WS / UDP 三个传输并派生统一 `state`；**WS 优先、BLE 兜底**（`BLOCKED_TYPES` 黑名单外的类型均可蓝牙，现仅 `stream` 图传被拦）。信道切换：WS 上连让出 BLE 射频；WS 下连保 BLE / 双断自动重扫 → 发现最近设备自连 →「连上停扫」。`BLEClient` / `WSCarClient` / `UDPVideoClient` 只做纯传输，不做连接策略。
 
 | 通道 | 用途 | 实现状态 |
 |---|---|---|
@@ -23,17 +23,17 @@
 | WiFi UDP | 图传 JPEG 分片（低延迟；缺片/超时自愈） | 真实（`UDPVideoClient.gd`，分片协议与板侧 `udp_send_frame` 对齐） |
 | 云端多模态 AI | DIRECT：板子直调云端，手机只下发 `ai_goal` | DIRECT（不经手机侧） |
 
-- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `fold` 收臂折叠回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角）/ `light` / `reset` / `stream` / `log`（`cat=exec|ai|all`,`on` 统一日志转发，替代原 `exec_log`/`ai_log`）/ `get_state` / `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel`，另含调试直驱 `servo / motor / drive / arm_pose`。
-- **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）。`ai_oneshot` = 只执行一轮决策即收尾。
+- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `fold` 收臂折叠回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角）/ `light` / `reset` / `stream` / `log`（`cat=exec|ai|all`,`on` 统一日志转发，替代原 `exec_log`/`ai_log`）/ `get_state`（回 `bits` 位图）/ `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel` / `ai_chat`（`message` 插话）/ `goto`（`x`/`y`，可选 `frame`）/ `nz_read`，另含调试直驱 `servo / motor / drive / arm_pose`。
+- **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）。`ai_oneshot` = 只执行一轮决策即收尾。AI 运行中发送键变「中止」：空文本走 `ai_cancel`，非空文本走 `ai_chat` 插话（补充要求、不打断闭环）。
 - **定距 / 定角**：`move` 的 `distance_cm`、`spin` 的 `angle_deg` 由板端按**时长近似**到点自停（无里程计，靠实测标定表插值），非闭环，供微操与标定粗用；不带则持续动作，靠 `stop` 收尾。
-- **调试与本地指令**：移动/直驱按族收敛——`/move rotate|spin|fore|back|arm`（转向舵三档 / 原地旋转 / 定距前进后退 / 机械臂位姿）与 `/drive motor|servo`（单轮电机或 n=0 全车 / 直驱舵机）经词表下发；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点。
+- **调试与本地指令**：移动/直驱按族收敛——`/move rotate|spin|fore|back|to|arm`（转向舵三档 / 原地旋转 / 定距前进后退 / `to <x> <y> [global]` 移动到指定坐标 → `goto` / 机械臂位姿，`arm` 含 `reset|fold`）与 `/drive motor|servo`（单轮电机或 n=0 全车 / 直驱舵机）经词表下发；`/log <exec|ai|all> [on|off]`（旧 `/exec_log`、`/ai_log` 为别名）与 `/nz_read`（哪吒 I2C 探测）同理；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点。
 - **重连同步**：WS 连上后主动发一次 `get_state`，板端回 `type:"state"`，`Main.gd._apply_state` → `DirectControl.sync_state` 同步灯光/夹爪按钮（`set_pressed_no_signal`，不回灌指令）。
 
 ## 目录结构
 
 ```
 res://
-  Main.tscn / Main.gd          # App 壳：连接编排、页面切换、摇杆映射、图传开关、连接状态；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）
+  Main.tscn / Main.gd          # App 壳：连接编排、页面切换（含左右滑动切页）、摇杆映射、图传开关、连接状态；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）
   state/LocalStore.gd          # autoload 本地持久化（last_device / wifi / ai 配置 / 设置项）
   state/AppLog.gd              # autoload 本地日志落盘：每次启动截断重写 user://logs/app.log，聊天区每行统一写入
   animation/AnimationManager.gd # autoload 通用动画（淡入+缩放滑入/滑出、上下浮动）
@@ -105,5 +105,7 @@ res://
 - BLE（已解决，2026-09-05）：真机“刷新恒 0 设备”根因不是 gdble 扫描——btleplug Java `onScanResult` 正常大量回调、gdble 返回 25+ 周边设备，是 `BLEClient.gd:_labels` 对 `"name": null` 的设备字典做 `var name: String = d.get("name","")` 赋值，取到 Nil 触发运行时错误中断函数，`address` 兜底永远走不到、结果恒 `[]`。已改为显式判 null（name 为 null 时回退 address）。配网 GATT 两侧代码已接（见下）。
 
 - **遗留命名**：板侧本地直驱状态（`exec_status`）在 `Main.gd` / `ChatPanel.gd` 中仍以 `"执行板"` 作为消息来源标签显示，如需改为「状态」需同步两处。
+
+- **遗留不一致（2026-09-16 核对）**：`Main.gd` 摇杆释放分支（非原地旋转模式）发 `CP.servo(1, _SERVO_CENTER)`，而同文件其它「转向回正」路径发 `servo(0, …)`；按 `CommandProto.servo` 的约定 `n=1` 是移爪而非转向舵，该处疑似写错通道号。
 
 - **遗留字段不符**：`CommandProto.arm()` 发 `params.duration_ms`，而板端 `direct_exec.cpp` 的 `arm` 只读 `params.dist_cm`（`duration_ms` 被忽略，等同无定距的持续动作）——违反「词表两侧逐字对应」。目前该 builder 无调用方（UI 走 `DirectControl.gd` 只发 `act`，持续动作靠 `stop` 收尾），启用前需先在两侧统一字段名。
