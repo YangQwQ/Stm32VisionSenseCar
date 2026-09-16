@@ -895,6 +895,7 @@ custom_minimum_size = Vector2(200, 200)
 layout_mode = 2
 size_flags_horizontal = 4
 offset_transform_enabled = true
+focus_mode = 0
 theme_override_constants/icon_max_width = 120
 theme_override_styles/normal = SubResource("StyleBoxFlat_3y6u5")
 theme_override_styles/pressed = SubResource("StyleBoxFlat_fpfj3")
@@ -931,6 +932,7 @@ visible = false
 custom_minimum_size = Vector2(1080, 720)
 layout_mode = 2
 size_flags_vertical = 3
+mouse_filter = 1
 script = ExtResource("5_trn2v")
 
 [node name="Feed" type="TextureRect" parent="BodyControl/Video" unique_id=353400016]
@@ -985,6 +987,7 @@ custom_minimum_size = Vector2(220, 100)
 layout_mode = 2
 size_flags_horizontal = 10
 size_flags_vertical = 4
+focus_mode = 0
 text = "框选目标"
 
 [node name="ChatPanel" type="VBoxContainer" parent="BodyControl" unique_id=745781195]
@@ -997,6 +1000,7 @@ script = ExtResource("5_kjvhd")
 [node name="ChatLog" type="RichTextLabel" parent="BodyControl/ChatPanel" unique_id=590147692]
 layout_mode = 2
 size_flags_vertical = 3
+mouse_filter = 1
 theme_override_fonts/normal_font = ExtResource("7_fpfj3")
 theme_override_styles/normal = SubResource("StyleBox_panel")
 bbcode_enabled = true
@@ -1005,12 +1009,11 @@ scroll_following = true
 [node name="BottomPanl" type="TabContainer" parent="BodyControl/ChatPanel/ChatLog" unique_id=1726379680]
 visible = false
 layout_mode = 1
-anchors_preset = 12
+anchors_preset = -1
 anchor_top = 1.0
 anchor_right = 1.0
 anchor_bottom = 1.0
 offset_top = -43.0
-grow_horizontal = 2
 grow_vertical = 0
 theme_override_styles/panel = SubResource("StyleBoxFlat_o6qdn")
 current_tab = 0
@@ -1021,6 +1024,7 @@ layout_mode = 2
 theme_override_colors/font_color = Color(0.6, 0.76, 0.94, 1)
 theme_override_fonts/font = ExtResource("7_fpfj3")
 theme_override_font_sizes/font_size = 32
+autowrap_mode = 3
 metadata/_tab_index = 0
 
 [node name="ImageList" type="HBoxContainer" parent="BodyControl/ChatPanel/ChatLog/BottomPanl" unique_id=709334818]
@@ -1159,6 +1163,7 @@ backspace_deletes_composite_character_enabled = true
 [node name="SendBtn" type="Button" parent="BodyControl/ChatPanel/InputRow" unique_id=1447337239]
 custom_minimum_size = Vector2(180, 0)
 layout_mode = 2
+focus_mode = 0
 toggle_mode = true
 text = "发送"
 
@@ -1166,6 +1171,7 @@ text = "发送"
 custom_minimum_size = Vector2(0, 740)
 layout_mode = 2
 size_flags_stretch_ratio = 1.22
+mouse_filter = 1
 theme_override_styles/panel = SubResource("StyleBoxEmpty_3y6u5")
 script = ExtResource("6_03owx")
 
@@ -1335,6 +1341,7 @@ size_flags_vertical = 3
 [node name="AutoConnOnStart" type="CheckButton" parent="BodyAbout/Options" unique_id=1668483588]
 custom_minimum_size = Vector2(0, 120)
 layout_mode = 2
+focus_mode = 0
 theme_override_font_sizes/font_size = 52
 text = "启动时自动连接设备"
 flat = true
@@ -1342,6 +1349,7 @@ flat = true
 [node name="DisableAutoConnWS" type="CheckButton" parent="BodyAbout/Options" unique_id=356664563]
 custom_minimum_size = Vector2(0, 120)
 layout_mode = 2
+focus_mode = 0
 theme_override_font_sizes/font_size = 52
 text = "关闭自动建立WS连接"
 flat = true
@@ -1349,6 +1357,7 @@ flat = true
 [node name="SpinMode" type="CheckButton" parent="BodyAbout/Options" unique_id=607347106]
 custom_minimum_size = Vector2(0, 120)
 layout_mode = 2
+focus_mode = 0
 theme_override_font_sizes/font_size = 52
 text = "使用原地旋转作为转向行为"
 flat = true
@@ -1356,6 +1365,7 @@ flat = true
 [node name="About" type="Panel" parent="BodyAbout" unique_id=1950890272]
 custom_minimum_size = Vector2(0, 500)
 layout_mode = 2
+mouse_filter = 1
 theme_override_styles/panel = SubResource("StyleBoxFlat_sc1dx")
 
 [node name="Title" type="Label" parent="BodyAbout/About" unique_id=1871410363]
@@ -1476,6 +1486,7 @@ custom_minimum_size = Vector2(230, 230)
 layout_mode = 2
 size_flags_horizontal = 7
 size_flags_vertical = 4
+focus_mode = 0
 toggle_mode = true
 button_pressed = true
 button_group = SubResource("ButtonGroup_trn2v")
@@ -1489,6 +1500,7 @@ custom_minimum_size = Vector2(230, 230)
 layout_mode = 2
 size_flags_horizontal = 7
 size_flags_vertical = 4
+focus_mode = 0
 toggle_mode = true
 button_group = SubResource("ButtonGroup_trn2v")
 texture_normal = ExtResource("9_j4qnp")
@@ -1501,6 +1513,7 @@ custom_minimum_size = Vector2(230, 230)
 layout_mode = 2
 size_flags_horizontal = 7
 size_flags_vertical = 4
+focus_mode = 0
 toggle_mode = true
 button_group = SubResource("ButtonGroup_trn2v")
 texture_normal = ExtResource("11_fpfj3")

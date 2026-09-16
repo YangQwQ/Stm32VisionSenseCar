@@ -48,6 +48,21 @@ const _SPIN_SPEED := 900       # 原地旋转模式下左右推摇杆的单轮 P
 var _device_name := ""
 var _page_tween: Tween = null
 const _PAGE_DURATION := 0.28
+const _PAGE_TRIGGER := 24.0   # 横向滑动达到该位移才判定为切页手势（区分纵向滚动）
+const _PAGE_FLING := 600.0    # 拖动中采样的瞬时横向速度超过该值按"甩动"吸附到下/上一页（px/s）
+const _VEL_SAMPLE_MS := 33    # 拖动中每隔该时长采一次速（镜像 ScrollContainer 的位移差/时长 采样）
+# 横向切页手势状态：当前页 / 拖动基准 / 是否已进入切页。
+var _cur_page := 0
+var _swipe_start := Vector2.ZERO
+var _drag_base := 0.0
+var _drag_active := false
+var _drag_float := 0.0
+var _mouse_held := false   # 桌面兜底：仅在按住左键拖动时响应横移（避免悬停误触发）
+var _swipe_skip := false   # 手势落在摇杆区域内时置真：整段不响应，避免和转向拖动冲突
+var _drag_accum := 0.0      # 累计手指横向位移（当前 x - 起点 x）
+var _last_sample := 0.0     # 上次采速时的累计位移
+var _last_sample_tick := -1 # 上次采速时刻（ms），<0 表示尚未采速
+var _vel := 0.0             # 拖动中最近一次采到的瞬时横向速度（px/s）
 ## 待配网设备 + 待下发 WiFi/AI（设备卡片 → 连接窗口 → 确认）。
 var _pending_addr := ""
 var _pending_name := ""
@@ -113,16 +128,135 @@ func _on_nav_toggled(pressed_on: bool, page: int) -> void:
 	_switch_page(page)
 
 func _switch_page(page: int) -> void:
+	_cur_page = clampi(page, 0, 2)
+	_snap_to(_cur_page, true)
+
+## 把三页各自摆到对应"页浮点" f 处（f=页序号，含拖动中的小数）：BTScan=0 / Control=1 / About=2。
+func _apply_page_offset(f: float) -> void:
+	_scan_panel.offset_transform_position = Vector2(-20.0 * f, 0)
+	_scan_panel.offset_transform_position_ratio = Vector2(0.0 - f, 0)
+	_body_ctrl.offset_transform_position = Vector2(-20.0 * f + 20, 0)
+	_body_ctrl.offset_transform_position_ratio = Vector2(1.0 - f, 0)
+	_body_about.offset_transform_position = Vector2(-20.0 * f + 40, 0)
+	_body_about.offset_transform_position_ratio = Vector2(2.0 - f, 0)
+
+## 吸附到最近的整页（拖动松手 / 点导航），并同步当前页与底部导航选中态。
+func _snap_to(page: int, animate: bool) -> void:
+	_cur_page = clampi(page, 0, 2)
 	if _page_tween != null:
 		_page_tween.kill()
-	var tween = create_tween().set_parallel(true).set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
-	tween.tween_property(_scan_panel, "offset_transform_position", Vector2(-20 * page, 0), _PAGE_DURATION)
-	tween.tween_property(_body_ctrl, "offset_transform_position", Vector2(-20 * page + 20, 0), _PAGE_DURATION)
-	tween.tween_property(_body_about, "offset_transform_position", Vector2(-20 * page + 40, 0), _PAGE_DURATION)
-	tween.tween_property(_scan_panel, "offset_transform_position_ratio", Vector2(0 - page, 0), _PAGE_DURATION)
-	tween.tween_property(_body_ctrl, "offset_transform_position_ratio", Vector2(1 - page, 0), _PAGE_DURATION)
-	tween.tween_property(_body_about, "offset_transform_position_ratio", Vector2(2 - page, 0), _PAGE_DURATION)
-	_page_tween = tween
+	if not animate:
+		_apply_page_offset(float(page))
+	else:
+		var tween = create_tween().set_parallel(true).set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
+		tween.tween_property(_scan_panel, "offset_transform_position", Vector2(-20.0 * page, 0), _PAGE_DURATION)
+		tween.tween_property(_scan_panel, "offset_transform_position_ratio", Vector2(0.0 - page, 0), _PAGE_DURATION)
+		tween.tween_property(_body_ctrl, "offset_transform_position", Vector2(-20.0 * page + 20, 0), _PAGE_DURATION)
+		tween.tween_property(_body_ctrl, "offset_transform_position_ratio", Vector2(1.0 - page, 0), _PAGE_DURATION)
+		tween.tween_property(_body_about, "offset_transform_position", Vector2(-20.0 * page + 40, 0), _PAGE_DURATION)
+		tween.tween_property(_body_about, "offset_transform_position_ratio", Vector2(2.0 - page, 0), _PAGE_DURATION)
+		_page_tween = tween
+	_sync_nav(page)
+
+## 底部导航只读同步（set_pressed_no_signal 避免回灌 toggled → _switch_page 造成重复）。
+func _sync_nav(page: int) -> void:
+	_nav_bt.set_pressed_no_signal(page == 0)
+	_nav_ctrl.set_pressed_no_signal(page == 1)
+	_nav_about.set_pressed_no_signal(page == 2)
+
+## 画面上左右滑动切页：直接在 _input 里全量处理（不依赖 unhandled 传播，保证任何位置都响应）。
+## 横移超过阈值且横向占主导才切页；落在摇杆区内整段跳过，避免和转向拖动冲突。
+func _input(event: InputEvent) -> void:
+	if event is InputEventScreenTouch:
+		var t := event as InputEventScreenTouch
+		if t.pressed:
+			_swipe_start = t.position
+			_drag_base = float(_cur_page)
+			_drag_active = false
+			_drag_float = _drag_base
+			_reset_velocity()
+			_swipe_skip = _joystick.get_global_rect().has_point(t.position)
+		else:
+			if _drag_active:
+				_end_drag()
+			_drag_active = false
+	elif event is InputEventScreenDrag:
+		if _swipe_skip:
+			return
+		var d := event as InputEventScreenDrag
+		_track_velocity(d.position.x)
+		if not _drag_active:
+			var dx: float = d.position.x - _swipe_start.x
+			var dy: float = d.position.y - _swipe_start.y
+			if absf(dx) < _PAGE_TRIGGER or absf(dx) < absf(dy):
+				return
+			_drag_active = true
+			_drag_base = float(_cur_page)
+			if _page_tween != null:
+				_page_tween.kill()
+		_drag_float = clampf(_drag_base - (d.position.x - _swipe_start.x) / size.x, 0.0, 2.0)
+		_apply_page_offset(_drag_float)
+		get_viewport().set_input_as_handled()
+	elif OS.get_name() != "Android" and event is InputEventMouseButton \
+			and (event as InputEventMouseButton).button_index == MOUSE_BUTTON_LEFT:
+		var mb := event as InputEventMouseButton
+		if mb.pressed:
+			_mouse_held = true
+			_swipe_start = mb.position
+			_drag_base = float(_cur_page)
+			_drag_active = false
+			_drag_float = _drag_base
+			_reset_velocity()
+			_swipe_skip = _joystick.get_global_rect().has_point(mb.position)
+		else:
+			_mouse_held = false
+			if _drag_active:
+				_end_drag()
+			_drag_active = false
+	elif OS.get_name() != "Android" and event is InputEventMouseMotion \
+			and _mouse_held and not _swipe_skip:
+		var m := event as InputEventMouseMotion
+		_track_velocity(m.position.x)
+		if not _drag_active:
+			var dx2: float = m.position.x - _swipe_start.x
+			var dy2: float = m.position.y - _swipe_start.y
+			if absf(dx2) < _PAGE_TRIGGER or absf(dx2) < absf(dy2):
+				return
+			_drag_active = true
+			_drag_base = float(_cur_page)
+			if _page_tween != null:
+				_page_tween.kill()
+		_drag_float = clampf(_drag_base - (m.position.x - _swipe_start.x) / size.x, 0.0, 2.0)
+		_apply_page_offset(_drag_float)
+		get_viewport().set_input_as_handled()
+
+## 松手吸附：默认吸附到最近整页；若拖动中采样到的横向速度很高（甩动）则顶掉速度方向相邻那一页。
+func _end_drag() -> void:
+	var target := clampi(roundi(_drag_float), 0, 2)
+	if absf(_vel) > _PAGE_FLING:
+		target = clampi(int(_drag_base) + (1 if _vel < 0.0 else -1), 0, 2)
+	_snap_to(target, true)
+
+## 按下时重置速度采样。
+func _reset_velocity() -> void:
+	_drag_accum = 0.0
+	_last_sample = 0.0
+	_last_sample_tick = -1
+	_vel = 0.0
+
+## 拖动中采速（镜像 ScrollContainer）：位移差 / 采样时长，间隔离散采样防噪声。
+func _track_velocity(px: float) -> void:
+	_drag_accum = px - _swipe_start.x
+	var now: int = Time.get_ticks_msec()
+	if _last_sample_tick >= 0:
+		var dms: int = now - _last_sample_tick
+		if dms >= _VEL_SAMPLE_MS:
+			_vel = (_drag_accum - _last_sample) / (float(dms) / 1000.0)
+			_last_sample = _drag_accum
+			_last_sample_tick = now
+	else:
+		_last_sample = _drag_accum
+		_last_sample_tick = now
 
 # ============================== BLE ==============================
 
@@ -256,10 +390,10 @@ func _exec_status_text(p: Variant) -> String:
 		return line
 	return ""
 
-## 统一扫描入口。auto=true（启动/恢复）：清列表 + 同步自动目标名；
-## auto=false（手动）：清列表 + 打断自动重连 + 复位连接占位 + 开扫。
+## 统一扫描入口。auto=true（启动/恢复）：同步自动目标名；
+## auto=false（手动）：打断自动重连 + 复位连接占位 + 开扫。
+## 列表不在开扫时清空：由扫描页在真正显示新设备时才清旧列表（见 ScanPanel），避免扫描间隙空白。
 func _start_scan(auto: bool) -> void:
-	_scan_panel.call("clear")
 	if auto:
 		_pending_name = DeviceConn.auto_target_name()   # 顶栏 "连接中: xxx"
 	else:
@@ -269,7 +403,7 @@ func _start_scan(auto: bool) -> void:
 	DeviceConn.scan()
 
 func _on_refresh_toggled(pressed_on: bool) -> void:
-	# toggle 按下 → 统一入口（清列表 + 打断自动重连 + 开扫），松开 → 统一停扫（恢复扫描一并打断）。
+	# toggle 按下 → 统一入口（打断自动重连 + 开扫），松开 → 统一停扫（恢复扫描一并打断）。
 	if pressed_on:
 		_start_scan(false)
 	else:

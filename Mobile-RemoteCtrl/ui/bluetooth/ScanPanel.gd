@@ -14,6 +14,8 @@ const BT_ITEM := preload("res://ui/bluetooth/BTDeviceListItem.tscn")
 var _device_seen: Dictionary = {}
 var _empty_hint: Label = null
 var _refresh_tween: Tween = null
+## 新一轮扫描待首条新设备；出现时才清掉上一轮旧表（避免扫描间隙显示空白）。
+var _need_flush := false
 
 ## 扫描结束收尾：复位按钮/动画、按地址去重补漏设备，整轮空则显示空提示。
 ## 返回是否整轮一个设备都没发现（供 Main 决定是否提示权限问题）。
@@ -21,6 +23,10 @@ func on_scan_finished(devices: Array) -> bool:
 	if _refresh_btn.button_pressed:
 		_refresh_btn.set_pressed_no_signal(false)
 	_stop_scan_animation()
+	# 本轮若有新设备经 on_device_found 已清旧表；这里兜底：仅当确要到条列表才清。
+	if _need_flush and devices.size() > 0:
+		_need_flush = false
+		_flush()
 	# 设备在扫描中已逐台加进列表（边扫边显示），这里兜底补漏（按地址去重）。
 	for d: Variant in devices:
 		if not (d is Dictionary):
@@ -43,8 +49,11 @@ func on_scan_finished(devices: Array) -> bool:
 		return true
 	return false
 
-## 扫描中逐台发现：去重后立刻补一张卡片，实现"边扫边显示"。
+## 扫描中逐台发现：本轮首条新设备先清上一轮旧表；再按地址去重立刻补一张卡片（边扫边显示）。
 func on_device_found(device: Dictionary) -> void:
+	if _need_flush:
+		_need_flush = false
+		_flush()
 	var raw_addr: Variant = device.get("address")
 	if not (raw_addr is String) or (raw_addr as String).is_empty():
 		return
@@ -57,13 +66,19 @@ func on_device_found(device: Dictionary) -> void:
 	_device_seen[addr.to_lower()] = nm
 	_add_device_card(nm, addr)
 
-## 进入扫描：刷新按钮按下态 + 旋转动画。
+## 进入扫描：刷新按钮按下态 + 旋转动画；标记"待首条新设备再清旧表"。
 func show_scanning() -> void:
+	_need_flush = true
 	_refresh_btn.set_pressed_no_signal(true)
 	_start_scan_animation()
 
-## 清空列表与去重表（新一轮扫描 / 手动重扫前调用）。
+## 清空列表与去重表（上一轮的旧内容，仅在新一轮出现首条设备时才由 _flush 调用）。
 func clear() -> void:
+	_need_flush = true
+	_flush()
+
+## 真正清空：释放旧设备卡片与空提示占位、重置去重表。
+func _flush() -> void:
 	for child: Node in _device_vbox.get_children():
 		child.queue_free()
 	_empty_hint = null
