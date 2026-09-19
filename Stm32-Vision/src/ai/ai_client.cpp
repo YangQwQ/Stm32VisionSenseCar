@@ -276,14 +276,29 @@ struct PsaBuf {
 // 400 "invalid unicode/character"；中文等多字节字节序原样透传（UTF-8 合法）。
 static void esc_append(PsaBuf& b, const char* s) {
   b.put('"');
-  for (const char* c = s; *c; c++) {
-    unsigned char ch = (unsigned char)*c;
-    if (ch == '"' || ch == '\\') { b.put('\\'); b.put((char)ch); }
-    else if (ch == '\n') { b.put('\\'); b.put('n'); }
-    else if (ch == '\r') { b.put('\\'); b.put('r'); }
-    else if (ch == '\t') { b.put('\\'); b.put('t'); }
-    else if (ch < 0x20) { char h[7]; snprintf(h, sizeof(h), "\\u%04X", ch); b.put(h); }
-    else b.put((char)ch);
+  const unsigned char* p = (const unsigned char*)s;
+  while (*p) {
+    unsigned char ch = *p;
+    if (ch == '"' || ch == '\\') { b.put('\\'); b.put((char)ch); p++; }
+    else if (ch == '\n') { b.put('\\'); b.put('n'); p++; }
+    else if (ch == '\r') { b.put('\\'); b.put('r'); p++; }
+    else if (ch == '\t') { b.put('\\'); b.put('t'); p++; }
+    else if (ch < 0x20) { char h[7]; snprintf(h, sizeof(h), "\\u%04X", ch); b.put(h); p++; }
+    else if (ch < 0x80) { b.put((char)ch); p++; }
+    else {
+      // 多字节 UTF-8：校验续字节，非法/残缺则替换为 '?'（防云端判 invalid unicode code point，400）
+      // 历史环回喂的模型 reason 偶发携非良构多字节（如不合法的 unicode escape），只能防御。
+      int need;
+      if (ch >= 0xC2 && ch <= 0xDF) need = 1;
+      else if (ch >= 0xE0 && ch <= 0xEF) need = 2;
+      else if (ch >= 0xF0 && ch <= 0xF4) need = 3;
+      else { b.put('?'); p++; continue; }              // 非法首字节
+      bool ok = true;
+      for (int i = 1; i <= need; i++)
+        if (!(p[i] >= 0x80 && p[i] <= 0xBF)) { ok = false; break; }
+      if (ok) { for (int i = 0; i <= need; i++) b.put((char)p[i]); p += need + 1; }
+      else { b.put('?'); p++; }                        // 残缺/非法序列：单字节替换
+    }
   }
   b.put('"');
 }
@@ -329,7 +344,7 @@ static void b64_append(PsaBuf& b, const uint8_t* in, size_t inlen) {
 static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
   b.put("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,");
   b64_append(b, data, len);
-  b.put("\",\"detail\":\"medium\"}}");
+  b.put("\",\"detail\":\"high\"}}");   // DeepSeek 只认 low/high/original/auto；medium 会被 422 拒（夹取小目标需保细节）
 }
 
 // 屏幕像素 → 地面坐标（单应投影）由独立模块 ground_proj 负责：ground::screen_to_world。

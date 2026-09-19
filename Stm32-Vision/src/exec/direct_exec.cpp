@@ -314,18 +314,23 @@ bool exec::set_servo(uint8_t logical, uint16_t pwm) {
 bool exec::arm_pose(float x, float h) {
   // 给末端目标位姿：x=夹心车头前方 cm，h=夹心离地高度 cm。反解走 bivar 散点插值。
   // 目标在标定可达盒内直接反解；超出盒(撞边界)则先夹到盒内最近的合法点再反解——不拒绝，
-  // 而是移到最接近的合法位姿。夹紧后仍不可达（物理舵机限位）才会拒绝并记录诊断。
+  // 而是移到最接近的合法位姿。反解出的 PWM 越物理舵机限位时也夹到限位继续，而非拒绝：
+  // 只要落进标定盒就能尽力移到物理边界，防止稀疏角区外插把"还能压下去"误当成不可达。
   s_arm_rej.x = x; s_arm_rej.h = h;
   bool clamped = bivar::arm_clamp(&x, &h);
   // 夹到盒内后戳地(h<0)已不可达（盒 h 最小>0），这里仅兜底负高度竖直挤压情形。
   float reach = 0, lift = 0;
-  if (!bivar::arm_ik(x, h, &reach, &lift)) return false;  // 夹紧后仍出盒/不可达
+  if (!bivar::arm_ik(x, h, &reach, &lift)) return false;  // 夹紧后仍出盒→不可达
   int rr = (int)roundf(reach), ll = (int)roundf(lift);     // 左=移爪 reach / 右=抬落 lift
-  // 越物理限位判不可达并记录诊断（盒内点一般不至于，但角区外插可能跑到）
-  if (rr < REACH_LO || rr > REACH_HI) { s_arm_rej.armed = true; s_arm_rej.reason = 2; return false; }
-  if (ll < LIFT_LO  || ll > LIFT_HI ) { s_arm_rej.armed = true; s_arm_rej.reason = 3; return false; }
-  if (clamped) { s_arm_rej.armed = true; s_arm_rej.reason = 1; s_arm_rej.cx = x; s_arm_rej.ch = h; }
-  else         { s_arm_rej.armed = false; }
+  // 反解在稀疏角区外插可能越物理限位：夹到舵机限位继续执行而非拒绝，让标定盒内的位姿总能
+  // 尽力移到组件物理边界（否则 IDW 一外插超限就被当"不可达"卡住）。撞物理限位也算夹紧记进诊断。
+  bool phy = false;
+  if (rr < REACH_LO) { rr = REACH_LO; phy = true; }
+  else if (rr > REACH_HI) { rr = REACH_HI; phy = true; }
+  if (ll < LIFT_LO) { ll = LIFT_LO; phy = true; }
+  else if (ll > LIFT_HI) { ll = LIFT_HI; phy = true; }
+  s_arm_rej.armed = clamped || phy;
+  if (clamped) { s_arm_rej.reason = 1; s_arm_rej.cx = x; s_arm_rej.ch = h; }
   // 联动：一次同时给左右两舵机目标。set_servo 内部会限 pwm 并同步状态。
   bool ok = set_servo(1, (uint16_t)rr) & set_servo(2, (uint16_t)ll);
   return ok;

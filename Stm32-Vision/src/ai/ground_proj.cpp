@@ -17,8 +17,8 @@ static bool s_ready = false;
 // A 按列主元反射逐步上三角化，b 同步施加反射，最后回代。返回 false=奇异/数值失败。
 static bool qr_fit(const double A[2 * kGroundCalN][8], const double b[2 * kGroundCalN], double h[8]) {
   const int m = 2 * kGroundCalN, n = 8;
-  double R[32][8];   // m×n 工作副本（kGroundCalN≤16 时 m≤32）
-  double qb[32];
+  static double R[2 * kGroundCalN][8];   // m×n 工作副本，尺寸随标定点数推导（勿写死 16×2）
+  static double qb[2 * kGroundCalN];     // 静态：不压 loopTask 栈（见 ground::init 注释）
   for (int i = 0; i < m; i++) { for (int j = 0; j < n; j++) R[i][j] = A[i][j]; qb[i] = b[i]; }
   for (int k = 0; k < n; k++) {
     double n2 = 0;
@@ -64,7 +64,9 @@ bool ground::init(void) {
   us = us / kGroundCalN; vs = vs / kGroundCalN; xs = xs / kGroundCalN; ys = ys / kGroundCalN;
   if (us < 1e-9) us = 1; if (vs < 1e-9) vs = 1; if (xs < 1e-9) xs = 1; if (ys < 1e-9) ys = 1;
 
-  double A[32][8], b[32];
+  // 大工作数组不放栈：loopTask 栈 8K，嵌套 init→qr_fit 两套 [2N][8] 易溢出（见历史 panic）。
+  // 静态放 .bss（仅 init 期用一次，无并发），省下 ≈6KB 栈。
+  static double A[2 * kGroundCalN][8], b[2 * kGroundCalN];
   for (int i = 0; i < kGroundCalN; i++) {
     double u = (kGroundCal[i][0] - um) / us, v = (kGroundCal[i][1] - vm) / vs;
     double x = (kGroundCal[i][2] - xm) / xs, y = (kGroundCal[i][3] - ym) / ys;
@@ -89,10 +91,12 @@ bool ground::init(void) {
                     (ey - (float)kGroundCal[i][3]) * (ey - (float)kGroundCal[i][3]));
     if (e > maxerr) maxerr = e;
   }
+  // QR 成功即启用像素观测。回验误差仅作精度日志、不再因此禁用：相机略斜/远点像素点击误差
+  // 会让个别标定点残差 >5cm，但整体最短二乘仍可用；禁用会让 AI 退回只有方位的 rel_deg，
+  // 反而损失距离。screen_to_world 自带 0..1 与地面范围护栏防外推，误差大只致坐标偏差、不崩溃。
   if (maxerr <= 5.f) { blog::logf(blog::CAM, "单应QR求解成功 回验最大误差=%.1fcm", maxerr); return true; }
-  blog::logf(blog::CAM, "单应QR回验超差(%.1fcm)，像素观测禁用", maxerr);
-  s_ready = false;
-  return false;
+  blog::logf(blog::CAM, "单应QR回验超差(%.1fcm)，仍启用像素观测（坐标偏差上限≈该值）", maxerr);
+  return true;
 }
 
 bool ground::ready() { return s_ready; }
