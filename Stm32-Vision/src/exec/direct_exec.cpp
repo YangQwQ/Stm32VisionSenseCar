@@ -32,6 +32,7 @@ static int16_t s_steer = STEER_CENTER;
 static int16_t s_reach = REACH_CENTER;
 static int16_t s_lift  = LIFT_CENTER;
 static int16_t s_grip  = GRIP_CENTER;
+static bool s_folded = false;   // 臂是否处于"已折叠回平台"态: fold 置位, 任何移动臂位的动作(arm_pose/持续/reset)清除
 
 // 缓动分离：s_reach/s_lift = 目标(逻辑/状态读取用)，s_reach_w/s_lift_w = 实际写入板的 PWM。
 // 离散定位(fold/arm_pose/reset/init)在 update_tick 里用 S 形曲线把 s_*_w 追向 s_*；
@@ -250,10 +251,12 @@ static void send_arm(const JsonObjectConst& p) {
   if (!strcmp(act_, "lift_up") || !strcmp(act_, "lift_down")) {
     // 抬落（联动 h 轴）：lift_up = 末端升高（h+）；lift_down = 降低（h-），保持 x 不变。
     int16_t dir = !strcmp(act_, "lift_up") ? +1 : -1;
+    s_folded = false;   // 移动臂位即解除折叠态
     setup_active(1, dir, has_dist, dist);
   } else if (!strcmp(act_, "reach_forward") || !strcmp(act_, "reach_backward")) {
     // 移爪（联动 x 轴）：forward = 前伸（x+）；backward = 缩回（x-），保持高度 h 不变。
     int16_t dir = !strcmp(act_, "reach_forward") ? +1 : -1;
+    s_folded = false;
     setup_active(0, dir, has_dist, dist);
   } else if (!strcmp(act_, "clip")) {
     clear_active();
@@ -268,6 +271,7 @@ static void send_arm(const JsonObjectConst& p) {
     s_lift  = FOLD_LIFT_PWM;  write_lift();
     s_reach = FOLD_REACH_PWM; write_reach();
     s_grip  = GRIP_CENTER;    write_grip();
+    s_folded = true;
   }
 }
 
@@ -399,6 +403,7 @@ bool exec::act(const char* type, const JsonObjectConst& params) {
   if (!strcmp(type, "arm"))    { send_arm(params);  return true; }
   if (!strcmp(type, "arm_pose")) {
     // AI/手动指定位姿：x=夹心车头前方 cm，h=夹心离地高度 cm；不可达返回 false（不动）。
+    s_folded = false;   // 指定位姿同样脱离折叠态
     return arm_pose(params["x"] | 0.0f, params["h"] | 0.0f);
   }
   if (!strcmp(type, "light")) {
@@ -412,7 +417,7 @@ bool exec::act(const char* type, const JsonObjectConst& params) {
     }
     return ok;
   }
-  if (!strcmp(type, "reset"))  { exec::reset(); return true; }
+  if (!strcmp(type, "reset"))  { exec::reset(); s_folded = false; return true; }
   return false;
 }
 
@@ -469,8 +474,10 @@ bool exec::read_state(char* buf, size_t cap) {
   float fk_x = 0, fk_h = 0;
   arm_fk(s_reach, s_lift, &fk_x, &fk_h);
   if (fk_x < 0) fk_x = 0;
-  snprintf(buf, cap, "小车:%s %s | 抓手:前%.0fcm(%d) 高%.0fcm(%d) 爪:%s%s",
-    car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, lim);
+  // 臂态语义：是否已折叠回平台（fold 到位/未被打断）。给 AI 明确反馈，避免已折叠后仍反复 fold。
+  const char* fold_stat = s_folded ? " 已折叠" : "";
+  snprintf(buf, cap, "小车:%s %s | 抓手:前%.0fcm(%d) 高%.0fcm(%d) 爪:%s%s%s",
+    car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, lim, fold_stat);
   // 撞边界/不可达诊断：反馈"想去哪、实际落到哪/反解成多少"，帮用户/AI 判断机械臂边界
   // （exec_log 推给手机）。reason=1 表示撞边界但已夹到最近合法点继续移动，非错误。
   if (s_arm_rej.armed) {

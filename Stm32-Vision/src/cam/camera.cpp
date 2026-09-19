@@ -40,8 +40,8 @@ bool init() {
   // WHEN_EMPTY 双缓冲轮流交出，及时归还即不死锁，两者各取新鲜且不同的帧。
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 14;
-  config.fb_count = 2;
+  config.jpeg_quality = 10;
+  config.fb_count = 3;
 
   // PSRAM 缺失时降级
   if (!psramFound()) {

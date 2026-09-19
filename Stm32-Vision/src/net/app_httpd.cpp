@@ -119,9 +119,10 @@ static void tune_socket(int fd)
 
 // WS 对端（手机）活体探测：连续此时间无任何上行 → 发一次探测 ping；再此时间无响应判死。
 // 用于感知"静默断链"（如手机重启），恢复 BLE 广播供再次配网/兜底。探测基于应用层
-// {"type":"ping"}，对端协议栈/客户端回 {"type":"pong"}，均走 WS 文本帧，无附加心跳.
-static const uint32_t WS_IDLE_PING_MS = 10000;    // 连续无上行时长，达到则发探测
-static const uint32_t WS_PING_TIMEOUT_MS = 3000;  // 探测后可容忍的无上行时长（判死界）
+// {"type":"ping"}，对端协议栈/客户端回 {"type":"pong"}，均走 WS 文本帧，无附加心跳。
+// 手机侧空闲 3s 会主动发 ping（上行），故这里的 idle 阈值只要 >3s 就不会误伤健康客户端；
+static const uint32_t WS_IDLE_PING_MS = 6000;     // 连续无上行时长，达到则发探测
+static const uint32_t WS_PING_TIMEOUT_MS = 2500;  // 探测后可容忍的无上行时长（判死界）
 static volatile uint32_t s_ws_last_rx_ms = 0;      // 最近收到任一 WS 文本/binary 上行（ms）
 static volatile bool s_ws_ping_pending = false;    // 已发探测、等 pong（由 httpd 任务写入）
 static uint32_t s_ws_ping_at_ms = 0;
