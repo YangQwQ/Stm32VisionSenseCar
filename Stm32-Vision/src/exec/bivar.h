@@ -28,7 +28,8 @@ const ArmSet* arm_set(void);
 bool arm_init(void);
 bool arm_ready(void);
 
-// 正向 FK：(reach_pwm, lift_pwm) → (x, h)。距最近测点过远（超实测范围）返回 false。
+// 正向 FK：(reach_pwm, lift_pwm) → (x, h)。PWM 越标定区间时夹回区间内插值（饱和钳制，
+// 返回夹到边界的位姿，不拒绝），供反馈/状态在边界稳定读值、避免抖动。返回 false 仅当未 ready。
 bool arm_fk(float reach_pwm, float lift_pwm, float* x, float* h);
 
 // 反向 IK：(x, h) → (reach_pwm, lift_pwm)。在 x/h 空间按测点加权插值，超范围返回 false。

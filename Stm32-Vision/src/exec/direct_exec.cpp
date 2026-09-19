@@ -1,6 +1,7 @@
 #include "src/exec/direct_exec.h"
 #include "src/exec/nezha_direct.h"
 #include "src/exec/bivar.h"
+#include "src/core/board_log.h"   // blog::logf（临时调试 armdbg 用）
 #include "Calibration.h"   // 集中式校准数据（舵机限位/移动表/标定点）
 #include <math.h>
 #include <string.h>
@@ -189,9 +190,17 @@ void exec::update_tick(void) {
     return;
   }
   // 夹心持续平动：在逻辑位置 s_claw 上沿目标轴步进、保持另一维，再 arm_pose 单点定位。
-  // 用维护的 xh 逻辑状态做增量，避免沿 FK→微步→反解的连续闭环（散点 IDW 下该闭环卡死不前进）。
+  // 连续步进需节流帧率：伺服跟不上会产生滞后，FK 反馈读到滞后位置再回拽 → 极限环。
+  // 约 50ms 落一步，伺服跟得上、反馈才稳。
+  static uint32_t s_arm_step_ms = 0;
+  uint32_t now_ms = millis();
+  if (s_arm_step_ms != 0 && now_ms - s_arm_step_ms < 50) return;
+  s_arm_step_ms = now_ms;
+  // === 临时调试：定位移爪极限环（用毕删除）===
+  static int s_arm_dbg = 0;
   if (s_claw_x < 1.f && s_claw_h < 1.f) {   // 逻辑位置未初始化（reset 后首动）：从当前舵机反算
     arm_fk(s_reach, s_lift, &s_claw_x, &s_claw_h);
+    blog::logf(blog::EXEC, "armdbg REINIT pwm=(%d,%d) logic=(%.1f,%.1f)", s_reach, s_lift, s_claw_x, s_claw_h);
   }
   float tx = s_claw_x, th = s_claw_h;
   if (s_active.axis == 0) tx += ARM_STEP_CM * s_active.dir;   // 前伸/缩回：x 变，h 不变
@@ -200,9 +209,21 @@ void exec::update_tick(void) {
   bivar::arm_clamp(&tx, &th);
   if (!exec::arm_pose(tx, th)) { clear_active(); return; }    // 夹紧后仍不可达（物理限位）：到边即停
   s_reach_w = s_reach; s_lift_w = s_lift; write_reach(); write_lift();
-  // 逻辑位置直接用"目标坐标"推进（已夹）：IDW 下 FK∘IK 不互逆，若用实际 pwm 反算当起点，
-  // 每步会被反算回拽（h 荡在 4.75~5.2），表现为按钮降不下去；目标坐标推进等价多次小步 move。
-  s_claw_x = tx; s_claw_h = th;
+  // 回授协调：只把"被步进的轴"锚到真实 FK，保持轴维持命令值——避免 fk 噪声把保持轴带入
+  // 极限环 / 按住后反向漂移。臂到真实物理极限时 FK 停进，s_claw 随之停，命令不再空推。
+  float rxx = 0, rhh = 0;
+  if (bivar::arm_fk((float)s_reach, (float)s_lift, &rxx, &rhh)) {
+    if (s_active.axis == 0) { s_claw_x = rxx; s_claw_h = th; }   // 移爪：x 跟回授，h 保持命令
+    else                    { s_claw_h = rhh; s_claw_x = tx; }   // 抬落：h 跟回授，x 保持命令
+  } else {
+    s_claw_x = tx; s_claw_h = th;     // 反算越数据范围读不到：回退用目标（夹紧后仍 push）
+  }
+  if (s_arm_dbg++ < 600 && (s_arm_dbg & 3) == 0) {   // 每 4 拍打一拍，最多 600 行
+    float fb_x = 0, fb_h = 0;
+    arm_fk(s_reach, s_lift, &fb_x, &fb_h);
+    blog::logf(blog::EXEC, "armdbg logic=(%.2f,%.2f) tgt=(%.2f,%.2f) pwm=(%d,%d) fk=(%.2f,%.2f)",
+               s_claw_x, s_claw_h, tx, th, s_reach, s_lift, fb_x, fb_h);
+  }
   if (s_active.budget > 0) {
     if (--s_active.budget <= 0) clear_active();
   }
@@ -212,6 +233,10 @@ static void setup_active(int8_t axis, int16_t dir, bool has_dist, int16_t dist) 
   s_active.axis = axis;
   s_active.dir = dir;
   s_active.budget = has_dist ? (int16_t)(dist * ARM_CNT_PER_CM) : 0;
+  // 每次持续移动起点：把逻辑坐标重新锚到舵机真实当前位置（FK）。否则 reset/fold/离散
+  // arm_pose 后残留旧逻辑值，首拍会从旧坐标起步、朝反方向先补一枪。
+  float fx = 0, fh = 0;
+  if (bivar::arm_fk((float)s_reach_w, (float)s_lift_w, &fx, &fh)) { s_claw_x = fx; s_claw_h = fh; }
 }
 
 static void send_arm(const JsonObjectConst& p) {
@@ -311,16 +336,45 @@ bool exec::set_servo(uint8_t logical, uint16_t pwm) {
   }
 }
 
+// 迭代反解：以 IDW 反查询为初值，用正演 FK 走牛顿迭代校正，使 FK(pwm)→目标精确，
+// 消除 IDW FK∘IK 不互逆（否则持续相控时每步被 FK 打回 / 或边界空推）。到物理限位自动饱和停滞。
+static bool ik_refine(float x, float h, float* r, float* l) {
+  if (!bivar::arm_ik(x, h, r, l)) return false;   // 反查初值；越标定盒返回 false
+  float rp = *r, lp = *l;
+  for (int it = 0; it < 7; it++) {
+    float fx, fh;
+    if (!bivar::arm_fk(rp, lp, &fx, &fh)) break;             // 出标定数据区：没法校正，用当前值
+    float ex = x - fx, eh = h - fh;
+    if (fabsf(ex) < 0.02f && fabsf(eh) < 0.02f) break;        // 已收敛
+    const float d = 1.0f;                                     // 数值雅可比：reach/lift 各偏 d
+    float fxr, fhr, fxl, fhl;
+    if (!bivar::arm_fk(rp + d, lp, &fxr, &fhr)) break;
+    if (!bivar::arm_fk(rp, lp + d, &fxl, &fhl)) break;
+    float J00 = (fxr - fx) / d, J01 = (fxl - fx) / d;
+    float J10 = (fhr - fh) / d, J11 = (fhl - fh) / d;
+    float det = J00 * J11 - J01 * J10;
+    if (fabsf(det) < 1e-6f) break;                            // 奇异（饱和区雅可比退化）
+    float dr = (ex * J11 - J01 * eh) / det;
+    float dl = (-J10 * ex + J00 * eh) / det;
+    dr = fmaxf(-6.f, fminf(6.f, dr));                         // 阻尼防发散
+    dl = fmaxf(-6.f, fminf(6.f, dl));
+    rp += dr; lp += dl;
+    rp = fmaxf((float)REACH_LO, fminf((float)REACH_HI, rp));
+    lp = fmaxf((float)LIFT_LO, fminf((float)LIFT_HI, lp));
+  }
+  *r = rp; *l = lp;
+  return true;
+}
+
 bool exec::arm_pose(float x, float h) {
-  // 给末端目标位姿：x=夹心车头前方 cm，h=夹心离地高度 cm。反解走 bivar 散点插值。
-  // 目标在标定可达盒内直接反解；超出盒(撞边界)则先夹到盒内最近的合法点再反解——不拒绝，
-  // 而是移到最接近的合法位姿。反解出的 PWM 越物理舵机限位时也夹到限位继续，而非拒绝：
-  // 只要落进标定盒就能尽力移到物理边界，防止稀疏角区外插把"还能压下去"误当成不可达。
+  // 给末端目标位姿：x=夹心车头前方 cm，h=夹心离地高度 cm。反解：IDW 反查初值 + FK 迭代校正
+  // （使反解出的 PWM 的实际 FK 回读≈目标，收敛到物理饱和为止）。超出盒先夹到盒内最近的
+  // 合法点再反解——不拒绝，移到最接近的合法位姿；反解落在物理舵机限位外也夹到限位继续。
   s_arm_rej.x = x; s_arm_rej.h = h;
   bool clamped = bivar::arm_clamp(&x, &h);
   // 夹到盒内后戳地(h<0)已不可达（盒 h 最小>0），这里仅兜底负高度竖直挤压情形。
   float reach = 0, lift = 0;
-  if (!bivar::arm_ik(x, h, &reach, &lift)) return false;  // 夹紧后仍出盒→不可达
+  if (!ik_refine(x, h, &reach, &lift)) return false;  // 反查初值即出盒→不可达
   int rr = (int)roundf(reach), ll = (int)roundf(lift);     // 左=移爪 reach / 右=抬落 lift
   // 反解在稀疏角区外插可能越物理限位：夹到舵机限位继续执行而非拒绝，让标定盒内的位姿总能
   // 尽力移到组件物理边界（否则 IDW 一外插超限就被当"不可达"卡住）。撞物理限位也算夹紧记进诊断。

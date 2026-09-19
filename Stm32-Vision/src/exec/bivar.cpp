@@ -38,9 +38,10 @@ bool arm_ready(void) { return s_ready; }
 
 bool arm_fk(float reach_pwm, float lift_pwm, float* x, float* h) {
   if (!s_ready) return false;
-  // 正向可达域：索引在 pwm 标定区间内即插值（区间内网格密，可靠）
-  if (reach_pwm < s_r_min || reach_pwm > s_r_max ||
-      lift_pwm  < s_l_min || lift_pwm  > s_l_max) return false;
+  // 越标定 PWM 区间也夹回区间再插值、不拒绝（饱和钳制）：让反馈/状态在边界能读到"夹到边界
+  // 的真实位置"。否则过程顶破数据范围时 FK 返回 false 使反馈失锚 → 边界抖动（logic/target 来回跳）。
+  if (reach_pwm < s_r_min) reach_pwm = s_r_min; else if (reach_pwm > s_r_max) reach_pwm = s_r_max;
+  if (lift_pwm  < s_l_min) lift_pwm  = s_l_min; else if (lift_pwm  > s_l_max) lift_pwm  = s_l_max;
   // IDW：以 pwm 距离平方的倒数加权，最近点占主导，测点处精确穿过
   float sw = 0, sx = 0, sh = 0;
   const float eps = 1e-3f;
