@@ -16,6 +16,8 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "fb_gfx.h"
+#include <string.h>
+#include <stdlib.h>
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "lwip/sockets.h"
@@ -166,15 +168,15 @@ static void udp_peer_clear(void) {
 
 // 把一帧 JPEG 切成 UDP 分片推给对端；任一分片发送失败（缓冲满/对端不可达）即整帧放弃
 // （快于降帧率，契合"同步发送+跳帧"控制策略，避免积压抬延迟）。
-static void udp_send_frame(camera_fb_t *fb) {
+static void udp_send_frame_data(const uint8_t *jpeg, size_t len) {
     if (!s_udp_peer_valid || s_udp_fd < 0) return;
-    size_t total = fb->len;
+    size_t total = len;
     if (total == 0) return;
     uint32_t fid = s_udp_frame_id++;
     uint16_t count = (uint16_t)((total + UDP_JPG_CHUNK - 1) / UDP_JPG_CHUNK);
     uint8_t hdr[UDP_FRAME_HDR];
     uint8_t buf[UDP_JPG_CHUNK + UDP_FRAME_HDR];
-    const uint8_t *p = fb->buf;
+    const uint8_t *p = jpeg;
     size_t rem = total;
     for (uint16_t seq = 0; seq < count; seq++) {
         size_t chunk = rem > UDP_JPG_CHUNK ? UDP_JPG_CHUNK : rem;
@@ -216,13 +218,44 @@ static void ws_kick_all(void) {
     }
 }
 
+// WS 文本统一出口消毒(残缺/非法 UTF-8 与控制字符→'?')，防 Godot 1007 断链
+static void ws_sanitize_utf8(char* s) {
+    char* w = s;
+    const unsigned char* p = (const unsigned char*)s;
+    while (*p) {
+        unsigned char c = *p;
+        int need = 0;
+        if (c < 0x20 || c == 0x7f) { *w++ = '?'; p++; continue; }
+        if (c < 0x80) { *w++ = (char)c; p++; continue; }
+        if (c >= 0xC2 && c <= 0xDF) need = 1;
+        else if (c >= 0xE0 && c <= 0xEF) need = 2;
+        else if (c >= 0xF0 && c <= 0xF4) need = 3;
+        bool ok = need > 0;
+        for (int i = 1; ok && i <= need; i++) {
+            unsigned char cc = p[i];
+            if (!cc || !(cc >= 0x80 && cc <= 0xBF)) ok = false;
+        }
+        if (ok) { for (int i = 0; i <= need; i++) *w++ = (char)p[i]; p += need + 1; }
+        else    { *w++ = '?'; p += 1; }
+    }
+    *w = 0;
+}
+
 static esp_err_t ws_send_text(int fd, const char *text)
 {
+    // 统一出口消毒，堆拷贝发(1:1)，不动入参、不占发送任务大栈
+    size_t n = strlen(text);
+    char* buf = (char*)malloc(n + 1);
+    if (!buf) return ESP_ERR_NO_MEM;
+    memcpy(buf, text, n + 1);
+    ws_sanitize_utf8(buf);
     httpd_ws_frame_t frame = {0};
     frame.type = HTTPD_WS_TYPE_TEXT;
-    frame.payload = (uint8_t *)text;
-    frame.len = strlen(text);
-    return httpd_ws_send_frame_async(stream_httpd, fd, &frame);
+    frame.payload = (uint8_t *)buf;
+    frame.len = strlen(buf);
+    esp_err_t r = httpd_ws_send_frame_async(stream_httpd, fd, &frame);
+    free(buf);
+    return r;
 }
 
 static esp_err_t ws_send_jpeg(int fd, camera_fb_t *fb)
@@ -392,9 +425,9 @@ static void ws_stream_task(void *arg)
     while (true) {
         bool has_client = false;
         if (cmd::streaming()) {
-            camera_fb_t *fb = cam::grab();
+            camera_fb_t *fb = cam::grab();               // 图传高频：直接抓帧推，不搞中间拷贝(减少一次 malloc+memcpy 拖慢)
             if (fb) {
-                udp_send_frame(fb);                          // 图传帧走 UDP；WS 仅探测客户端是否在位（不再推帧）
+                udp_send_frame_data(fb->buf, fb->len);   // 图传帧走 UDP；WS 仅探测客户端是否在位（不再推帧）
                 ws_send_jpeg_to_ws_clients(nullptr, &has_client);
                 cam::return_frame(fb);
             }
@@ -462,7 +495,12 @@ static void ws_stream_task(void *arg)
         // 只有"真在推帧"（UDP 图传 / MJPEG 推流）才停 BLE 广播，否则手机随时可发现
         // VisionS3 重连（此前 WS 常挂/半开会让广播永久关闭，导致手机不重启连不上）。
         ble::set_transmission(isStreaming || cmd::streaming());
-        vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
+        // 空转降频：无 WS 客户端且非推流时，此任务只需维持 BLE 广播/心跳探测，无需高频轮询。
+        // 降低空转 CPU，让 core1 让给图传/AI；有客户端或推流时维持原 WS_STREAM_FPS 节奏。
+        if (has_client || cmd::streaming())
+            vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
+        else
+            vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 #endif // CONFIG_HTTPD_WS_SUPPORT
@@ -1579,6 +1617,9 @@ void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 16;
+    // httpd 默认栈偏小，WS 指令处理链（cmd::handle → 统一日志转发）加深易触发栈 canary 崩溃
+    // （实测收到 spin 时 httpd 栈溢出），调大与 ws_stream 同级避免 WS 指令线程爆栈。
+    config.stack_size = 8192;
 
     httpd_uri_t index_uri = {
         .uri = "/",

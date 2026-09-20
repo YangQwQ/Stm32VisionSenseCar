@@ -1,9 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-// TLS 传输(仅发送层): 复用连接 POST 到 AI 端点并读响应体。独立出 ai_http 模块,
-// 与 ai_client 的 worker 状态机解耦; cancel/set_goal 通过 http_stop() 中断在途请求。
-// g_client(连接) / g_last_status(最近状态码) 均 file-local 于 ai_http.cpp。
+// AI TLS 发送层(复用连接 POST 并读响应)。g_client/g_last_status 仅在本模块内。
 namespace ai {
 
 // POST url(带 key 的 AI 接口)。成功返回 true 且尽量保留 g_client 连接供下次复用。

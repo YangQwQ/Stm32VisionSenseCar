@@ -33,7 +33,7 @@
 #define AI_WAIT_FB_MIN_MS 10000   // wait 反馈节流: 同一动作少于此间隔只回一条
 #define AI_MOVE_CAP_MS 2000       // AI 持续 move 单次行驶时限(无里程计兜底, 防决策间隔内盲走撞墙)
 #define AI_MAX_NET_FAIL 4         // 连续"无有效输出"轮数上限: 超过即中止任务并回报(防云端持续无响应时无限空转)
-#define AI_HIST_N 8               // 历史环条数(AI 决策 + 插话共用, 满员淘汰最旧)
+#define AI_HIST_N 20               // 历史环条数(AI 决策 + 插话共用, 满员淘汰最旧)
 
 // 本地巡航(approach / /move to)参数: 定距段长、初对齐阈值、单次转向上限等。
 #define AI_APPROACH_STOP_CM 15   // AI 自动靠近的到位距离(之后交给 AI 微操)

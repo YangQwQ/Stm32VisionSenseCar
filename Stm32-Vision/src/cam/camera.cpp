@@ -42,6 +42,10 @@ bool init() {
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 10;
   config.fb_count = 3;
+  // 新库字段：jpeg 帧缓冲上限。经典版旧库无此字段，默认 recv_size=width*height/5(VGA≈60KB)，
+  // VGA+jpeg_quality=10 的高熵画面单帧 JPEG 常超 60KB，cam_hal 判定 fb 溢出(FB-OVF) → ll_cam_stop
+  // 硬停 DCMI → 图传冻结。抬到 128KB 消除溢出。依赖重编后的新版 esp32-camera 库，旧库编译会报错。
+  config.jpeg_buffer_size = 128 * 1024;
 
   // PSRAM 缺失时降级
   if (!psramFound()) {

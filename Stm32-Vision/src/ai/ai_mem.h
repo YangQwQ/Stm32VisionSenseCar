@@ -2,10 +2,7 @@
 #include <Arduino.h>     // size_t / millis
 #include <ArduinoJson.h>
 
-// 空间记忆 + 车姿态/坐标系换算(原 ai_client.cpp 的 file-local 静态块, 拆分后独立模块)。
-// AI 每步执行 move/spin 后由调用方(ai_client worker)调 car_update_pose 累积车姿态,
-// 观测结果入 g_mem 物体记忆表; mem_feed 把记忆按"当前车头局部系"渲染喂回模型。
-// 本命名空间内部 g_mem / name_same_obj / median_n / mem_store 仅在 ai_mem.cpp 内可见。
+// 空间记忆 + 车姿态(拆分自 ai_client)。g_mem 等仅本模块内可见。
 namespace ai {
 
 // 角度→弧度换算系数(内部连接性, 各 TU 自持一份; 供 ai_client.cpp 的 navigate_to 使用)。
