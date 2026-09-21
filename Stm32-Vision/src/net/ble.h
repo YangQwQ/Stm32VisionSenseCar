@@ -12,5 +12,7 @@ void reply(const char* text);  // 经 status 特征把应答文本通知给已�
 void send_status(const char* text);  // status 特征直接通知一段独立 JSON（周期状态推送 /log exec，不依赖 WS）
 void set_ws_connected(bool on);  // WS 客户端连上/断开时由 app_httpd 调，用于 status.ws
 void set_transmission(bool on);  // 任一图传通道活跃时停广播（让 WiFi 独占射频）；全部安静后恢复
+void set_quiet(bool on);  // OTA 硬静默：无条件停广播，并压住期间一切"恢复广播"的请求（升级结束须解除）
+bool is_quiet();          // 当前是否处于硬静默
 
 }  // namespace ble

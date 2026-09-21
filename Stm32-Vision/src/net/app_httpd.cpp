@@ -31,6 +31,7 @@
 #undef IPADDR_NONE
 #include "esp_heap_caps.h"
 #include "src/cam/camera_index.h"
+#include "src/net/ota.h"   // HTTP OTA 入口（/update）注册
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -604,7 +605,8 @@ static void ws_stream_task(void *arg)
         // 状态文本与上次完全相同时跳过（防刷屏，只有变化才推）。
         static uint32_t s_last_status_ms = 0;
         static char s_last_state[192] = {0};
-        if (blog::enabled(blog::EXEC) &&
+        // OTA 升级期间停推周期状态：每 400ms 一条 WS+BLE 通知纯属抢射频的杂音
+        if (!ota::active() && blog::enabled(blog::EXEC) &&
             (int32_t)(now - s_last_status_ms) >= (int32_t)400) {
             s_last_status_ms = now;
             char st[192];  // 状态含抓手前端 XZ 与 PWM + 不可达诊断，需足量避免截断
@@ -1112,6 +1114,9 @@ static esp_err_t stream_handler(httpd_req_t *req)
 
     while (true)
     {
+        // 有 OTA 会话在写固件：本次 MJPEG 推流就地结束，把射频与 CPU 让给固件传输
+        // （流退出时下方 isStreaming=false 会复位，OTA 结束后客户端重连即可恢复）
+        if (ota::active()) break;
 #if CONFIG_ESP_FACE_DETECT_ENABLED
     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
         detected = false;
@@ -1936,6 +1941,9 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &greg_uri);
         httpd_register_uri_handler(camera_httpd, &pll_uri);
         httpd_register_uri_handler(camera_httpd, &win_uri);
+
+        // 固件升级入口（GET 上传页 / POST 固件流），实现在 src/net/ota.cpp
+        ota::http_register(camera_httpd);
     }
 
     config.server_port += 1;

@@ -6,6 +6,7 @@
 #include "src/exec/direct_exec.h"
 #include "src/core/command.h"
 #include "src/net/ble.h"
+#include "src/net/ota.h"
 #include "src/ai/ai_client.h"
 #include "src/core/board_log.h"
 
@@ -53,6 +54,8 @@ void setup() {
   net::init();
   startCameraServer();
 
+  ota::init();  // 固件升级入口（ArduinoOTA 网络端口 + HTTP /update）；联网后由 update() 自动就绪
+
   ai::init();  // AI worker 任务（DIRECT 链路；依赖 WiFi 与摄像头）
 
   blog::logf(blog::SYS, "Ready!");
@@ -64,5 +67,6 @@ void loop() {
   ble::update();   // 处理 BLE cmd 队列 + WiFi 状态变化上报
   exec::update_tick();  // 直驱连续机械臂动作步进（约 10ms 一拍）
   ai::update();    // 排空 AI 结果队列（回传 Godot ai_result）
+  ota::update();   // OTA：联网后起 ArduinoOTA 并驱动 handle()（升级期间此调用会阻塞）
   delay(10);
 }

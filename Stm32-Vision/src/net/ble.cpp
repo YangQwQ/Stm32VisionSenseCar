@@ -38,6 +38,8 @@ static BLEServer* g_server = nullptr;
 static BLECharacteristic* g_status_char = nullptr;
 static bool g_ws_connected = false;   // 仅 WS 客户端在位（status.ws 字段）
 static bool g_transmission = false;   // 任一图传通道活跃（WS 客户端/MJPEG/streaming 标志）
+static bool g_quiet = false;          // OTA 硬静默：无条件停广播，压住一切"恢复广播"的请求
+static bool g_applied = false;        // 已施加的停广播状态（广播开关的唯一写入点见 apply_advertising）
 static bool g_last_net = false;
 
 // cmd JSON 队列：GATT 写回调入队，ble::update()（loop 上下文）取出统一派发。
@@ -154,9 +156,9 @@ class ServerCB : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer* s) override {
     bool adv = BLEDevice::getAdvertising()->isAdvertising();
-    // 任一图传通道活跃（WS 客户端/MJPEG/streaming）时保持低调，不恢复广播以免抢 WiFi 射频；
+    // 任一图传通道活跃（WS 客户端/MJPEG/streaming）或 OTA 静默中时保持低调，不恢复广播以免抢 WiFi 射频；
     // 否则(纯兜底/配网)恢复可发现，供再次连接。
-    if (s && !g_transmission) s->startAdvertising();
+    if (s && !g_transmission && !g_quiet) s->startAdvertising();
     blog::logf(blog::BLE, "手机断开 ws=%d adv=%d", g_ws_connected ? 1 : 0, adv);
   }
 };
@@ -225,18 +227,40 @@ void ble::set_ws_connected(bool on) {
   notify_status("");  // 状态变化即上报（ws 字段刷新）
 }
 
+// 广播开关的唯一施加点：图传活跃（g_transmission）或 OTA 硬静默（g_quiet）任一成立即停广播。
+// ⚠️ 必须收口到一处：ws_stream_task 每拍都按"当前图传状态"重设广播，OTA 期间若只从外面
+// stopAdvertising() 一次，下一拍就被它恢复（升级全程无法让出射频）——所以请求记在标志里，
+// 由这里裁决，任何一方的"恢复"都会被另一方的请求压住。
+static void apply_advertising() {
+  bool stop = g_transmission || g_quiet;
+  if (stop == g_applied) return;
+  g_applied = stop;
+  bool before = BLEDevice::getAdvertising()->isAdvertising();
+  if (stop) { if (before) BLEDevice::stopAdvertising(); }
+  else      { if (!before) BLEDevice::startAdvertising(); }
+  bool after = BLEDevice::getAdvertising()->isAdvertising();
+  if (before == after) return;
+  if (g_quiet) blog::logf(blog::BLE, "OTA 静默 → 广播%s", after ? "已启动" : "已停止");
+  else         blog::logf(blog::BLE, "图传=%s 广播%s", g_transmission ? "on" : "off", after ? "已启动" : "已停止");
+}
+
 void ble::set_transmission(bool on) {
   // BLE 与 WiFi 共用 2.4G 射频：广播开启会明显压低 WiFi 吞吐（手机离线但电脑 MJPEG 在推时
   // 单帧能从 ~100ms 恶化到 ~400ms）。因此任一图传通道活跃即停广播，全部安静再恢复可发现。
   if (g_transmission == on) return;
   g_transmission = on;
-  bool before = BLEDevice::getAdvertising()->isAdvertising();
-  if (on) { if (before) BLEDevice::stopAdvertising(); }
-  else    { if (!before) BLEDevice::startAdvertising(); }
-  bool after = BLEDevice::getAdvertising()->isAdvertising();
-  if (before != after)
-    blog::logf(blog::BLE, "图传=%s 广播%s", on ? "on" : "off", after ? "已启动" : "已停止");
+  apply_advertising();
 }
+
+void ble::set_quiet(bool on) {
+  // OTA 期间硬静默：此时固件正往 flash 写，射频时间片全留给 WiFi（广播开着吞吐掉到约 1/4）。
+  // 升级失败后由 ota 模块解除；成功路径紧接重启，广播随开机恢复。
+  if (g_quiet == on) return;
+  g_quiet = on;
+  apply_advertising();
+}
+
+bool ble::is_quiet() { return g_quiet; }
 
 void ble::update() {
   // 1) 处理 GATT 写回调积压的 cmd JSON
