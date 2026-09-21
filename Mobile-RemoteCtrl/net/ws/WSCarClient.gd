@@ -111,10 +111,16 @@ func _process(delta: float) -> void:
 			connected.emit()
 	elif rs in [WebSocketPeer.STATE_CLOSED, WebSocketPeer.STATE_CLOSING]:
 		var reason := ""
+		var code: int = _peer.get_close_code()
 		if rs == WebSocketPeer.STATE_CLOSED:
 			reason = _peer.get_close_reason()
-		if _peer.get_close_code() == 1000:
+		if code == 1000:
 			reason = "主动断开"
+		elif code > 0:
+			# 关闭码必须带上：Godot 的关闭原因文本直接取自对端所发关闭帧，而断链可能是
+			# 「板端文本帧内容非法」(1007) 也可能是「帧被并发写坏导致协议错」(1002)，
+			# 两者文本都长得像 UTF-8 问题，只有码能区分——排查方向完全不同，别只留原因文本。
+			reason = "%s（码=%d）" % [reason if not reason.is_empty() else "异常关闭", code]
 		_abnormal_disconnect(reason)
 		return
 	# 已连接时也继续读包（Open 分支不提前 return，否则收不到下行）。

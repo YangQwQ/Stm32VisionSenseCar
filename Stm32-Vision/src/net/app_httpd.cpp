@@ -373,7 +373,12 @@ static void ws_handle_text(const char *json, int fd)
         int port = doc["params"]["udp_port"] | 0;
         const char *src_ip = doc["params"]["src_ip"] | "";
         blog::logf(blog::WS, "stream on=%d port=%d src_ip=%s", on, port, src_ip);
-        if (on && port > 0) {
+        // 升级中不建/不拆 UDP 会话：手机自动重连会把"开图传"原样重放回来（掉线时它的开关
+        // 并不会复位），一旦重建对端 ws_stream_task 立刻恢复抓帧推流，与固件写入抢射频和
+        // core1（实测把 OTA 拖到超时）。command 侧另有同样的闸门，这里挡的是它之前的建会话。
+        if (ota::active()) {
+            blog::logf(blog::WS, "固件升级中：忽略图传开关（保持关闭）");
+        } else if (on && port > 0) {
             struct sockaddr_in src;
             socklen_t sl = sizeof(src);
             uint32_t peer_ip = 0;
@@ -512,7 +517,9 @@ static void ws_stream_task(void *arg)
         // 于是刚开播就被判成客户端离线 → 停推流 + 清 UDP 对端（画面卡在首帧、连接显示掉线）。
         ws_send_jpeg_to_ws_clients(nullptr, &has_client);
 
-        if (cmd::streaming()) {
+        // 升级中一律走"停推流"分支：闸门在 command/ws_handle_text 已挡住重新开启，这里兜底，
+        // 顺带把在途帧的 PSRAM 副本放掉，把内存与 core1 让给固件写入。
+        if (cmd::streaming() && !ota::active()) {
             if (s_out_active) {
                 udp_pump();              // 上一帧还在续传：按队列空闲续片，不抢新帧
                 // 弃帧只针对"发不动"：链路彻底不消化(持续一段时间一片都没出去)，
@@ -1062,6 +1069,11 @@ static esp_err_t capture_handler(httpd_req_t *req)
 
 static esp_err_t stream_handler(httpd_req_t *req)
 {
+    // 升级中直接拒绝开新流：整条 MJPEG 是持续抓帧+编码的 CPU 大户，会与固件写入抢 core1、
+    // 射频与 PSRAM；只靠下面循环里的 break 会让发起方以为流已建立（画面僵住却不见报错）。
+    if (ota::active())
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "固件升级中，暂不提供视频流");
+
     camera_fb_t *fb = NULL;
     struct timeval _timestamp;
     esp_err_t res = ESP_OK;

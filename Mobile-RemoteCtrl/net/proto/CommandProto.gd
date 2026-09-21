@@ -10,7 +10,9 @@ static func stop(scope: String = "all") -> Dictionary:
 	return {"type": "stop", "params": {"scope": scope}, "id": _new_id()}
 
 static func arm(act: String, duration_ms: int = 0) -> Dictionary:
-	# act: lift_up / lift_down / clip / release / reach_forward / reach_backward / home(收臂回平台)
+	# act: lift_up / lift_down / clip / release / reach_forward / reach_backward / fold(收臂折叠回平台)
+	#      / low(降到板端标定的贴地夹取准备位，再靠挪车把目标送进两指之间)
+	# 持续型只有 lift_up/lift_down/reach_forward/reach_backward；其余为一次性离散动作。
 	# duration_ms == 0 表示持续移动，直到收到 stop(scope="arm")
 	return {"type": "arm", "params": {"act": act, "duration_ms": duration_ms}, "id": _new_id()}
 
@@ -49,6 +51,12 @@ static func ping(target: String = "") -> Dictionary:
 	if not target.is_empty():
 		params["target"] = target
 	return {"type": "ping", "params": params, "id": _new_id()}
+
+static func reboot() -> Dictionary:
+	# 远程重启板子：链路卡死（WiFi/IP 死、BLE 还活着）时唯一能远程按下的那一下。
+	# 板端先回 status「正在重启…」再延时重启；同一句另经日志转发广播（所有 WS 客户端 + BLE），
+	# 所以旁观的手机也能看到，不依赖发起方。注意板端升级期间会拒收此指令。
+	return {"type": "reboot", "params": {}, "id": _new_id()}
 
 static func ai_goal(message: String, annotation: Dictionary = {}, use_image: bool = false) -> Dictionary:
 	# DIRECT 链路目标下发：手机 → 板子。annotation 为可选圈选区域 {x,y,w,h,label}（坐标相对手机画面）。
@@ -140,6 +148,7 @@ const COMMAND_HINTS := {
 	"/stop [wheels|arm]": "停车",
 	"/log <exec|ai|all> [on|off]": "统一日志转发开关（默认关；exec=执行日志+周期状态, ai=AI日志, all=板端全部输出）",
 	"/nz_read": "I2C诊断：探测哪吒从机在线状态(写/读ACK)",
+	"/reboot": "重启板子(链路卡死时的解药; 升级中会被拒)",
 	"/light <front|vibe|back> <0|1>": "直驱灯开关(前/氛围/尾)",
 	"/config <WiFi名> <密码>": "配网",
 	"/ai [goal|oneshot|cancel] <目标>": "AI 目标 / 单轮 / 取消",

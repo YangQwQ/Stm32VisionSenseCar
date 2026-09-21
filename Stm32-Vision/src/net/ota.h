@@ -16,4 +16,9 @@ void update();    // loop 中调用：联网后自动起 ArduinoOTA 并驱动 ha
 void http_register(httpd_handle_t server);  // startCameraServer 中调用一次：注册 /update
 bool active();    // 是否有 OTA 会话正在写固件：其它模块据此让路（MJPEG 推流退出、周期状态停推）
 
+// 运行中固件的标记，形如 "v1 指纹 fef509d0"（静态缓冲，勿长期持有）。
+// 出处与"为什么不用描述符里的 date/version"见 ota.cpp；指令回执里附带它，手机/PC 脚本
+// 开日志时就能知道板上跑的是哪份固件，从而判断 OTA 到底生效没有。
+const char* fw_stamp();
+
 }  // namespace ota

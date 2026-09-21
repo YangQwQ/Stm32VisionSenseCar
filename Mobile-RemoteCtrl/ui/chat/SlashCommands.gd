@@ -41,6 +41,8 @@ static func parse(text: String) -> Dictionary:
 			return _log_parse(_arg(pieces), "")
 		"/nz_read":
 			return _cmd(CP.nz_read())
+		"/reboot":  # 远程重启板子：卡死（WiFi/IP 死、BLE 还活着）时的唯一解药
+			return _cmd(CP.reboot(), true)
 		"/light":
 			return _light(pieces)
 		"/stop":
@@ -125,16 +127,21 @@ static func _move_parse(args: String) -> Dictionary:
 				thr = -thr
 			return _cmd(CP.move_dist(thr, cm), true)
 		"arm":
-			# /move arm <x> <h> 位姿；/move arm reset 机械臂+转向回正；/move arm fold 收臂折叠。
+			# /move arm <x> <h> 位姿；/move arm reset 机械臂+转向回正；/move arm fold 收臂折叠；
+			# /move arm low 降到贴地夹取准备位。
 			if mv.size() == 2:
 				match mv[1].strip_edges().to_lower():
 					"reset":
 						return _cmd(CP.reset(), true)
 					"fold":
 						return _cmd(CP.arm("fold"), true)
-				return _hint("用法: /move arm <x> <h> | reset | fold")
+					"low":
+						# 板端标定过的贴地夹取准备位（固定低姿）：先降到位，再靠前后挪车把目标
+						# 送进两指之间。手动验证该准备位/复现 AI 的贴地夹取流程时用。
+						return _cmd(CP.arm("low"), true)
+				return _hint("用法: /move arm <x> <h> | reset | fold | low")
 			if mv.size() < 3 or not mv[1].is_valid_float() or not mv[2].is_valid_float():
-				return _hint("用法: /move arm <x=车头系前方cm> <h=离地高度cm> | reset | fold")
+				return _hint("用法: /move arm <x=车头系前方cm> <h=离地高度cm> | reset | fold | low")
 			# 校准用：不限制数值范围（可为负/超界），不可达由板端可达域检查拦截。
 			return _cmd(CP.arm_pose(mv[1].to_float(), mv[2].to_float()), true)
 		"to":
@@ -218,6 +225,7 @@ static func _arg(pieces: Array) -> String:
 	return (pieces[1] as String).strip_edges() if pieces.size() > 1 else ""
 
 ## /log 统一日志开关：/log <exec|ai|all> [on|off]；缺省 on。旧 /exec_log /ai_log 映射到对应类别。
+## 板端三个开关是**单选**（开某类别即收窄到该类、开 all 即全部），回执会带「当前: …」供确认。
 static func _log_parse(args: String, forced_cat: String) -> Dictionary:
 	var cat := forced_cat
 	var on := true

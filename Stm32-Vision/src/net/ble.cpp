@@ -257,6 +257,15 @@ void ble::set_quiet(bool on) {
   // 升级失败后由 ota 模块解除；成功路径紧接重启，广播随开机恢复。
   if (g_quiet == on) return;
   g_quiet = on;
+  // 光停广播还不够：已连上的手机仍挂着一条 BLE 链路，连接事件在共存仲裁里优先于 WiFi，
+  // 会持续啃掉升级的无线吞吐（纯蓝牙兜底模式的手机正属此列）。一并踢下去——升级结束
+  // 广播恢复即可重连；走 WS 的手机本就断开蓝牙让射频。
+  if (on && g_server) {
+    auto peers = g_server->getPeerDevices(true);
+    for (auto& p : peers) g_server->disconnect(p.first);
+    if (!peers.empty())
+      blog::logf(blog::BLE, "OTA 静默 → 断开 %u 个 BLE 连接", (unsigned)peers.size());
+  }
   apply_advertising();
 }
 

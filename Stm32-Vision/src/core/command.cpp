@@ -6,6 +6,7 @@
 #include "src/net/ping_svc.h"
 #include "src/exec/nezha_direct.h"
 #include "src/core/board_log.h"
+#include "src/net/ota.h"
 
 // 应答格式遵循架构 §5.1：板 → 手机文本 = {type:status/pong, params:{...}, id:<回填>}。
 // move/stop/arm 是高频手动指令，只在 UART 层记录，不回文本（避免刷屏）。
@@ -68,6 +69,21 @@ static void log_manual_throttled(const char* type) {
   }
 }
 
+// OTA 升级期间的硬闸门：只放行不占射频/CPU 的三类——活体探测、状态查询、日志开关
+// （手机 6s 单轮收不到 pong 就判死并重连，断链风暴比老老实实回一句更吵，故必须留活口）。
+// 其余一律回绝并说明原因：升级正在写 flash，任何把图传/AI/电机重新开起来的指令都在抢射频
+// 与 CPU，会把固件传输拖成涓流（实测因此超时、上传失败）。升级开始时的"静默一次"不够——
+// 手机自动重连会把 stream on 之类原样重放回来，闸门必须是持续的。
+static bool ota_gate_blocks(const char* type, JsonObject params) {
+  if (!ota::active()) return false;
+  if (!strcmp(type, "pong") || !strcmp(type, "get_state") || !strcmp(type, "log")) return false;
+  if (!strcmp(type, "ping")) {  // 无目标 = 就地回 pong（活体探测）；带目标要发 ICMP，占射频
+    const char* tgt = params["target"] | "";
+    return tgt[0] != 0;
+  }
+  return true;
+}
+
 void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_ctx) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) {
@@ -76,6 +92,10 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   }
   const char* type = doc["type"] | "";
   JsonObject params = doc["params"].as<JsonObject>();
+  if (ota_gate_blocks(type, params)) {
+    reply_status(doc, reply, reply_ctx, "固件升级中，指令已忽略（数十秒后自动恢复）");
+    return;
+  }
   // 手动接管类型：move/stop/arm 之外，摇杆/直控面板的直接驱动指令（drive/spin/servo/motor/
   // arm_pose/reset）同样会接管小车运动，必须打断板载 AI 闭环，否则 AI 与手动抢控制权。
   bool manual = !strcmp(type, "move") || !strcmp(type, "stop") || !strcmp(type, "arm") ||

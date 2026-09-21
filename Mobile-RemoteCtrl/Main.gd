@@ -507,7 +507,13 @@ func _handle_board_msg(data: Dictionary) -> bool:
 				var lsrc := str((lp as Dictionary).get("src", ""))
 				var ltv: Variant = (lp as Dictionary).get("text")
 				if ltv is String:
-					_chat_panel.chat("日志", "[%s] %s" % [lsrc, ltv as String])
+					# ai 类别用「AI日志」样式单列（ChatPanel 已有该分支，颜色与「日志」区分）：
+					# 全类别混进同一个灰色「日志」区时，AI 行为被 cmd/exec 的噪声淹掉，
+					# 看起来就像"AI 日志不发了"。
+					if lsrc == "ai":
+						_chat_panel.chat("AI日志", ltv as String)
+					else:
+						_chat_panel.chat("日志", "[%s] %s" % [lsrc, ltv as String])
 		"state":
 			# get_state 回传：同步直控按钮（灯/夹爪/AI 运行态）。
 			_apply_state(data)
