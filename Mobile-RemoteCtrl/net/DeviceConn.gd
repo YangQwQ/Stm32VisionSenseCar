@@ -78,8 +78,9 @@ func _ready() -> void:
 	_ws.text_received.connect(text_received.emit)
 	_ws.frame_received.connect(frame_received.emit)
 
-	# UDP 图传帧 → 统一 frame_received 上抛（Main 的 _on_frame 据此刷新画面），
-	# 同时刷新 WS 断线探测计时：推流期间链路上持续有活跃，避免 WS 层误发 ping 探测。
+	# UDP 图传帧 → 统一 frame_received 上抛（Main 的 _on_frame 据此刷新画面）。
+	# 注意：图传帧是纯下行，不能当作"WS 上行通路还活着"的依据（曾据此抑制 WS 心跳，
+	# 结果图传期间上行 ping 永不发、板端 idle 探测必然到期并判死重连）。心跳由 WSCarClient 自持。
 	_udp.frame_received.connect(_on_udp_frame)
 
 	add_child(_ble)
@@ -302,9 +303,8 @@ func _on_ble_disconnected(reason: String) -> void:
 	device_disconnected.emit(reason)
 	_maybe_recover()
 
-## UDP 图传帧：上抛画面 + 记 WS 活跃（见 _ready 注释）。
+## UDP 图传帧：上抛画面。
 func _on_udp_frame(img: Image) -> void:
-	_ws.note_activity()
 	frame_received.emit(img)
 
 func _on_ble_status(data: Dictionary) -> void:

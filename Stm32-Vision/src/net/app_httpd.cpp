@@ -21,12 +21,16 @@
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "lwip/sockets.h"
-#include "src/cam/camera_index.h"
-// lwip 的 inet.h 把 INADDR_NONE/IPADDR_NONE 定义为宏，而 Arduino core 的 IPAddress.h
-// 声明同名全局对象（extern const IPAddress INADDR_NONE），宏会在声明处展开破坏语法；
-// lwip 为预编译库，此处撤销宏不影响其编译期使用。
+// lwip 的 inet.h（经上行 sockets.h:53 引入）把 INADDR_NONE/IPADDR_NONE 定义成宏，而 Arduino
+// core 的 IPAddress.h 声明同名全局对象（extern const IPAddress INADDR_NONE），宏会在声明处
+// 展开破坏语法；lwip 为预编译库，此处撤销宏不影响其编译期使用。
+// ⚠️ 这两行必须紧跟 lwip/sockets.h。IPAddress.h 由 Arduino.h:198 引入，因此任何直接或间接
+//    拉进 Arduino.h 的头都只能排在其后，否则报 "expected ')' before numeric constant"
+//    （踩过的实例：BLEDevice.h → BLEServer.h:45 → Arduino.h → IPAddress.h）。
 #undef INADDR_NONE
 #undef IPADDR_NONE
+#include "esp_heap_caps.h"
+#include "src/cam/camera_index.h"
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -117,17 +121,24 @@ static void tune_socket(int fd)
 #include "src/core/board_log.h"
 
 #define WS_STREAM_FPS 10
+// UDP 图传整帧上限帧率：板子按链路吞吐能推多快就推多快，但接收端解析能力有限，
+// 超出部分只会变成接收端积压（延迟累积、并挤占控制面应答），故在此封顶。
+#define UDP_STREAM_MAX_FPS 18
 #define WS_EDIT_IMG_MAX (128 * 1024)  // 编辑图（二进制上行）上限，与 ai_client 一致
 
 // WS 对端（手机）活体探测：连续此时间无任何上行 → 发一次探测 ping；再此时间无响应判死。
 // 用于感知"静默断链"（如手机重启），恢复 BLE 广播供再次配网/兜底。探测基于应用层
 // {"type":"ping"}，对端协议栈/客户端回 {"type":"pong"}，均走 WS 文本帧，无附加心跳。
-// 手机侧空闲 3s 会主动发 ping（上行），故这里的 idle 阈值只要 >3s 就不会误伤健康客户端；
+// 手机侧无条件按固定周期发 ping（上行，与图传下行无关），故 idle 阈值只要大于该周期
+// 就不会误伤健康客户端。⚠️ 曾误伤：手机侧一度改成"仅下行空闲时才发探测"，图传下行不断
+// → 上行 ping 永不发、idle 必然到期；且单轮无应答即踢，把"手机这一拍忙"当成真断链。
 static const uint32_t WS_IDLE_PING_MS = 6000;     // 连续无上行时长，达到则发探测
-static const uint32_t WS_PING_TIMEOUT_MS = 2500;  // 探测后可容忍的无上行时长（判死界）
+static const uint32_t WS_PING_TIMEOUT_MS = 2500;  // 单轮探测可容忍的无上行时长
+static const uint32_t WS_PING_MAX_TRY = 3;        // 最多探测轮数，连续这么多轮无应答才判死
 static volatile uint32_t s_ws_last_rx_ms = 0;      // 最近收到任一 WS 文本/binary 上行（ms）
 static volatile bool s_ws_ping_pending = false;    // 已发探测、等 pong（由 httpd 任务写入）
 static uint32_t s_ws_ping_at_ms = 0;
+static uint32_t s_ws_ping_try = 0;                 // 本轮已发出的探测次数（判死计数）
 static bool s_ws_had_client = false;               // WS 客户端曾经在位（有→无即判离线）
 
 // httpd 活跃 fd 表上限，须 >= 服务器 max_open_sockets（给足余量，过长时跳过）
@@ -153,7 +164,10 @@ static void udp_peer_set(uint32_t ip_s_addr, uint16_t port) {
         s_udp_fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (s_udp_fd < 0) { log_e("UDP socket fail"); return; }
         int nb = 1;
-        lwip_fcntl(s_udp_fd, F_SETFL, O_NONBLOCK);  // 非阻塞：发送缓冲满即本次 hop 失败、整帧跳过
+        // 非阻塞：拿不到发送机会就立刻返回，由 udp_pump 停手、下个 tick 接着续，不在这里等。
+        // 注：lwip 的 UDP 出站不实现 SO_SNDBUF（无 socket 级发送缓冲，setsockopt 无效），
+        // 背压完全来自 WiFi 驱动 TX 队列 —— sendto 返回 <0 即"队列满"，属正常节流信号。
+        lwip_fcntl(s_udp_fd, F_SETFL, O_NONBLOCK);
     }
     memset(&s_udp_peer, 0, sizeof(s_udp_peer));
     s_udp_peer.sin_family = AF_INET;
@@ -162,40 +176,107 @@ static void udp_peer_set(uint32_t ip_s_addr, uint16_t port) {
     s_udp_peer_valid = true;
 }
 
+// 渐进式图传状态：整帧缓存在 PSRAM，按驱动队列空闲逐分片续传，队列满即停、下 tick 再续，
+// 直到整帧发完才抓下一帧。链路能承受多少就稳发多少(自然降帧)，不再出现"整帧发一半被弃"——
+// 半帧到手机端必然重组不出来，那些字节纯属白占链路，还会把接收端卡在旧画面上。
+// 帧率天然自适应：吞吐 ÷ 单帧字节，无需调参；代价是慢链路下画面变陈旧，故设上限弃帧重来。
+#define OUT_FRAME_MAX_US   600000  // 单帧在途时长上限(us)：超时弃帧，避免画面无限陈旧
+#define OUT_FRAME_STALL_US 400000  // 连续此期间一个分片都发不出去 → 判链路死，弃帧重试
+static uint8_t* s_out_jpeg = nullptr;  // 当前待发帧副本(PSRAM)
+static size_t   s_out_cap = 0;         // s_out_jpeg 已分配容量
+static size_t   s_out_len = 0;         // 本帧字节数
+static uint16_t s_out_count = 0;       // 本帧分片总数
+static uint16_t s_out_seq_next = 0;    // 下一个待发分片序号
+static uint32_t s_out_fid = 0;         // 本帧号
+static bool     s_out_active = false;  // 有帧在续传中
+static uint64_t s_out_start = 0;       // 本帧开始续传时刻(us)
+// 最近一次成功发出分片的时刻(us)。弃帧判据用它而非"tick 计数"：慢链路上帧尾会把驱动
+// 缓冲池占满，新帧开头几拍可能一片都发不出去，按 tick 数判会把这些帧误杀。
+static uint64_t s_out_last_ok = 0;
+static uint64_t s_out_last_grab_us = 0;  // 上帧开抓时刻(us)，用于上限帧率节流
+// 弃帧时的背压归因：sendto 失败原因(errno)与本帧累计失败次数。ENOBUFS=驱动 TX 池满(对端/空口不消化)、
+// EAGAIN=本端 socket 发送缓冲满、其余多为 netif 异常 —— 三者处置完全不同，故随弃帧一并印出，
+// 免得只能从"无进展多少 ms"反推。（空口不消化时池子被在途包占满，重试再多次也发不出去。）
+static int      s_out_errno = 0;
+static uint32_t s_out_fail = 0;
+
 static void udp_peer_clear(void) {
     s_udp_peer_valid = false;
+    s_out_active = false;
 }
 
-// 把一帧 JPEG 切成 UDP 分片推给对端；任一分片发送失败（缓冲满/对端不可达）即整帧放弃
-// （快于降帧率，契合"同步发送+跳帧"控制策略，避免积压抬延迟）。
-static void udp_send_frame_data(const uint8_t *jpeg, size_t len) {
-    if (!s_udp_peer_valid || s_udp_fd < 0) return;
-    size_t total = len;
-    if (total == 0) return;
-    uint32_t fid = s_udp_frame_id++;
-    uint16_t count = (uint16_t)((total + UDP_JPG_CHUNK - 1) / UDP_JPG_CHUNK);
+static void udp_out_free(void) {
+    if (s_out_jpeg) { heap_caps_free(s_out_jpeg); s_out_jpeg = nullptr; s_out_cap = 0; }
+}
+
+// 把一帧 JPEG 拷入 PSRAM 副本作为"当前待发帧"，随后由 udp_pump() 逐分片续传。
+static bool udp_start_frame(const uint8_t *jpeg, size_t len) {
+    if (!len || len > 256 * 1024) return false;
+    if (!s_out_jpeg || len > s_out_cap) {
+        uint8_t *nb = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+        if (!nb) return false;
+        udp_out_free();
+        s_out_jpeg = nb; s_out_cap = len;
+    }
+    memcpy(s_out_jpeg, jpeg, len);
+    s_out_len = len;
+    s_out_count = (uint16_t)((len + UDP_JPG_CHUNK - 1) / UDP_JPG_CHUNK);
+    s_out_fid = s_udp_frame_id++;
+    s_out_seq_next = 0;
+    s_out_start = esp_timer_get_time();
+    s_out_last_ok = s_out_start;   // 从"刚起步"起算无进展时长
+    s_out_errno = 0;
+    s_out_fail = 0;
+    s_out_active = true;
+    return true;
+}
+
+// 单 tick 内续传的时间预算：队列满时让出片刻等驱动排空再续。
+// ⚠️ 撞满不能立刻收手：WiFi 驱动的 TX 缓冲池只有十几个 buffer(~24KB)，每 tick 只填满一次的话，
+// 吞吐会被钉死在「池容量 × 循环频率」≈ 240KB/s，远低于链路实际能力（单帧 >60KB 时只剩几帧）；
+// 预算到期才收手，剩余分片交给下一 tick，既解开自设上限又不霸占本任务。
+#define OUT_PUMP_BUDGET_US 40000
+// 推流时的循环节拍(ms)。这个延时在每轮循环末尾无条件执行，而一帧通常要跨多轮 pump 才发完，
+// 于是它既是「每帧固定多付的延迟」，也是「帧间隔被量化的台阶」（帧率忽高忽低的一部分来源）。
+// 取 5ms：远小于一帧的空中时间，兼顾"队列一空就赶紧续片"与"不空转烧 CPU"。
+// （pump 自身已按 40ms 预算与队列状态自行限流，不靠这个节拍限速。）
+#define OUT_PUMP_TICK_MS   5
+
+// 续传当前帧：按底层队列空闲连续发送分片；整帧发完置 s_out_active=false。
+// lwip 的 UDP 出站没有发送队列，sendto 失败反映的是 WiFi 驱动 TX 队列满 —— 属背压而非错误，
+// 因此绝不据此废弃整帧（旧实现 break 后整帧丢弃，是"帧一直被丢弃"的直接原因）。
+// 帧率自适应为「吞吐 ÷ 单帧字节」，无需调参。
+static void udp_pump(void) {
+    if (!s_out_active || !s_udp_peer_valid || s_udp_fd < 0) return;
     uint8_t hdr[UDP_FRAME_HDR];
     uint8_t buf[UDP_JPG_CHUNK + UDP_FRAME_HDR];
-    const uint8_t *p = jpeg;
-    size_t rem = total;
-    for (uint16_t seq = 0; seq < count; seq++) {
-        size_t chunk = rem > UDP_JPG_CHUNK ? UDP_JPG_CHUNK : rem;
+    uint64_t t0 = esp_timer_get_time();
+    while (s_out_seq_next < s_out_count) {
+        size_t off = (size_t)s_out_seq_next * UDP_JPG_CHUNK;
+        size_t chunk = s_out_len - off;
+        if (chunk > UDP_JPG_CHUNK) chunk = UDP_JPG_CHUNK;
+        uint16_t seq = s_out_seq_next;
         hdr[0] = UDP_MAGIC0; hdr[1] = UDP_MAGIC1;
-        hdr[2] = (uint8_t)(fid >> 24); hdr[3] = (uint8_t)(fid >> 16);
-        hdr[4] = (uint8_t)(fid >> 8);  hdr[5] = (uint8_t)(fid);
-        hdr[6] = (uint8_t)(seq >> 8);  hdr[7] = (uint8_t)(seq);
-        hdr[8] = (uint8_t)(count >> 8); hdr[9] = (uint8_t)(count);
-        hdr[10] = (uint8_t)(total >> 24); hdr[11] = (uint8_t)(total >> 16);
-        hdr[12] = (uint8_t)(total >> 8);  hdr[13] = (uint8_t)(total);
+        hdr[2] = (uint8_t)(s_out_fid >> 24); hdr[3] = (uint8_t)(s_out_fid >> 16);
+        hdr[4] = (uint8_t)(s_out_fid >> 8);  hdr[5] = (uint8_t)(s_out_fid);
+        hdr[6] = (uint8_t)(seq >> 8);        hdr[7] = (uint8_t)(seq);
+        hdr[8] = (uint8_t)(s_out_count >> 8); hdr[9] = (uint8_t)(s_out_count);
+        hdr[10] = (uint8_t)(s_out_len >> 24); hdr[11] = (uint8_t)(s_out_len >> 16);
+        hdr[12] = (uint8_t)(s_out_len >> 8);  hdr[13] = (uint8_t)(s_out_len);
         memcpy(buf, hdr, UDP_FRAME_HDR);
-        memcpy(buf + UDP_FRAME_HDR, p, chunk);
+        memcpy(buf + UDP_FRAME_HDR, s_out_jpeg + off, chunk);
         if (lwip_sendto(s_udp_fd, buf, UDP_FRAME_HDR + chunk, 0,
                         (struct sockaddr *)&s_udp_peer, sizeof(s_udp_peer)) < 0) {
-            break;  // 非阻塞返回错误 = 队列满/对端不可达，废弃本帧
+            s_out_errno = errno;  // 归因用（见 s_out_errno 注释）
+            s_out_fail++;
+            if (esp_timer_get_time() - t0 >= OUT_PUMP_BUDGET_US) break;  // 本 tick 预算用尽，余片下 tick 续
+            vTaskDelay(1);  // 让出约 1ms 给驱动排空，同一分片稍后重试
+            continue;
         }
-        p += chunk;
-        rem -= chunk;
+        s_out_last_ok = esp_timer_get_time();
+        s_out_seq_next++;
     }
+    if (s_out_seq_next >= s_out_count) s_out_active = false;  // 整帧发完
 }
 
 // 全量 WS fd 探测/踢除辅助：httpd 仅暴露活跃 fd 表，无 per-fd 状态管理，故按需遍历。
@@ -424,15 +505,51 @@ static void ws_stream_task(void *arg)
 {
     while (true) {
         bool has_client = false;
+        // WS 客户端在位探测：必须每个 tick 无条件执行。它是 has_client 的唯一来源，
+        // 而 has_client 既喂 ble::set_ws_connected，又决定下面「客户端离线」的判定。
+        // ⚠️ 曾经只在"抓到新帧"分支里探测：续传跨 tick 那几拍 has_client 恒为 false，
+        // 于是刚开播就被判成客户端离线 → 停推流 + 清 UDP 对端（画面卡在首帧、连接显示掉线）。
+        ws_send_jpeg_to_ws_clients(nullptr, &has_client);
+
         if (cmd::streaming()) {
-            camera_fb_t *fb = cam::grab();               // 图传高频：直接抓帧推，不搞中间拷贝(减少一次 malloc+memcpy 拖慢)
-            if (fb) {
-                udp_send_frame_data(fb->buf, fb->len);   // 图传帧走 UDP；WS 仅探测客户端是否在位（不再推帧）
-                ws_send_jpeg_to_ws_clients(nullptr, &has_client);
-                cam::return_frame(fb);
+            if (s_out_active) {
+                udp_pump();              // 上一帧还在续传：按队列空闲续片，不抢新帧
+                // 弃帧只针对"发不动"：链路彻底不消化(持续一段时间一片都没出去)，
+                // 或单帧拖太久(超过在途上限，画面已陈旧到没意义)。慢链路只要有进展就不会被弃——
+                // 帧率自适应到吞吐，而不是把帧丢一半。
+                uint64_t now_us = esp_timer_get_time();
+                bool stall    = (now_us - s_out_last_ok > OUT_FRAME_STALL_US);
+                bool overtime = (now_us - s_out_start   > OUT_FRAME_MAX_US);
+                if (s_out_active && (stall || overtime)) {
+                    // 必须打印命中的是哪条判据：超时弃帧时"无进展"往往远小于其阈值(400ms)，
+                    // 只印它会把排查方向带偏（曾据此误判链路无进展）。
+                    blog::logf(blog::WS, "[udp] 弃帧 fid=%u seq=%u/%u len=%u 判据=%s 无进展=%dms 在途=%dms errno=%d 失败=%u",
+                               s_out_fid, s_out_seq_next, s_out_count, (unsigned)s_out_len,
+                               stall ? "无进展" : "在途超时",
+                               (int)((now_us - s_out_last_ok) / 1000),
+                               (int)((now_us - s_out_start) / 1000),
+                               s_out_errno, (unsigned)s_out_fail);
+                    s_out_active = false;
+                }
+            } else {
+                // 上限帧率：整帧间隔不小于 1/UDP_STREAM_MAX_FPS。不封顶则"链路能推多快推多快"，
+                // 接收端吃不下只会积压成延迟，反过来挤占控制面（pong 应答）的时序。
+                uint64_t grab_us = esp_timer_get_time();
+                if (grab_us - s_out_last_grab_us >= (1000000ULL / UDP_STREAM_MAX_FPS)) {
+                    camera_fb_t *fb = cam::grab();    // 图传高频：直接抓帧，拷入 PSRAM 后立刻还缓冲
+                    if (fb) {
+                        s_out_last_grab_us = grab_us;
+                        size_t flen = fb->len;
+                        bool started = udp_start_frame(fb->buf, flen);
+                        cam::return_frame(fb);
+                        if (started) udp_pump();
+                    }
+                }
             }
         } else {
-            ws_send_jpeg_to_ws_clients(nullptr, &has_client);  // 探测挂着的 WS 客户端
+            // 停推流：中断在途帧并释放 PSRAM 帧副本（下次开播重新分配）
+            s_out_active = false;
+            udp_out_free();
         }
 
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -441,19 +558,32 @@ static void ws_stream_task(void *arg)
             if (!s_ws_ping_pending && (int32_t)(now - s_ws_last_rx_ms) >= (int32_t)WS_IDLE_PING_MS) {
                 s_ws_ping_pending = true;
                 s_ws_ping_at_ms = now;
+                s_ws_ping_try = 1;
                 ws_ping_all();
-                blog::logf(blog::WS, "idle 超时，发探测 ping");
+                blog::logf(blog::WS, "idle 超时，发探测 ping (#%u)", (unsigned)s_ws_ping_try);
             } else if (s_ws_ping_pending &&
                        (int32_t)(now - s_ws_ping_at_ms) >= (int32_t)WS_PING_TIMEOUT_MS) {
-                // 探测后仍无上行 → 判死：踢 fd，下轮 has_client 回落 → 尾部恢复广播
-                s_ws_ping_pending = false;
-                s_ws_last_rx_ms = 0;
-                has_client = false;
-                ws_kick_all();
-                blog::logf(blog::WS, "探测超时，判定断线，恢复广播");
+                // 单轮无应答不立刻判死：手机主线程可能只是这一拍被图传解码占住（同步解码、
+                // 与 WS 读包同线程），重发一轮给它机会；连续多轮都没上行才认定真断。
+                if (s_ws_ping_try >= WS_PING_MAX_TRY) {
+                    // 判死：踢 fd，下轮 has_client 回落 → 尾部恢复广播
+                    s_ws_ping_pending = false;
+                    s_ws_ping_try = 0;
+                    s_ws_last_rx_ms = 0;
+                    has_client = false;
+                    ws_kick_all();
+                    blog::logf(blog::WS, "探测 %u 轮无应答，判定断线，恢复广播", (unsigned)WS_PING_MAX_TRY);
+                } else {
+                    s_ws_ping_at_ms = now;
+                    s_ws_ping_try++;
+                    ws_ping_all();
+                    blog::logf(blog::WS, "探测无应答，重发 ping (#%u/%u)",
+                               (unsigned)s_ws_ping_try, (unsigned)WS_PING_MAX_TRY);
+                }
             }
         } else {
             s_ws_ping_pending = false;  // 无 WS 挂载时复位探测态
+            s_ws_ping_try = 0;
         }
 
         // 客户端从有到无（手机退出且未先发 stream off）：停掉它发起的推流，
@@ -496,8 +626,12 @@ static void ws_stream_task(void *arg)
         // VisionS3 重连（此前 WS 常挂/半开会让广播永久关闭，导致手机不重启连不上）。
         ble::set_transmission(isStreaming || cmd::streaming());
         // 空转降频：无 WS 客户端且非推流时，此任务只需维持 BLE 广播/心跳探测，无需高频轮询。
-        // 降低空转 CPU，让 core1 让给图传/AI；有客户端或推流时维持原 WS_STREAM_FPS 节奏。
-        if (has_client || cmd::streaming())
+        // 降低空转 CPU，让 core1 让给图传/AI。
+        // 推流中用短节拍：udp_pump 已按驱动队列排空速度自行限流，这里只需尽快回到 pump；
+        // 若仍用 100ms 长节拍，吞吐会再被钉在「驱动队列容量 × 10Hz」上（见 udp_pump 注释）。
+        if (cmd::streaming())
+            vTaskDelay(pdMS_TO_TICKS(OUT_PUMP_TICK_MS));
+        else if (has_client)
             vTaskDelay(pdMS_TO_TICKS(1000 / WS_STREAM_FPS));
         else
             vTaskDelay(pdMS_TO_TICKS(500));
