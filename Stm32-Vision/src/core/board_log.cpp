@@ -1,10 +1,12 @@
 #include "src/core/board_log.h"
 #include <ArduinoJson.h>
+#include <stdio.h>     // snprintf（state_text）
 #include <string.h>    // strdup/memcpy
 #include <stdlib.h>    // free
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <esp_heap_caps.h>   // MALLOC_CAP_SPIRAM：转发任务栈放 PSRAM
 
 // 统一板端日志模块实现：
 //   logf() 任意任务可调用——先写串口（带 [类] 前缀），类别开启时把 JSON 排队，
@@ -19,15 +21,51 @@ static bool g_en[CAT_MAX] = {false};
 static bool g_all = false;
 static SendFn g_sender = nullptr;
 static QueueHandle_t g_q = nullptr;
+static StackType_t*  s_fwd_stack = nullptr;  // 转发任务栈：放 PSRAM，抬内部 DMA 块水位
+static StaticTask_t  s_fwd_tcb;
 
 static const char* const k_name[CAT_MAX] = {
     "exec", "ai", "net", "cam", "ws", "cmd", "ble", "sys"};
 
 bool enabled(Cat c) { return c < CAT_MAX && (g_all || g_en[c]); }
 
-void enable(Cat c, bool on) { if (c < CAT_MAX) g_en[c] = on; }
+// 类别位与 all 互斥（单选，见头文件）：这样每条 /log 回执说的"只开/只关这一类"才算数。
+void enable(Cat c, bool on) {
+  if (c >= CAT_MAX) return;
+  if (on) {
+    g_all = false;          // 选具体类别 = 收窄：否则遗留的 all 会把这次"只开 ai"放大成全类别
+    g_en[c] = true;
+    return;
+  }
+  if (g_all) {
+    // all 开着时关单个类别：把 all 降级成"其余类别各自开"，否则这条 off 名不副实（回执说关闭，日志照发）。
+    // 先清 all 再置其余：跨任务读到的中间态只会少发一拍，不会多发出用户已关的类别。
+    g_all = false;
+    for (int i = 0; i < (int)CAT_MAX; i++) g_en[i] = (i != (int)c);
+    return;
+  }
+  g_en[c] = false;
+}
 
-void set_all(bool on) { g_all = on; }
+void set_all(bool on) {
+  g_all = on;
+  // all 期内的类别位无意义（且关 all 后会变成残留），一律清掉：all 开=全类别、all 关=真正全关。
+  for (int i = 0; i < (int)CAT_MAX; i++) g_en[i] = false;
+}
+
+void state_text(char* buf, size_t n) {
+  if (!buf || !n) return;
+  buf[0] = 0;
+  if (g_all) { snprintf(buf, n, "all(全部)"); return; }
+  size_t w = 0;
+  for (int i = 0; i < (int)CAT_MAX; i++) {
+    if (!g_en[i]) continue;
+    int m = snprintf(buf + w, n - w, "%s%s", w ? "," : "", k_name[i]);
+    if (m < 0 || (size_t)m >= n - w) { buf[n - 1] = 0; return; }   // 截断即止（类别名短，实际不会走到）
+    w += (size_t)m;
+  }
+  if (!w) snprintf(buf, n, "-");
+}
 
 void set_forwarder(SendFn fn) { g_sender = fn; }
 
@@ -103,8 +141,13 @@ void init() {
   if (g_q) return;                      // 幂等
   g_q = xQueueCreate(32, sizeof(char*));
   if (!g_q) return;                     // 队列创建失败：保持静默，转发自然关闭
-  // 栈给足 8192 与 ws_stream 一致：发送器内含 ws_send_text + BLE notify，避免栈溢出。
-  xTaskCreatePinnedToCore(forward_task, "blog_fwd", 8192, nullptr, 1, nullptr, 1);
+  // 栈先试 PSRAM（内部堆紧，见 heap_watch）：把 8KB 让回内部 DMA 池；失败退回内部栈保转发可用。
+  if (!s_fwd_stack) s_fwd_stack = (StackType_t*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+  if (s_fwd_stack) {
+    xTaskCreateStaticPinnedToCore(forward_task, "blog_fwd", 8192, nullptr, 1, s_fwd_stack, &s_fwd_tcb, 1);
+  } else {
+    xTaskCreatePinnedToCore(forward_task, "blog_fwd", 8192, nullptr, 1, nullptr, 1);
+  }
 }
 
 }  // namespace blog

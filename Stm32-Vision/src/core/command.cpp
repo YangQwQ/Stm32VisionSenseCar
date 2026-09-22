@@ -6,7 +6,15 @@
 #include "src/net/ping_svc.h"
 #include "src/exec/nezha_direct.h"
 #include "src/core/board_log.h"
+#include "src/core/heap_watch.h"   // 体征行里的 DMA 块最低水位（见 heap_watch.h）
 #include "src/net/ota.h"
+#include <esp_heap_caps.h>   // /mem：内部堆各 region 的空闲/最大连续块（定位碎片来源）
+
+#include <lwip/sockets.h>   // lwip_socket / lwip_close（socket 表自检，见 net_free_sockets）
+// 同 app_httpd.cpp：lwip 的 inet.h（经 sockets.h 引入）把 INADDR_NONE/IPADDR_NONE 定义成宏，
+// 与 Arduino core IPAddress.h 里的同名全局对象声明冲突。此处撤销，防后续 include 再踩。
+#undef INADDR_NONE
+#undef IPADDR_NONE
 
 // 应答格式遵循架构 §5.1：板 → 手机文本 = {type:status/pong, params:{...}, id:<回填>}。
 // move/stop/arm 是高频手动指令，只在 UART 层记录，不回文本（避免刷屏）。
@@ -28,6 +36,40 @@ static uint8_t make_state_bits() {
   if (exec::grip_closing())    b |= 1u << 3;
   if (ai::busy())              b |= 1u << 4;
   return b;
+}
+
+// 本次开机是怎么来的（log 回执随体征一起回报，见下）：直接区分"板子自己复位了"
+// （崩溃/看门狗/掉电）与"人手动断电"（上电）。板上跑挂后网络同时没了，重启后这行字
+// 就是唯一能说明上一次运行怎么结束的东西 —— 不需要串口。
+static const char* reset_text() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "上电";
+    case ESP_RST_EXT:       return "外部";
+    case ESP_RST_SW:        return "软件";
+    case ESP_RST_PANIC:     return "崩溃";
+    case ESP_RST_INT_WDT:   return "中断狗";
+    case ESP_RST_TASK_WDT:  return "任务狗";
+    case ESP_RST_WDT:       return "看门狗";
+    case ESP_RST_DEEPSLEEP: return "深睡";
+    case ESP_RST_BROWNOUT:  return "掉电";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "未知";
+  }
+}
+
+// 数一数 lwIP 的 socket 表还剩几个空位（连开裸 socket 直到失败，再全部关掉）。开的是未连接的
+// socket，不占 TCP PCB、不发一个包，代价就是十几个 netconn 的瞬时分配。
+// 为什么值得每 30s 报一次：卡死时 WiFi 仍关联、BLE 仍活，却所有 TCP 都建不起来——两种可能
+// （a）连接泄漏把 16 个槽位占满（脚本/手机反复重连、httpd 的会话没回收），于是出站 connect 直接
+// 失败（正是 ai_http 打的 code=-1）、httpd 无法 accept（手机侧表现为"握手超时"）；（b）WiFi TX
+// 整体哑了，跟 socket 表无关。这一行 + 手敲 /ping <网关> 就能把两者分开：ICMP 走 raw pcb、不经
+// socket 表——`套接字余=0` 而 ping 通 ⇒ (a)；两者皆死 ⇒ (b)。平时它则是一条泄漏曲线。
+static int net_free_sockets() {
+  int fd[32];
+  int n = 0;
+  while (n < 32 && (fd[n] = lwip_socket(AF_INET, SOCK_STREAM, 0)) >= 0) n++;
+  for (int i = 0; i < n; i++) lwip_close(fd[i]);
+  return n;
 }
 
 // 组一段带原 id 的应答文本并发出（reply 可空）。
@@ -135,14 +177,42 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
 
   if (!strcmp(type, "ping")) {
     // 无 target = 测小车连通性（回 pong）；带 target（IP/域名）= 板子去 ping 并回报延迟。
+    // ⚠️ 排查卡死时用 IP 字面量（域名要先做 DNS，tcpip 线程卡住时连解析都不返回）。
     const char* target = params["target"] | "";
     if (target[0]) {
-      ping::start(target, 5, reply, reply_ctx);
+      // 起不来必须出声：ping 会话要一段连续 16KB 的栈（已挪 PSRAM）加若干分配，内部堆紧时仍可能
+      // 失败。以前这里把返回值丢掉 —— 用户只看到"正在 ping…"然后永远没有下文，跟"网络不通"完全
+      // 分不开，等于把一次内存故障误读成链路故障。带上体征就能当场分清（详细原因另由 ping_svc 的
+      // log_fail 走日志转发报出）。
+      if (!ping::start(target, 5, reply, reply_ctx)) {
+        char buf[224];
+        snprintf(buf, sizeof(buf),
+                 "ping %s: 未发起（上一个 ping 未结束 或 内部堆不足）｜堆=%uk 最低=%uk 块=%uk psram=%uk",
+                 target, (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024),
+                 (unsigned)(ESP.getMaxAllocHeap() / 1024), (unsigned)(ESP.getFreePsram() / 1024));
+        reply_status(doc, reply, reply_ctx, buf);
+        return;
+      }
       String tip = "正在 ping " + String(target) + "…";
       reply_status(doc, reply, reply_ctx, tip.c_str());
     } else {
       reply_pong(doc, reply, reply_ctx);
     }
+    return;
+  }
+
+  if (!strcmp(type, "reboot")) {
+    // 远程重启：链路卡死（WiFi/IP 死而 BLE 还活着）时唯一能远程按下的那一下，值得留着。
+    // 升级期间被上面的 ota_gate_blocks 拦下——写 flash 时重启等于砖，那不是后门是坑。
+    // 报两遍是为覆盖两类观察者：回执只到发起方那一个 fd，而日志转发是广播给所有 WS 客户端
+    // + BLE 的，于是"别人按的重启"旁边的人也能看见（不必经手机端中转）。
+    reply_status(doc, reply, reply_ctx, "正在重启…");
+    blog::logf(blog::SYS, "收到 reboot：重启中（卡死时跑的 %s）", ota::fw_stamp());
+    // 回执是同步发出的，但日志转发得等 blog 的转发任务醒来再经 WS/BLE 送出去：300ms 只够前者
+    // （OTA 那条路就是这么写的），这里留一倍余量把最后一行送完再断电。多这几百毫秒不影响
+    // "能远程重启"这件事本身——重启后日志通道本来也要重连。
+    delay(600);
+    ESP.restart();
     return;
   }
 
@@ -161,15 +231,76 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
   if (!strcmp(type, "log")) {
     // 统一日志转发开关：/log <exec|ai|all> on|off。
     // 默认全关；exec = 直驱执行日志+周期状态推送，ai = AI 调试日志，
-    // all = 板端串口所有输出全部转发手机（经统一日志队列）。
+    // all = 板端全部类别日志转发手机（经统一日志队列）。三者单选（见 board_log.h）。
     const char* cat = params["cat"] | "";
     bool on = params["on"] | false;
-    const char* cfg = nullptr;
-    if (!strcmp(cat, "all")) { blog::set_all(on); cfg = on ? "全部日志转发已开启" : "全部日志转发已关闭"; }
-    else if (!strcmp(cat, "exec")) { blog::enable(blog::EXEC, on); cfg = on ? "执行日志转发已开启" : "执行日志转发已关闭"; }
-    else if (!strcmp(cat, "ai")) { blog::enable(blog::AI, on); cfg = on ? "AI日志转发已开启" : "AI日志转发已关闭"; }
-    else { cfg = "log: cat 需 exec|ai|all"; }
-    reply_status(doc, reply, reply_ctx, cfg);
+    const char* what = nullptr;
+    // 施加前后各取一次"当前生效类别"，两次相同即本次是**幂等重申**：PC 脚本每 30s 会重申一次
+    // /log on（防手机改掉那个全局单选），若照旧回一整句，日志里就每 30s 多一条一模一样的
+    // "已开启（当前…）+固件"，看着像板子在反复重开日志——其实什么都没变。
+    char st_before[48], st_after[48];
+    blog::state_text(st_before, sizeof(st_before));
+    if (!strcmp(cat, "all")) { blog::set_all(on); what = "全部"; }
+    else if (!strcmp(cat, "exec")) { blog::enable(blog::EXEC, on); what = "执行"; }
+    else if (!strcmp(cat, "ai")) { blog::enable(blog::AI, on); what = "AI"; }
+    else {
+      reply_status(doc, reply, reply_ctx, "log: cat 需 exec|ai|all");
+      return;
+    }
+    blog::state_text(st_after, sizeof(st_after));
+    // 回执附带当前生效类别：只回报本次开关时，残留的 all（或 all 期内的降级）用户无从察觉，
+    // 会出现"我只开了 ai 却全类别都在发"和"这条 off 到底生效没有"两类困惑。
+    // 再附上当前固件标记：开日志是手机/PC 脚本每次接入的必经一步，顺路把"板上跑的是哪份固件"
+    // 送到两边（OTA 后正是靠这行确认新固件到底生效没有），不必另开串口或网页。
+    // 再顺路回报运行体征（内部堆三口径 + 复位原因 + 运行秒数）：开日志是手机/PC 每次接入的必经
+    // 一步，于是这行在日志里天然形成一条体征曲线。板上跑挂时 WiFi/WS 一起没了、串口又拆不下来，
+    // 这行就是事后唯一的现场 —— 而 BLE 有自己预分配的控制器缓冲，卡死时照常可连（实测指令照收），
+    // 卡死后用手机走 BLE 敲一次 /log on 即可当场取回：
+    //   `最低`/`块` 逼近 0 ⇒ 内部堆耗尽（lwIP / WiFi-TX 分不到缓冲 ⇒ ARP 与 TCP 全哑，而 WiFi 关联
+    //   和 BLE 都还活着）——症状正是"连着热点却谁都不通、蓝牙却还能用"；
+    //   `运行` 秒数在某次重连后归零 ⇒ 这中间其实复位过，再看`复位`是哪一种（崩溃/看门狗/掉电）；
+    //   `套接字余` 逼近 0 ⇒ lwIP 的 16 个 socket 槽位被泄漏的连接占满（判读见 net_free_sockets）。
+    // 卡死时除了这行，再手敲一条 `/ping <网关>`：ICMP 不经 socket 表，两者一对照即可定位层级。
+    // 再加一个 `DMA块最低`：这是**唯一**能预报"WiFi 收不进包"的指标。WiFi 的 RX 缓冲必须落
+    // DMA 可达的内部 RAM，闸门是那块最大连续块——它逼近 0 时收包必失败（ARP 都不回、ping 全灭），
+    // 而此时 `堆=`（总空闲）可能看着还挺富余，`最低=` 也只是个含 PSRAM 无关的总量口径。
+    // 实测：健康基线 `DMA块最低≈7k`；AI 任务一轮能把内部堆压到 `最低=1k`，链路随即全哑且不自愈。
+    // 该值由 heap_watch 的 20ms 哨兵记录（AI 每轮任务起点清零，故它=最近一轮任务的最深点）。
+    // ⚠️ ESP.getFreeHeap / getMinFreeHeap / getMaxAllocHeap 三者同为 MALLOC_CAP_INTERNAL 口径
+    // （cores/esp32/Esp.cpp），与 ai_http 打的 `heap=` 可直接对照；别改成含 PSRAM 的口径。
+    // `DMA块最低` 的 0 有两义：**真触底**与**哨兵没起来**（heap_watch 的栈没分配上）。
+    // 两者含义相反、严重性也相反，印成同一个 `0k` 就等着被误读；未起来时印 `--`。
+    // DMA 块给**两个**数：`现`=当前最大连续块，`低`=谷底（自 AI 任务起点清零）。
+    // 缺一个就判不了 —— 两者的结论相反：`现` 就很小 ⇒ 这个池**结构性**贴底（与任务无关，是内存
+    // 布局问题，告警等于常亮噪声）；`现` 正常而 `低`=0 ⇒ 是被某一轮任务压下去的（那才是有信息量的
+    // 那次事件）。此前只印谷底，于是"啥也没干也一直弹"这件事在网侧完全看不见（见 heap_watch 注释）。
+    // 与上一行的 `块=`（MALLOC_CAP_INTERNAL 口径）对照着看更关键：两者口径不同，`块=11k` 而
+    // `DMA块现` 只有几 k 是常见组合，说明吃紧的是 DMA 可达的那个子集，不是内部 RAM 总量。
+    char dma_txt[32];
+    if (hwatch::ready())
+      snprintf(dma_txt, sizeof(dma_txt), "%uk/低%uk", (unsigned)(hwatch::cur_largest_dma() / 1024),
+               (unsigned)(hwatch::min_largest_dma() / 1024));
+    else
+      snprintf(dma_txt, sizeof(dma_txt), "--");
+    char msg[320];  // 命名避开 cfg（本文件另有 cfg:: 命名空间）；加 DMA块后需比原 224 宽
+    if (!strcmp(st_before, st_after)) {
+      // 幂等重申：只回一行体征当心跳。类别与固件都没变，重复报它们没有信息量；而体征必须照给
+      // ——板子跑挂、WiFi 也断了时，这行是唯一还能出来的现场（走 BLE，见上）。
+      snprintf(msg, sizeof(msg),
+               "日志转发未变（当前: %s）｜复位=%s 堆=%uk 最低=%uk 块=%uk DMA块(现/低)=%s 套接字余=%d 运行=%us",
+               st_after, reset_text(), (unsigned)(ESP.getFreeHeap() / 1024),
+               (unsigned)(ESP.getMinFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024),
+               dma_txt, net_free_sockets(), (unsigned)(millis() / 1000));
+    } else {
+      snprintf(msg, sizeof(msg),
+               "%s日志转发已%s（当前: %s）｜固件 %s｜复位=%s 堆=%uk 最低=%uk 块=%uk DMA块(现/低)=%s psram=%uk 套接字余=%d 运行=%us",
+               what, on ? "开启" : "关闭", st_after, ota::fw_stamp(), reset_text(),
+               (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024),
+               (unsigned)(ESP.getMaxAllocHeap() / 1024),
+               dma_txt, (unsigned)(ESP.getFreePsram() / 1024),
+               net_free_sockets(), (unsigned)(millis() / 1000));
+    }
+    reply_status(doc, reply, reply_ctx, msg);
     return;
   }
 
@@ -196,6 +327,32 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     if (has_id(doc)) out["id"] = doc["id"].as<long>();
     String s;
     serializeJson(out, s);
+    if (reply) { reply(reply_ctx, s.c_str()); }
+    return;
+  }
+
+  if (!strcmp(type, "mem")) {
+    // 内部堆 region 全览（诊断，只读）：回各池空闲/最大连续块/谷底，判 DMA 池是被固定大块占住
+    // 还是运行时 churn 碎出的（前者 largest 恒小、后者谷底为 0）。串口再留一份 region 映射明细。
+    heap_caps_dump_all();
+    auto fill = [](JsonObject o, uint32_t caps) {
+      multi_heap_info_t hi;
+      heap_caps_get_info(&hi, caps);
+      o["free"] = (uint32_t)hi.total_free_bytes;
+      o["largest"] = (uint32_t)hi.largest_free_block;
+      o["min"] = (uint32_t)hi.minimum_free_bytes;
+      o["blocks"] = (uint32_t)hi.free_blocks;
+    };
+    JsonDocument out;
+    out["type"] = "mem";
+    JsonObject params = out["params"].to<JsonObject>();
+    { JsonObject o = params["internal"].to<JsonObject>();        fill(o, MALLOC_CAP_INTERNAL); }
+    { JsonObject o = params["dma_internal"].to<JsonObject>();    fill(o, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA); }
+    { JsonObject o = params["psram"].to<JsonObject>();           fill(o, MALLOC_CAP_SPIRAM); }
+    { JsonObject o = params["dma_external"].to<JsonObject>();    fill(o, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA); }
+    String s;
+    serializeJson(out, s);
+    blog::logf(blog::NET, "mem: %s", s.c_str());
     if (reply) { reply(reply_ctx, s.c_str()); }
     return;
   }

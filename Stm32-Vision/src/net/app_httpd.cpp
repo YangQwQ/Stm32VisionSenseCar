@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "esp_http_server.h"
 #include "esp_timer.h"
+#include <freertos/semphr.h>   // WS 帧发送串行化用的互斥量
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "fb_gfx.h"
@@ -30,8 +31,13 @@
 #undef INADDR_NONE
 #undef IPADDR_NONE
 #include "esp_heap_caps.h"
+#include "esp_core_dump.h"   // /coredump：panic 现场（原因串 + 任务 + 回溯 PC）
+#include "src/cam/camera.h"       // cam::grab / cam::jpeg_len（后者见 camera.cpp 的说明）
 #include "src/cam/camera_index.h"
 #include "src/net/ota.h"   // HTTP OTA 入口（/update）注册
+#include "src/ai/ai_dump.h"   // AI 抓帧留档清单/取图（/ai_dump, /ai_frame 调试用）
+#include "src/ai/magnify.h"   // /zoomshot：手动对当帧目标区域裁出放大图（等价于 AI 的 zoom）
+#include "src/ai/ai_client.h"   // ai::busy()：AI 任务进行中时图传 FPS 降半，让 CPU 与内部 DMA 池给 AI 让路
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -120,6 +126,7 @@ static void tune_socket(int fd)
 #include "src/ai/ai_client.h"
 #include "src/exec/direct_exec.h"
 #include "src/core/board_log.h"
+#include "src/net/wifi_net.h"   // net::kWanMtu（UDP 分片大小由它派生）
 
 #define WS_STREAM_FPS 10
 // UDP 图传整帧上限帧率：板子按链路吞吐能推多快就推多快，但接收端解析能力有限，
@@ -150,8 +157,13 @@ static bool s_ws_had_client = false;               // WS 客户端曾经在位�
 // 延迟时高时低。指令/状态仍走 WS（控制面，低带宽可靠通道）。
 // 握手：手机绑定本地 UDP 端口并上报本机 IP，随 WS 的 stream on 指令发(udp_port, src_ip)；
 // 板据此建立 UDP 会话（同网段，无 NAT）。整帧 JPEG 切成 ≤UDP_JPG_CHUNK 的分片推送。
-#define UDP_JPG_CHUNK 1400     // 每数据报 JPEG 分片负载（留 MTU 余量，避免 IP 分片）
 #define UDP_FRAME_HDR 14       // 分片头固定字节：magic(2) frame_id(4) seq(2) count(2) total(4) 全大端
+// 每数据报 JPEG 分片负载：网卡 MTU 扣 IP(20)+UDP(8)+分片头，保证**不会被 IP 分片**。
+// 必须由 net::kWanMtu 派生，不能写死：板子为修 AI 通路把网卡 MTU 压到了公网路径 MTU 之下
+// （见 wifi_net.h），此处若仍是 1500 时代的数值，每个数据报都会被切成两片 —— 图传的
+// 报文数、驱动 TX 队列压力与"丢一片=废一帧"的概率都会变差。接收端按包头 seq/count 重组，
+// 与分片大小无关，故改小完全兼容。
+#define UDP_JPG_CHUNK (net::kWanMtu - 28 - UDP_FRAME_HDR)
 #define UDP_MAGIC0 0x56
 #define UDP_MAGIC1 0x44
 static int s_udp_fd = -1;                    // UDP 会话 fd（懒创建）
@@ -282,6 +294,7 @@ static void udp_pump(void) {
 
 // 全量 WS fd 探测/踢除辅助：httpd 仅暴露活跃 fd 表，无 per-fd 状态管理，故按需遍历。
 static esp_err_t ws_send_text(int fd, const char *text);  // 前向声明（定义在下方）
+static void ws_send_text_to_ws_clients(const char *text); // 前向声明（定义在下方）
 static void ws_ping_all(void) {
     int fds[WS_MAX_CLIENTS]; size_t n = WS_MAX_CLIENTS;
     if (httpd_get_client_list(stream_httpd, &n, fds) != ESP_OK) return;
@@ -323,6 +336,16 @@ static void ws_sanitize_utf8(char* s) {
     *w = 0;
 }
 
+// WS 帧发送串行化（与下面 ws_send_text / ws_send_jpeg 共用）：帧由多个任务并发发出，而
+// httpd_ws_send_frame_async 是"低层直接写 socket"（帧头与载荷分次写，无内部排队、
+// 无线程安全保证）。并发调用会把两个帧的字节交错，接收端只能按协议错误断链——手机端
+// Godot 报的就是 1007 的 RFC 描述文本 "Invalid frame payload data"（看着像 UTF-8 问题，
+// 实为帧被写坏），表现为"日志一切正常却莫名掉线"，且必在日志/状态推送最密时发作。
+static SemaphoreHandle_t s_ws_tx_mtx = nullptr;
+static StackType_t*  s_ws_stack = nullptr;  // ws_stream 任务栈：放 PSRAM，抬内部 DMA 块水位
+static StaticTask_t  s_ws_tcb;
+#define WS_TX_LOCK_TIMEOUT_MS 500   // 等锁上限：对端卡住时宁可丢这一帧，绝不拖住调用者
+
 static esp_err_t ws_send_text(int fd, const char *text)
 {
     // 统一出口消毒，堆拷贝发(1:1)，不动入参、不占发送任务大栈
@@ -335,7 +358,12 @@ static esp_err_t ws_send_text(int fd, const char *text)
     frame.type = HTTPD_WS_TYPE_TEXT;
     frame.payload = (uint8_t *)buf;
     frame.len = strlen(buf);
+    if (s_ws_tx_mtx && xSemaphoreTake(s_ws_tx_mtx, pdMS_TO_TICKS(WS_TX_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        free(buf);
+        return ESP_ERR_TIMEOUT;
+    }
     esp_err_t r = httpd_ws_send_frame_async(stream_httpd, fd, &frame);
+    if (s_ws_tx_mtx) xSemaphoreGive(s_ws_tx_mtx);
     free(buf);
     return r;
 }
@@ -345,15 +373,27 @@ static esp_err_t ws_send_jpeg(int fd, camera_fb_t *fb)
     httpd_ws_frame_t frame = {0};
     frame.type = HTTPD_WS_TYPE_BINARY;
     frame.payload = fb->buf;
-    frame.len = fb->len;
-    return httpd_ws_send_frame_async(stream_httpd, fd, &frame);
+    frame.len = cam::jpeg_len(fb);   // 勿用 fb->len：可能被驱动报大（裹进后续帧）
+    if (s_ws_tx_mtx && xSemaphoreTake(s_ws_tx_mtx, pdMS_TO_TICKS(WS_TX_LOCK_TIMEOUT_MS)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t r = httpd_ws_send_frame_async(stream_httpd, fd, &frame);
+    if (s_ws_tx_mtx) xSemaphoreGive(s_ws_tx_mtx);
+    return r;
 }
 
-// cmd::Reply 适配：把应答文本发回给指定 fd
+// cmd::Reply 适配：把应答文本发回给指定 fd。
+// fd 已不是活跃 WS 客户端时回退广播：AI 闭环这类**长任务**在任务起点就把 fd 深拷贝进任务
+// （见 ai_client 的 enqueue_result），手机 WS 断线重连换了 fd 之后，原 fd 不再是 WS 客户端，
+// 定向发送会被 httpd 丢弃（ws_send_text 只回错误码，无人重试），手机端表现为"任务还在跑、
+// 但 AI 的答复突然不再出现"（AI 调试日志走广播通道，故照常到达，容易误判成日志模块的问题）。
+// 本链路假定单手机客户端，失效即广播与定向等价，消息不会再丢。
 static void ws_cmd_reply(void *ctx, const char *text)
 {
     int fd = *(int *)ctx;
-    ws_send_text(fd, text);
+    if (httpd_ws_get_fd_info(stream_httpd, fd) == HTTPD_WS_CLIENT_WEBSOCKET)
+        ws_send_text(fd, text);
+    else
+        ws_send_text_to_ws_clients(text);
 }
 
 // 文本帧 = 指令 JSON；stream 就地建/拆 UDP 会话，其余统一移交 command 模块
@@ -540,14 +580,17 @@ static void ws_stream_task(void *arg)
                     s_out_active = false;
                 }
             } else {
-                // 上限帧率：整帧间隔不小于 1/UDP_STREAM_MAX_FPS。不封顶则"链路能推多快推多快"，
-                // 接收端吃不下只会积压成延迟，反过来挤占控制面（pong 应答）的时序。
                 uint64_t grab_us = esp_timer_get_time();
-                if (grab_us - s_out_last_grab_us >= (1000000ULL / UDP_STREAM_MAX_FPS)) {
+                // 上限帧率：整帧间隔不小于 1/max_fps。不封顶则"链路能推多快推多快"，接收端吃不下只会
+                // 积压成延迟，反过来挤占控制面（pong 应答）的时序。
+                // AI 任务进行中降到一半 FPS：高帧推流压 CPU + 碎内部 DMA 池（TX pbuf 与 RX 同池互抢），
+                // 实测开着图传会让 DMA 块告警连发、并发 AI 被拖慢；降帧把两条都让给 AI。
+                int max_fps = ai::busy() ? (UDP_STREAM_MAX_FPS / 2) : UDP_STREAM_MAX_FPS;
+                if (grab_us - s_out_last_grab_us >= (1000000ULL / max_fps)) {
                     camera_fb_t *fb = cam::grab();    // 图传高频：直接抓帧，拷入 PSRAM 后立刻还缓冲
                     if (fb) {
                         s_out_last_grab_us = grab_us;
-                        size_t flen = fb->len;
+                        size_t flen = cam::jpeg_len(fb);   // 勿用 fb->len：虚高会把后续帧当本帧推出去
                         bool started = udp_start_frame(fb->buf, flen);
                         cam::return_frame(fb);
                         if (started) udp_pump();
@@ -616,7 +659,7 @@ static void ws_stream_task(void *arg)
         if (!ota::active() && blog::enabled(blog::EXEC) &&
             (int32_t)(now - s_last_status_ms) >= (int32_t)400) {
             s_last_status_ms = now;
-            char st[192];  // 状态含抓手前端 XZ 与 PWM + 不可达诊断，需足量避免截断
+            char st[256];  // 状态含抓手前端 XZ 与 PWM + 撞边界/位姿没到位诊断，需足量避免截断
             if (exec::read_state(st, sizeof(st)) && strcmp(st, s_last_state)) {
                 strncpy(s_last_state, st, sizeof(s_last_state) - 1);
                 s_last_state[sizeof(s_last_state) - 1] = 0;
@@ -900,6 +943,49 @@ static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_
     return len;
 }
 
+// /zoomshot: 对当帧按目标区域裁出放大 JPEG —— 手动"凑近看"两指与目标，等价于 AI 的 zoom。
+// 参数(GET query)：px,py=框中心(归一化 0~1，默认 0.5)；scale=倍率(框=全幅 1/scale，默认 2，上限 8)；
+// out_w/out_h=输出尺寸(像素，默认 320×240)；quality=JPEG 质量(默认 80)。
+// 复用 magnify::crop_to_jpg：它内部自持 cam 解码/编码共享锁，与 AI worker/mvfy 的软解并发互斥，安全。
+static esp_err_t zoomshot_handler(httpd_req_t *req)
+{
+    camera_fb_t *fb = cam::grab();
+    if (!fb || fb->format != PIXFORMAT_JPEG) {
+        if (fb) esp_camera_fb_return(fb);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    const size_t w = fb->width, h = fb->height;
+    float px = 0.5f, py = 0.5f, sc = 2.0f;
+    int outw = 320, outh = 240, quality = 80;
+    char qs[160];
+    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK) {
+        char p[16];
+        if (httpd_query_key_value(qs, "px", p, sizeof(p)) == ESP_OK) px = constrain(atof(p), 0.0f, 1.0f);
+        if (httpd_query_key_value(qs, "py", p, sizeof(p)) == ESP_OK) py = constrain(atof(p), 0.0f, 1.0f);
+        if (httpd_query_key_value(qs, "scale", p, sizeof(p)) == ESP_OK) sc = constrain(atof(p), 1.0f, 8.0f);
+        if (httpd_query_key_value(qs, "out_w", p, sizeof(p)) == ESP_OK) { outw = atoi(p); if (outw <= 0 || outw > 4096) outw = 320; }
+        if (httpd_query_key_value(qs, "out_h", p, sizeof(p)) == ESP_OK) { outh = atoi(p); if (outh <= 0 || outh > 4096) outh = 240; }
+        if (httpd_query_key_value(qs, "quality", p, sizeof(p)) == ESP_OK) { quality = atoi(p); if (quality < 1 || quality > 100) quality = 80; }
+    }
+    float half = 0.5f / sc;   // 框 = 全幅的 1/scale（宽高各自）
+    float x0 = constrain(px - half, 0.0f, 1.0f), x1 = constrain(px + half, 0.0f, 1.0f);
+    float y0 = constrain(py - half, 0.0f, 1.0f), y1 = constrain(py + half, 0.0f, 1.0f);
+    size_t cap = (size_t)outw * outh + 512;
+    uint8_t *out = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (!out) { esp_camera_fb_return(fb); httpd_resp_send_500(req); return ESP_FAIL; }
+    size_t olen = 0;
+    bool ok = magnify::crop_to_jpg(fb->buf, cam::jpeg_len(fb), (int)w, (int)h,
+                                   x0, y0, x1, y1, out, cap, &olen, outw, outh, quality);
+    esp_camera_fb_return(fb);
+    if (!ok || olen == 0) { heap_caps_free(out); httpd_resp_send_500(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    esp_err_t res = httpd_resp_send(req, (const char *)out, (int)olen);
+    heap_caps_free(out);
+    return res;
+}
+
 static esp_err_t capture_handler(httpd_req_t *req)
 {
     camera_fb_t *fb = NULL;
@@ -932,6 +1018,13 @@ static esp_err_t capture_handler(httpd_req_t *req)
     snprintf(ts, 32, "%ld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
     httpd_resp_set_hdr(req, "X-Timestamp", (const char *)ts);
 
+    // X-Raw-Len = 驱动自己报的 fb->len（**未**经 jpeg_len 校正）。正文只发校正后的真实长度，
+    // 于是"驱动是否还在把多帧拼进一格"从正文里就看不出来了 —— 拿它跟本次实际发出的字节数一比
+    // 即可判定（不等即驱动侧拼帧，差值就是被截掉的尾巴）。诊断用，别当数据用。
+    char raw[24];
+    snprintf(raw, sizeof(raw), "%u", (unsigned)fb->len);
+    httpd_resp_set_hdr(req, "X-Raw-Len", (const char *)raw);
+
 #if CONFIG_ESP_FACE_DETECT_ENABLED
     size_t out_len, out_width, out_height;
     uint8_t *out_buf;
@@ -948,10 +1041,12 @@ static esp_err_t capture_handler(httpd_req_t *req)
 #endif
         if (fb->format == PIXFORMAT_JPEG)
         {
+            // 勿用 fb->len：驱动可能报大（缓冲里裹了后续帧），发出去就是"一张图带尾巴"
+            size_t jlen = cam::jpeg_len(fb);
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            fb_len = fb->len;
+            fb_len = jlen;
 #endif
-            res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+            res = httpd_resp_send(req, (const char *)fb->buf, jlen);
         }
         else
         {
@@ -1170,7 +1265,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
                 }
                 else
                 {
-                    _jpg_buf_len = fb->len;
+                    _jpg_buf_len = cam::jpeg_len(fb);   // 勿用 fb->len：虚高会让一个 part 里塞进多帧
                     _jpg_buf = fb->buf;
                 }
 #if CONFIG_ESP_FACE_DETECT_ENABLED
@@ -1376,6 +1471,178 @@ static esp_err_t parse_get(httpd_req_t *req, char **obuf)
     }
     httpd_resp_send_404(req);
     return ESP_FAIL;
+}
+
+// ── AI 抓帧留档（调试用，见 ai_dump.h）──────────────────────────────────────
+// /ai_dump         → JSON 清单：这一轮 AI 收到的是哪张图、它据此做了什么（含被闸门拒的原因）
+// /ai_dump?after=N → 长轮询：挂住不返回，等出现序号 >N 的定案帧就立刻回清单（最多等 AI_DUMP_FOLLOW_MS）
+// /ai_frame?seq=N  → 该轮的原始 JPEG（就是发往云端的那份字节）
+// 只在 `/log ai on` 期间有内容：留档由 AI worker 按 blog 开关驱动，关着时不占一个字节。
+//
+// 为什么要长轮询：抓取端若靠定时轮询，快了空转、慢了漏帧（环形只 6 槽，一轮 AI 约 2s，十几秒的
+// 卡顿就挤掉了）。挂住请求=把"什么时候有"交给板端说，抓取端不必猜周期，也不会有轮询间隙。
+// 代价只在这条 HTTP 会话自己的任务里：不碰 WS/UDP，AI 线程也不为调试工具多等一毫秒。
+#define AI_DUMP_FOLLOW_MS 15000      // 单次挂起上限（抓取端的读超时必须大于它）
+#define AI_DUMP_FOLLOW_TICK_MS 200   // 检查间隔 ≈ "定案 → 抓取端看见" 的延迟
+
+static esp_err_t ai_dump_handler(httpd_req_t *req)
+{
+    // after=N → 长轮询模式。缺参则立即回（抓取端取历史/老用法）。
+    uint32_t after = 0;
+    bool follow = false;
+    char q[64];
+    size_t ql = httpd_req_get_url_query_len(req);
+    if (ql > 0 && ql + 1 <= sizeof(q) && httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char v[16];
+        if (httpd_query_key_value(q, "after", v, sizeof(v)) == ESP_OK) {
+            after = (uint32_t)strtoul(v, NULL, 10);
+            follow = true;
+        }
+    }
+    if (follow) {
+        uint32_t t0 = (uint32_t)millis();
+        while ((uint32_t)(millis() - t0) < AI_DUMP_FOLLOW_MS) {
+            if (ai::dump_newest_seq() > after) break;               // 有新定案帧：立刻回
+            // 留档关着 / 正在升级固件：不会再产出新帧，挂着只是白占一条会话（也给抓取端一个即时答复，
+            // 好让它把"板端没在留档"这句话说出口，而不是干等 15 秒）。
+            if (!blog::enabled(blog::AI) || ota::active()) break;
+            vTaskDelay(pdMS_TO_TICKS(AI_DUMP_FOLLOW_TICK_MS));
+        }
+    }
+    // 每条 ~180 字节 × 槽数；堆上开（httpd 栈 8192，清单虽小也别占它），
+    // 且不能 static —— httpd 多请求并发，静态缓冲会被另一个请求盖掉。
+    // 放在等待之后申请：挂起期间不占堆（AI 链路的内部堆很紧张，见 ai_client 顶部注释）。
+    const size_t cap = 2048;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    ai::dump_manifest(buf, cap);   // 失败也回合法空清单，前端不必区分错误形状
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t r = httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    free(buf);
+    return r;
+}
+
+static esp_err_t ai_frame_handler(httpd_req_t *req)
+{
+    uint32_t seq = 0;
+    char q[64];
+    if (httpd_req_get_url_query_len(req) + 1 <= sizeof(q) &&
+        httpd_req_get_url_query_len(req) > 0 &&
+        httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char v[16];
+        if (httpd_query_key_value(q, "seq", v, sizeof(v)) == ESP_OK) seq = (uint32_t)strtoul(v, NULL, 10);
+    }
+    if (seq == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "need seq (see /ai_dump)");
+        return ESP_FAIL;
+    }
+    // 接收缓冲走 PSRAM：单帧可达 96KB，与相机缓冲同池，不挤内部堆。
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(AI_DUMP_FRAME_MAX, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    uint32_t ms = 0;
+    size_t n = ai::dump_copy(seq, buf, AI_DUMP_FRAME_MAX, &ms);
+    if (n == 0) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such seq (or 0-byte frame)");
+        return ESP_FAIL;
+    }
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "seq=%u ms=%u", (unsigned)seq, (unsigned)ms);
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-AiFrame", hdr);
+    esp_err_t r = httpd_resp_send(req, (const char *)buf, n);
+    free(buf);
+    return r;
+}
+
+// ── panic 现场读取（/coredump）──────────────────────────────────────────────
+// 为什么需要这条路：板子跑挂后网络同时没了、串口也不在手边（车架在车上），于是「复位=崩溃」
+// 四个字就是全部线索。panic 的现场其实**已经**落在 coredump 分区里（partitions.csv 里那 512KB +
+// CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y），但分区开了却没有读取通路，等于没有。
+// 这条 GET 把它变成能远程取回的东西：
+//   GET /coredump          → 文本：panic 原因串 + 崩在哪个任务 + PC + 回溯 PC 数组 + 固件 sha
+//   GET /coredump?erase=1  → 清掉现场（panic 一次覆写一次；想留旧的先取再清）
+// 拿到 bt 的 PC 后，在 PC 侧对**本次固件的 .elf** 做 addr2line 即得文件:行号。先核对回来的 sha
+// 与手头 .elf 的 sha256 是否一致，否则解出来的是别人的代码。工具：`carctl.py coredump`。
+// ⚠️ 依赖 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH + DATA_FORMAT_ELF；库与头文件两侧都得开
+// （已在 librebuild 的配置里核实一致），否则下面两个符号链接不上——那是响亮的失败，不是静默。
+static esp_err_t coredump_handler(httpd_req_t *req)
+{
+    // erase=1：取完现场顺手清掉，免得下次 panic 的新现场跟旧的混在一起看。
+    char q[32];
+    size_t ql = httpd_req_get_url_query_len(req);
+    if (ql > 0 && ql + 1 <= sizeof(q) && httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char v[8];
+        if (httpd_query_key_value(q, "erase", v, sizeof(v)) == ESP_OK && v[0] == '1') {
+            esp_err_t e = esp_core_dump_image_erase();
+            char m[48];
+            snprintf(m, sizeof(m), "erase=%d\n", (int)e);
+            httpd_resp_set_type(req, "text/plain");
+            return httpd_resp_send(req, m, HTTPD_RESP_USE_STRLEN);
+        }
+    }
+
+    // summary 结构 ~200 字节、reason 上限 256：都走堆。httpd 栈只有 8192 且已知偏紧
+    // （见 startCameraServer 里那条注释），不能在这条链上加大局部变量。
+    const size_t cap = 1024;
+    esp_core_dump_summary_t *sum = (esp_core_dump_summary_t *)malloc(sizeof(esp_core_dump_summary_t));
+    char *reason = (char *)malloc(256);
+    char *out = (char *)malloc(cap);
+    if (!sum || !reason || !out) {
+        free(sum); free(reason); free(out);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    reason[0] = '\0';
+    esp_err_t er = esp_core_dump_get_panic_reason(reason, 256);
+    esp_err_t es = esp_core_dump_get_summary(sum);
+
+    // reason 是 panic 处理器写的自由文本，可能带引号/换行；这里按行输出，把控制字符压成空格，
+    // 免得一条乱字符把整段可读性毁掉（也让 PC 侧按行切片就够，不必上 JSON 转义）。
+    for (char *p = reason; *p; p++)
+        if ((unsigned char)*p < 0x20) *p = ' ';
+
+    size_t n = 0;
+#define CD_ADD(...) do { \
+        if (n < cap) { int w = snprintf(out + n, cap - n, __VA_ARGS__); \
+                       if (w > 0) n += (size_t)w; if (n > cap) n = cap; } \
+    } while (0)
+    CD_ADD("ok=%d\n", (int)(es == ESP_OK));
+    CD_ADD("reason_err=%d\n", (int)er);
+    CD_ADD("reason=%s\n", reason);
+    if (es == ESP_OK) {
+        CD_ADD("task=%s\n", sum->exc_task);
+        CD_ADD("pc=0x%08x\n", (unsigned)sum->exc_pc);
+        CD_ADD("cause=%u vaddr=0x%08x\n",
+               (unsigned)sum->ex_info.exc_cause, (unsigned)sum->ex_info.exc_vaddr);
+        CD_ADD("depth=%u corrupted=%d\n",
+               (unsigned)sum->exc_bt_info.depth, (int)sum->exc_bt_info.corrupted);
+        CD_ADD("bt=");
+        for (uint32_t i = 0; i < sum->exc_bt_info.depth && i < 16; i++)
+            CD_ADD("0x%08x ", (unsigned)sum->exc_bt_info.bt[i]);
+        CD_ADD("\n");
+        CD_ADD("sha=%s\n", (const char *)sum->app_elf_sha256);
+    } else {
+        CD_ADD("summary_err=%d\n", (int)es);
+    }
+#undef CD_ADD
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t r = httpd_resp_send(req, out, n);
+    free(sum); free(reason); free(out);
+    return r;
 }
 
 static esp_err_t cmd_handler(httpd_req_t *req)
@@ -1767,7 +2034,9 @@ static esp_err_t index_handler(httpd_req_t *req)
 void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    // 20 个槽：现 14（camera_httpd 上 12 个 + /zoomshot + ota 的 /update GET/POST 2 个）。
+    // 再加 URI 前先数一遍，超了 httpd_register_uri_handler 会静默失败（那个路径直接 404）。
+    config.max_uri_handlers = 20;
     // httpd 默认栈偏小，WS 指令处理链（cmd::handle → 统一日志转发）加深易触发栈 canary 崩溃
     // （实测收到 spin 时 httpd 栈溢出），调大与 ws_stream 同级避免 WS 指令线程爆栈。
     config.stack_size = 8192;
@@ -1815,6 +2084,19 @@ void startCameraServer()
         .uri = "/capture",
         .method = HTTP_GET,
         .handler = capture_handler,
+        .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+        ,
+        .is_websocket = true,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = NULL
+#endif
+    };
+
+    httpd_uri_t zoomshot_uri = {
+        .uri = "/zoomshot",
+        .method = HTTP_GET,
+        .handler = zoomshot_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
         ,
@@ -1928,10 +2210,37 @@ void startCameraServer()
 #endif
     };
 
+    // AI 抓帧留档（调试）：清单 + 按序号取图。纯 GET，非 WS。
+    httpd_uri_t ai_dump_uri = {
+        .uri = "/ai_dump",
+        .method = HTTP_GET,
+        .handler = ai_dump_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t ai_frame_uri = {
+        .uri = "/ai_frame",
+        .method = HTTP_GET,
+        .handler = ai_frame_handler,
+        .user_ctx = NULL
+    };
+
+    // panic 现场（调试）：纯 GET，取 coredump 分区的摘要，见 coredump_handler 顶部注释。
+    httpd_uri_t coredump_uri = {
+        .uri = "/coredump",
+        .method = HTTP_GET,
+        .handler = coredump_handler,
+        .user_ctx = NULL
+    };
+
     ra_filter_init(&ra_filter, 20);
 
     // 统一日志模块转发器：WS 广播 + BLE 通知，供 /log 开启后把板端日志发手机。
     blog::set_forwarder(send_log_to_phone);
+
+    // WS 发送锁：须在任何发送方（blog 转发任务、指令应答、ws_stream_task）启动前建好，
+    // 否则那几路发送会在无锁状态下并发写 socket（见 s_ws_tx_mtx 注释）。
+    if (!s_ws_tx_mtx) s_ws_tx_mtx = xSemaphoreCreateMutex();
 
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
     recognizer.set_partition(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fr");
@@ -1946,6 +2255,7 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &cmd_uri);
         httpd_register_uri_handler(camera_httpd, &status_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
+        httpd_register_uri_handler(camera_httpd, &zoomshot_uri);
         httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
         httpd_register_uri_handler(camera_httpd, &xclk_uri);
@@ -1953,6 +2263,9 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &greg_uri);
         httpd_register_uri_handler(camera_httpd, &pll_uri);
         httpd_register_uri_handler(camera_httpd, &win_uri);
+        httpd_register_uri_handler(camera_httpd, &ai_dump_uri);
+        httpd_register_uri_handler(camera_httpd, &ai_frame_uri);
+        httpd_register_uri_handler(camera_httpd, &coredump_uri);
 
         // 固件升级入口（GET 上传页 / POST 固件流），实现在 src/net/ota.cpp
         ota::http_register(camera_httpd);
@@ -1966,7 +2279,13 @@ void startCameraServer()
         httpd_register_uri_handler(stream_httpd, &stream_uri);
 #ifdef CONFIG_HTTPD_WS_SUPPORT
         httpd_register_uri_handler(stream_httpd, &ws_uri);
-        xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 8192, NULL, 5, NULL, 1);
+        // 栈先试 PSRAM（内部堆紧，见 heap_watch）：把 8KB 让回内部 DMA 池；失败退回内部栈保推流可用。
+        if (!s_ws_stack) s_ws_stack = (StackType_t*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+        if (s_ws_stack) {
+            xTaskCreateStaticPinnedToCore(ws_stream_task, "ws_stream", 8192, NULL, 5, s_ws_stack, &s_ws_tcb, 1);
+        } else {
+            xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 8192, NULL, 5, NULL, 1);
+        }
 #endif
     }
 }

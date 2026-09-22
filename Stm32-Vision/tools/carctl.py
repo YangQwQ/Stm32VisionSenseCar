@@ -265,6 +265,44 @@ def remember_host(host: str) -> None:
         pass          # 缓存写不进去不影响主流程
 
 
+def kill_stale_clients(host: str) -> None:
+    """清掉残留的本机→板子 TCP 连接（上次 car_logcat / carctl log 没退干净的 python 进程）。
+
+    板端 httpd/lwip 的连接槽有限：残留进程把槽占满后，新起的 HTTP/WS 一直连到超时都连不上，
+    和"板子死了"长得一模一样——但手机却能连（它不占本机的连接槽）。定位到板子后先清一遍，
+    只动**python 属主**的 80/81 ESTABLISHED 连接，别的进程一概不碰。
+    """
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                             errors="replace",  # netstat 走 OEM 码页，严格 UTF-8 会抛 UnicodeDecodeError
+                             timeout=10, check=False).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return
+    pat = re.compile(re.escape(host) + r":[8][01]\s+ESTABLISHED")
+    pids: set[int] = set()
+    for line in out.splitlines():
+        if line.startswith("TCP") and pat.search(line):
+            m = re.search(r"(\d+)\s*$", line)
+            if m and int(m.group(1)) != os.getpid():
+                pids.add(int(m.group(1)))
+    killed = []
+    for pid in sorted(pids):
+        try:  # 只清 python 属主（netstat 只给 PID 不给进程名，得回查）
+            tl = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                                capture_output=True, text=True, errors="replace",
+                                timeout=10).stdout or ""
+            name = tl.split('","')[0].strip('"') if tl else ""
+            if not name.lower().startswith("python"):
+                continue
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
+                           timeout=10, check=False)
+            killed.append(pid)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if killed:
+        log(f"[清理] 杀掉残留 python 连接进程 {', '.join(map(str, killed))}（占着板子连接槽）")
+
+
 # ---------------- HTTP：/update 的读（运行信息）与写（推固件） ----------------
 
 def http_get(host: str, path: str, timeout: float = HTTP_TIMEOUT_S, port: int = HTTP_PORT) -> bytes:
@@ -1398,6 +1436,18 @@ def parse_args():
     p.add_argument("--tries", type=int, default=4, help="单张失败重试次数（默认 4）")
     p.set_defaults(func=cmd_frame)
 
+    p = sub.add_parser("zoomshot", parents=[common],
+                       help="对目标区域裁出放大 JPEG（板端 /zoomshot）：手动凑近看两指与目标，等价于 AI 的 zoom")
+    p.add_argument("--px", type=float, help="框中心 x（画面归一化 0~1，默认 0.5）")
+    p.add_argument("--py", type=float, help="框中心 y（画面归一化 0~1，默认 0.5）")
+    p.add_argument("--scale", type=float, help="倍率（框=全幅 1/scale，默认 2）")
+    p.add_argument("--out-w", type=int, default=320, help="输出宽度（默认 320）")
+    p.add_argument("--out-h", type=int, default=240, help="输出高度（默认 240）")
+    p.add_argument("--quality", type=int, default=80, help="JPEG 质量（默认 80）")
+    p.add_argument("-o", "--out", help="输出路径（默认 tools/shots/z-<标签>.jpg）")
+    p.add_argument("-t", "--tag", help="文件名标签（默认当前时刻）")
+    p.set_defaults(func=cmd_zoomshot)
+
     p = sub.add_parser("step", parents=[common],
                        help="发指令+抓帧+记状态行（手动夹取/复盘用，一次一条可对照的记录）")
     p.add_argument("type", help="词表指令类型，如 arm / move / spin")
@@ -1489,6 +1539,31 @@ def fetch_state(host: str, timeout: float, wait: float = 2.5) -> str | None:
     except (OSError, ConnectionClosed, TimeoutError):
         pass
     return state
+
+
+def cmd_zoomshot(host: str, args) -> None:
+    """对目标区域裁出放大 JPEG（板端 /zoomshot）：手动"凑近看"两指与目标，等价于 AI 的 zoom。
+
+    用法：carctl.py zoomshot --px 0.5 --py 0.46 --scale 2.5
+    px/py 是目标在（你上一次拿到的全幅）画面里的归一化中心坐标；scale 是相对全幅的倍率。
+    裁框 = 以 (px,py) 为中心、各边长 = 全幅 1/scale。数据不走 WS、不碰 AI 状态机，纯一次 HTTP。
+    """
+    qargs = []
+    if args.px is not None: qargs.append(f"px={args.px}")
+    if args.py is not None: qargs.append(f"py={args.py}")
+    if args.scale is not None: qargs.append(f"scale={args.scale}")
+    if args.out_w: qargs.append(f"out_w={args.out_w}")
+    if args.out_h: qargs.append(f"out_h={args.out_h}")
+    if args.quality != 80: qargs.append(f"quality={args.quality}")
+    path = "/zoomshot" + ("?" + "&".join(qargs) if qargs else "")
+    blob = http_get(host, path, timeout=args.timeout)
+    if blob[:2] != b"\xff\xd8":
+        sys.exit(f"不是 JPEG（前16B {blob[:16]!r}）—— /zoomshot 返回异常")
+    SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    tag = args.tag or time.strftime("%H%M%S")
+    dst = Path(args.out) if args.out else SHOTS_DIR / f"z-{tag}.jpg"
+    dst.write_bytes(blob)
+    log(f"{dst}  {len(blob) / 1024:.1f}KB")
 
 
 def cmd_step(host: str, args) -> None:
@@ -1598,6 +1673,7 @@ def main() -> None:
             log("[提示] 上板：carctl.py build --flash   或   carctl.py ota <上面的产物>")
             return
         host = resolve_host(args)
+        kill_stale_clients(host)   # 建连前清残留，防止上次记录仪占满板子连接槽
         try:
             cmd_ota(host, argparse.Namespace(bin=str(bin_path), force=args.force,
                                              dry_run=False, no_wait=False,
@@ -1614,6 +1690,7 @@ def main() -> None:
             log("\n[中断] 已停止")
         return
     host = resolve_host(args)
+    kill_stale_clients(host)       # 建连前清残留，防止上次记录仪占满板子连接槽
     try:
         args.func(host, args)
     except KeyboardInterrupt:

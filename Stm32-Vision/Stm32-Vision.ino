@@ -4,11 +4,13 @@
 #include "src/net/wifi_net.h"
 #include "src/cam/camera.h"
 #include "src/exec/direct_exec.h"
+#include "src/exec/motion_verify.h"
 #include "src/core/command.h"
 #include "src/net/ble.h"
 #include "src/net/ota.h"
 #include "src/ai/ai_client.h"
 #include "src/core/board_log.h"
+#include "src/core/heap_watch.h"
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -36,6 +38,10 @@ void setup() {
 
   cfg::init();
   blog::init();  // 统一日志队列与转发任务（setup 早期拉起，供任意任务 logf 使用）
+  // 内部堆水位哨兵：紧跟 blog 拉起，让"最低水位"覆盖整段运行——
+  // WiFi RX 缓冲只能落 DMA 可达的内部 RAM，这块板的低点决定链路会不会哑（见 heap_watch.h）。
+  // 起点越早，卡死后读到的低点越完整。放在 ble 之前，保证任何指令到达时它已就绪。
+  hwatch::init();
 
   // BLE GATT Server 不依赖摄像头/WiFi——配网阶段无网可用，也要先能连上手机
   ble::init();
@@ -57,6 +63,7 @@ void setup() {
   ota::init();  // 固件升级入口（ArduinoOTA 网络端口 + HTTP /update）；联网后由 update() 自动就绪
 
   ai::init();  // AI worker 任务（DIRECT 链路；依赖 WiFi 与摄像头）
+  mvfy::init();  // 运动到位验证任务（软解放核心0，避免阻塞 loop/WS；依赖摄像头）
 
   blog::logf(blog::SYS, "Ready!");
 }

@@ -23,9 +23,17 @@ enum Cat : uint8_t {          // 日志来源类别
 // 是否转发该类别（手机开 → true）：全局 all 开启或该类别单独开启。
 bool enabled(Cat c);
 
-// 设置某类别开关 / 全局 all 开关（由 /log 指令调用）。
+// 设置某类别开关 / 全局 all 开关（由 /log 指令调用）。两者是**单选**关系：
+//   开某类别 = 收窄到该类（并清掉 all），开 all = 全部类别（并清掉各类别位），
+//   关 all = 真正全关（不留残余类别位）。
+// 单选是刻意的：先前 all 与类别位是"或"关系且能长期残留，`/log ai on` 会被残留的 all
+// 静默放大成"全类别都在发"，用户看到的回执却只说"AI日志转发已开启"。
 void enable(Cat c, bool on);
 void set_all(bool on);
+
+// 当前生效的转发类别文本（all 时 "all(全部)"；单选若干时 "ai"/"exec,ai"；全关时 "-"），
+// 供 /log 回执如实回报——只回报本次开关时，用户无法察觉"还有别的类别在发"。
+void state_text(char* buf, size_t n);
 
 // 统一日志输出：始终写串口（带 [类] 前缀）；enabled(c) 时同步转发手机。
 void logf(Cat c, const char* fmt, ...) __attribute__((format(printf, 2, 3)));

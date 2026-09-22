@@ -20,6 +20,12 @@ bool act(const char* type, const JsonObjectConst& params);
 bool set_servo(uint8_t logical, uint16_t pwm);
 // 二连杆 IK：给末端目标位姿(x=轴前方cm, h=地面以上cm)，联动解算并下发左右两舵机 pwm。目标不可达返回 false。
 bool arm_pose(float x, float h);
+// 低姿夹取准备位：夹心降到 Calibration.h 的 ARM_LOW_X_CM/ARM_LOW_H_CM（实测过的固定低姿）。
+// 降到这儿后靠车的前后移动把目标送进两指之间（机械臂不能左右移动）。不可达返回 false。
+bool arm_low();
+// 夹心当前位姿（对当前命令的 pwm 做正运动学回读，与状态行同源）。供上层判"爪是否真的在目标身上"。
+// 标定未就绪返回 false（此时调用方应按"位置未知"处理，不要据此拒绝动作）。
+bool arm_pos(float* x, float* h);
 // 该指令是否为"持续型"（持续直驱需要配 stop 收尾）。
 bool is_continuous(const char* type, const JsonObjectConst& params);
 // 当前是否有轮子/原地旋转在动（定距 move / spin 的到段等待用）。返回是否在转。

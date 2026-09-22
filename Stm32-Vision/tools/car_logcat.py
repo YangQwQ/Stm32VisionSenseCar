@@ -80,6 +80,7 @@ import os
 import queue
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -384,6 +385,42 @@ def remember_host(host: str) -> None:
         HOST_CACHE.write_text(host + "\n", encoding="utf-8")
     except OSError:
         pass
+
+
+def kill_stale_clients(host: str) -> None:
+    """清掉残留的本机→板子 TCP 连接（上次没退干净的 python 进程）。
+
+    板端 httpd/lwip 的连接槽有限：残留进程把槽占满后新连接会一直超时，与"板子死了"长得
+    一样（手机却能连，因为它不占本机连接槽）。每次建连前清一遍——长驻记录仪自己最常留残。
+    只动 python 属主的 80/81 ESTABLISHED 连接，别的进程不碰。
+    """
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                             timeout=10, check=False).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return
+    pat = re.compile(re.escape(host) + r":[8][01]\s+ESTABLISHED")
+    pids: set[int] = set()
+    for line in out.splitlines():
+        if line.startswith("TCP") and pat.search(line):
+            m = re.search(r"(\d+)\s*$", line)
+            if m and int(m.group(1)) != os.getpid():
+                pids.add(int(m.group(1)))
+    killed = []
+    for pid in sorted(pids):
+        try:
+            tl = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                                capture_output=True, text=True, timeout=10).stdout or ""
+            name = tl.split('","')[0].strip('"') if tl else ""
+            if not name.lower().startswith("python"):
+                continue
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
+                           timeout=10, check=False)
+            killed.append(pid)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if killed:
+        log(f"[清理] 杀掉残留 python 连接进程 {', '.join(map(str, killed))}（占着板子连接槽）")
 
 
 # ---------------- 日志落盘 ----------------
@@ -997,6 +1034,7 @@ def main() -> None:
     strip_proxy_env()
 
     host = resolve_host(args)
+    kill_stale_clients(host)   # 建连前清残留：长驻记录仪最常把板子连接槽占满
     remember_host(host)
 
     if args.out:
