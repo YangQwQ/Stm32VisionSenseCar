@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本文档基准：仓库 HEAD `5bb3b63`（2026-09-16）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `dda6b05`（2026-09-22）。只覆盖已提交内容；未提交改动不收录。
 
 本项目维护指南，供后续编码助手 / 会话快速对齐上下文。
 
@@ -84,14 +84,14 @@ res://
 
 ## 构建环境
 
-- Android SDK / NDK：`D:\AndroidSDK`（platforms android-36，build-tools 36.1/37，NDK 30.0.15729638，platform-tools）。
+- Android SDK / NDK：装在本机**非默认目录**，具体位置以 Godot「编辑器设置 → 导出 → Android」里的 SDK 路径为准（也可由环境变量 `ANDROID_HOME` 给出）。已装：platforms android-36，build-tools 36.1/37，NDK 30.0.15729638，platform-tools。
 
-- JDK：Java 21，`JAVA_HOME=D:\Soft\JAVA\jdk-21`。
+- JDK：Java 21，`JAVA_HOME` 指向本机 JDK 21 安装目录（Godot「编辑器设置 → 导出 → Android」里有对应设置项）。
 
 - **导出 = 编译动作**（非“无需编译”）：用 Godot 编辑器 headless 导出 Android debug APK。实测命令：
-  `"D:/PortableApp/Godot/Godot_v4.7.1-stable_mono_win64.exe" --headless --path <工程根> --export-debug "Android" <输出.apk>`（preset 名 `Android`）。
+  `"<Godot 4.7.1 mono 可执行文件>" --headless --path <工程根> --export-debug "Android" <输出.apk>`（preset 名 `Android`；Windows 上是 `Godot_v4.7.1-stable_mono_win64.exe`，其它平台换对应可执行文件）。
 
-- **GDBLE 已集成**（非待办）：Java/AAR 部分已编译就绪于 `addons/gdble/android/*.aar` + 导出插件 `addons/gdble_export`；Rust 源在独立仓库 `D:\Downloads\Git\gdble`（仓库外，未收录进本容器）。若要改 btleplug/Java 侧需重编 AAR 的 classes.jar 再导出。
+- **GDBLE 已集成**（非待办）：Java/AAR 部分已编译就绪于 `addons/gdble/android/*.aar` + 导出插件 `addons/gdble_export`；Rust 源在独立仓库 `gdble`（**与本仓库同级的 `../gdble`**，仓库外，未收录进本容器）。若要改 btleplug/Java 侧需重编 AAR 的 classes.jar 再导出。
 
 - 导出预置：`export_presets.cfg` 中 `gradle_build/use_gradle_build=true`，但实际走的是 **Godot 标准模板导出**（未真正跑 gradle assemble）；`plugins/GDBLE=false`、`plugins/GDBLEBridge=false`（插件经导出插件注入，不勾这两个开关）。
 
@@ -101,8 +101,6 @@ res://
 - **已知坑（扫描必现 `扫描失败: JNI call failed`，2026-09-06 已解）**：该字面量是 jni crate 对 `Error::JniCall(ThreadDetached)` 的 Display = 某线程**未 attach JVM** 就调进 Java。gdble 的 gdble-core 工作线程驱动 btleplug 前须 `attach_current_thread_permanently`（`src/android.rs::attach_core_thread`，core.rs 线程闭包调用）；若 .so 缺这段，`start_scan` 里 `global_jvm().get_env()` 直接 JNI_EDETACHED。**根因：主工程 `addons/gdble/android/gdble-release.aar` 里的 libgdble.so 是旧编译产物（缺 attach）**；worktree 同目录 AAR（09-05 20:36）含 attach、才是好的——AAR 是二进制品，不同步导致从主工程导出的包必坏。重编 gdble 后要把 `gdble/target/aarch64-linux-android/release/libgdble.so` 换入**主工程** AAR。查 .so 含不含 attach：字节里搜 `attach_current_thread_permanently failed` / `[GDBLE] Failed to attach core thread`。另：`BLEClient._on_error` 在扫描态失败也发 `scan_finished([])`，下拉框不再卡"扫描中…"。
 
 ## 后续待办（不在当前阶段）
-
-- BLE（已解决，2026-09-05）：真机“刷新恒 0 设备”根因不是 gdble 扫描——btleplug Java `onScanResult` 正常大量回调、gdble 返回 25+ 周边设备，是 `BLEClient.gd:_labels` 对 `"name": null` 的设备字典做 `var name: String = d.get("name","")` 赋值，取到 Nil 触发运行时错误中断函数，`address` 兜底永远走不到、结果恒 `[]`。已改为显式判 null（name 为 null 时回退 address）。配网 GATT 两侧代码已接（见下）。
 
 - **遗留命名**：板侧本地直驱状态（`exec_status`）在 `Main.gd` / `ChatPanel.gd` 中仍以 `"执行板"` 作为消息来源标签显示，如需改为「状态」需同步两处。
 

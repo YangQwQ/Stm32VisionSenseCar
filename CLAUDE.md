@@ -1,6 +1,6 @@
 # CLAUDE.md（仓库根 · 总览与索引）
 
-> 本文档基准：仓库 HEAD `5bb3b63`（2026-09-16）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `dda6b05`（2026-09-22）。只覆盖已提交内容；未提交改动不收录。
 
 本仓库是「视觉控制小车」协作工程的**容器仓库**，现收拢两块子工程：
 
@@ -19,7 +19,7 @@
 
 - **大脑板既是视觉大脑也是执行器**：`command` 收到手动指令后直接调 `exec::act`。
 - **词表 JSON 只由手机 App 持有**（`net/proto/CommandProto.gd`）；`词表 → 哪吒 I2C 命令` 的翻译在大脑板 `command` + `direct_exec` 一侧。
-- 当前状态：BLE 配网、WS 指令/状态、UDP 图传、软件 I2C 直驱（舵机/电机/灯，含**原地旋转**与按实测时长近似的**定距/定角**）均已接通；板载 DIRECT AI（`ai_goal`/`ai_oneshot`）已实现并按任务闭环调用 `exec`，其侧维护画面单应标定 + 物体空间记忆 + 车姿态累积，并按需携带上一帧做运动对比；手机端不持有云端 AI 客户端（DIRECT 不经手机侧）；AI 侧工具含 `wait`（等待）与 `approach`（快速接近），任务进度以 `tasks` 列表回报，另有 `goto`（直移到指定坐标）与 `ai_chat`（任务中插话）两条入口。
+- 当前状态：BLE 配网、WS 指令/状态、UDP 图传、软件 I2C 直驱（舵机/电机/灯，含**原地旋转**与按实测时长近似的**定距/定角**）均已接通；板载 DIRECT AI（`ai_goal`/`ai_oneshot`）已实现并按任务闭环调用 `exec`，其侧维护画面单应标定 + 物体空间记忆 + 车姿态累积，并按需携带上一帧做运动对比；手机端不持有云端 AI 客户端（DIRECT 不经手机侧）；AI 侧工具含 `wait`（等待）、`approach`（快速接近）与 `zoom`（放大镜，凑近看清目标），任务进度以 `tasks` 列表回报，另有 `goto`（直移到指定坐标）与 `ai_chat`（任务中插话）两条入口。
 
 ## 各子工程文件索引（简）
 
@@ -42,10 +42,20 @@
 | `src/net/ping_svc(.h/.cpp)` | `/ping <目标>` 异步 ICMP 探测（无目标则就地回 pong） |
 | `src/net/ble(.h/.cpp)` | BLE GATT Server：配网 + 兜底控制 + status 通知（广播名 VisionS3） |
 | `src/net/app_httpd.cpp` | HTTP（MJPEG/拍照/LED）+ WS（端口 81 文本 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（`ws_stream` 任务栈 8192） |
-| `src/ai/ai_client(.h/.cpp)` | 板载多模态 AI（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait/approach；任务进度用 `tasks` 列表每轮渲染回喂、前几轮思考按环缓存多轮喂回；HTTPClient + keep-alive TLS 复用重试、PSRAM 缓冲；单应标定 + 空间记忆 + 车姿态；默认单帧、按 `carry_prev` 附带上一帧；WS 文本出口做 UTF-8 消毒防手机端 1007 断链） |
+| `src/ai/ai_client(.h/.cpp)` | 板载多模态 AI（DIRECT 直调云端，任务级闭环：move/stop/arm/spin/arm_pose/wait/approach；任务进度用 `tasks` 列表每轮渲染回喂、前几轮思考按环缓存多轮喂回；默认单帧、按 `carry_prev` 附带上一帧；WS 文本出口做 UTF-8 消毒防手机端 1007 断链）。组包 / TLS 发送 / 空间记忆三块已拆出为下面三文件 |
+| `src/ai/ai_prompt(.h/.cpp)` | 系统提示词与请求 body 组装（`PsaBuf` PSRAM 增长缓冲、`build_body`：提示词+独立目标消息+历史环多轮回喂+执行板状态行，图预算 ≤2） |
+| `src/ai/ai_mem(.h/.cpp)` | AI 侧空间记忆 + 车姿态累积（`mem_reset` / `car_update_pose` / `mem_observe(_xy)` / `mem_feed` / `mem_find`，车头局部系） |
+| `src/ai/ai_http(.h/.cpp)` | AI TLS 发送层（keep-alive 复用 POST、状态码供 4xx/429 快速失败、`http_stop` 中止在途请求供打断用） |
+| `src/ai/ai_dump(.h/.cpp)` | AI 抓帧留档：把实际发往云端的那帧 JPEG + 该轮标注留在 PSRAM（6 槽环形），HTTP `/ai_dump` 供 PC 侧复盘 |
+| `src/ai/magnify(.h/.cpp)` | 放大镜（namespace `magnify`）：按归一化 `px`/`py` + 绝对倍数 `scale` 裁块放大回喂 AI |
 | `src/ai/ground_proj(.h/.cpp)` | 屏幕→地面单应换算（namespace `ground`），供 AI 用 |
+| `src/exec/motion_verify(.h/.cpp)` | 动作后校验（`mvfy`）：动作落地后抓帧软解 → 反投影，判"车/臂到底动没动"，供死区与"命令发了没到位"的补救用 |
+| `src/core/heap_watch(.h/.cpp)` | 内部堆/DMA 块水位哨兵：跌到危险线告警。⚠️ 判"车要挂了"看 **DMA 块**而非总空闲堆——碎片化才是真闸门 |
+| `src/net/ota(.h/.cpp)` | OTA：ArduinoOTA + HTTP `POST /update`（板子固定车上、串口够不着，刷固件走这里） |
 | `Calibration.h/.cpp` | **手动校准数据集中区**（根目录）：舵机限位/机械臂参数、定距/定角移动时长表、屏幕→地面单应标定点 `kGroundCal`、机械臂夹心散点 `kArmPts`；`bivar::arm_set()` 实现在 Calibration.cpp |
-| `partitions.csv` | 分区表（3MB APP，需 `huge_app`） |
+| `partitions.csv` | 分区表（sketch 自带，**覆盖** fqbn 的 `huge_app`）：app0/app1 双 OTA 槽各约 3.8MB + `coredump`；故 OTA 可用、panic 可落盘 |
+
+> 🛠️ **PC 侧工具**：板子固定在车上、串口够不着，日常诊断/烧录/抓帧都走 [`Stm32-Vision/tools/`](Stm32-Vision/tools/)——`carctl.py`（操作台：状态/日志/发指令/抓帧/体检/编译/OTA/panic 取证/压测）、`car_logcat.py`（记录仪：日志落盘 + AI 每轮画面留档）、`probe_macro.py`（编译期宏探针）。**全部经 `uv` 直接跑，不必手打 arduino-cli**；逐条用法见 [`Stm32-Vision/CLAUDE.md`](Stm32-Vision/CLAUDE.md) 的「PC 侧工具」。
 
 ### Mobile-RemoteCtrl/ — 手机遥控 App（Godot 工程）
 
@@ -85,16 +95,12 @@
 3. **哪吒 I2C 命令表**（从机 `0x80`、舵机/电机/灯光 cmd 字节）：现只有大脑板 `nezha_direct.cpp` 一处实现，无对侧；改动须对照哪吒扩展板硬件协议，别单方面改字节。
 4. 各子 CLAUDE.md 中还有各自的坑（如大脑板 `namespace net` 勿改回 `network`、esp32 勿回退 2.x / 勿用 esp32cam 目标等），改动前读。
 
-## 外部引用提醒
+## 仓库外资料（未入库）
 
-子 CLAUDE.md 里引用了**本仓库外**的原始工作区路径（`D:\Downloads\Git\Ctrl-App`、`D:\Downloads\Git\vision-control-architecture.md` 等）。在本容器内：
-
-- 手机端 = 本仓库的 `Mobile-RemoteCtrl/`（即外部路径里的 `Ctrl-App`）；
-- 架构文档（`vision-control-architecture.md`）**不在本仓库内**，如缺失且需要，找作者或按两份子 CLAUDE.md 的协议节反推。
-- `.trae/`（mbedTLS 重编流程 + `documents/` 设计笔记）**被 `.gitignore` 排除、不在版本库内**：本地工作区有，clone 后不会有。`Stm32-Vision/CLAUDE.md` 的构建要点引用它，属仓库外资料。
+- `.trae/`（早期排查草稿 + `documents/` 设计笔记）**被 `.gitignore` 排除、不在版本库内**：本地工作区有，clone 后不会有。**mbedTLS/内核库重编流程已不再依赖它**——编库脚本、定制 `defconfig`、链接脚本补丁均已入库于 [`Stm32-Vision/librebuild/`](Stm32-Vision/librebuild/README.md)（随提交 `33b18e7`）。
 
 ## 仓库级约定
 
-- 本仓库不配置顶层构建；编译/烧录入口分散：大脑板走 Arduino IDE/arduino-cli，App 走 Godot headless 导出。**不主动跑编译/烧录验证**（耗时无谓），默认交给用户在其 IDE 中做。
+- 本仓库不配置顶层构建；编译/烧录入口分散：大脑板走 Arduino IDE/arduino-cli（命令行等价入口已固化进 `Stm32-Vision/tools/carctl.py build`，含自动 OTA 与指纹核对），App 走 Godot headless 导出。**不主动跑编译/烧录验证**（耗时无谓），默认交给用户在其 IDE 中做。
 - Git：代码提交由用户操作（全局规则），助手可查看与撤回，若用户要求提交，请在提交消息中注意区分涉及部分，如(Vision/Mobile)，具体可见历史提交。推送时若发现需要先pull，尽量尝试使用git pull --rebase
 - 文档维护：每份 `CLAUDE.md` 顶部标注「本文档基准：仓库 HEAD `<短hash>`（日期）」= 该文档对应的代码基准；更新文档前先基于该 hash `git diff` 检查，规则见全局 CLAUDE「CLAUDE.md 维护约定」，Claude.md不主动更新
