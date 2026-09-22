@@ -1,2 +1,5 @@
 .trae
 .claude
+Stm32-Vision/logs/*
+Stm32-Vision/tools/__pycache__/*
+Stm32-Vision/tools/shots/*

@@ -1,0 +1,125 @@
+CONFIG_BT_ENABLED=y
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
+CONFIG_BTDM_CTRL_MODE_BTDM=n
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_SPIRAM=y
+CONFIG_RTC_CLK_CAL_CYCLES=576
+CONFIG_ESP32S3_UNIVERSAL_MAC_ADDRESSES_TWO=y
+# CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND is not set
+# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1 is not set
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=3120
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# ULP Setting for IDF 5.x
+CONFIG_ULP_COPROC_ENABLED=y
+# end of ULP COPROC_ENABLE
+# Choose FSM or RISCV exclusively! Never both.
+CONFIG_ULP_COPROC_TYPE_FSM=y
+# CONFIG_ULP_COPROC_TYPE_RISCV=y
+CONFIG_ULP_COPROC_RESERVE_MEM=512
+
+# RGB Display Optimizations
+# CONFIG_LCD_RGB_ISR_IRAM_SAFE is not set
+CONFIG_LCD_RGB_RESTART_IN_VSYNC=y
+
+# Matter settings:
+CONFIG_ENABLE_CHIPOBLE=n
+# increase the maximum number of endpoints per device
+CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=4
+
+# --- Wi-Fi buffers: 针对本工程 UDP 图传重调（一帧 20~29KB = 15~21 个 1400B 包）---
+# 上游这段是通用取舍：为「PSRAM 关闭」的板子省 ~25KB 内部 RAM，代价是 TX 只给 8 个内部缓冲、
+# 且整段关掉 cache-TX 队列 —— 池子一满就只能直接 ENOMEM 丢包。实测 enomem≈2~2.4×sendOk，
+# 一帧的突发就把 8 个缓冲占满 -> 帧发不完 -> 帧率忽高忽低、速率控制被失败反馈拖到 MCS0。
+#
+# 打开 SPIRAM_TRY_ALLOCATE_WIFI_LWIP 同时带来三件事（位置已对 IDF v5.5.5 源码核实）：
+#   · by_ref 派发：components/esp_wifi/src/wifi_netif.c 的 wifi_transmit_wrap()
+#   · PSRAM 分配：components/lwip/port/include/lwipopts.h 的 mem_clib_malloc
+#   · cache 队列：components/esp_wifi/src/wifi_init.c 的 esp_wifi_psram_check()
+#   1) 单 pbuf 的 TX 改走 esp_wifi_internal_tx_by_ref（引用计数后交给驱动，不再逐包拷贝进静态池）
+#      -> 8 个静态池不再是硬闸门
+#   2) lwIP 的 mem_clib_malloc 改为 heap_caps_malloc_prefer(SPIRAM 优先) -> 内部 RAM 反而更宽裕
+#   3) cache-TX 队列恢复可用：拿不到静态缓冲时排队待发，而不是 ENOMEM 丢弃
+# 注意 esp_wifi_psram_check()：开了 SPIRAM 就要求 cache_tx_buf_num != 0，否则 esp_wifi_init 直接失败。
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# ⚠️⚠️ 下面这几个"个数"改这里**对运行时无效** —— 真正生效的是**生效头文件**
+# `dio_opi/include/sdkconfig.h`（WIFI_INIT_CONFIG_DEFAULT() 是调用方编译期展开的宏，
+# 库自己那份 sdkconfig 里的个数只是编译配置）。改个数：改那份头文件 + 重编草图 --clean；
+# 验证：uv run python tools/probe_macro.py。本文件里的值只为让库与头文件**一致**、不误导人。
+# 详见 librebuild/README.md「但"缓冲区个数"不在 defconfig 里」。
+
+# 静态 TX 池（开 PSRAM 后 choice 只剩 Static）
+# 一帧 15~21 个包，8 个静态池必爆 —— 但**别靠加静态池解决**：突发靠 CACHE 队列（落 PSRAM，
+# 见下）吸收，实测 enomem/sendOk 由 4.87 降到 0.12。这里给 32 只是与头文件对齐的意图值。
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=32
+# cache 队列是 TX 池满时的溢出吸收路径；esp_wifi_psram_check() 要求开了 SPIRAM 就必须 != 0
+# （否则 esp_wifi_init 直接失败）。**这一项必须在头文件里也是 32**，库与头文件要一致地改。
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=32
+
+# 静态 RX 缓冲 8 -> 16：按**分配时机**定，不是按带宽定。
+#   静态 RX 在 esp_wifi_init() 时一次性分配（那会儿堆干净、无碎片），此后不释放，且 WiFi 硬件
+#   用它收**所有** 802.11 帧；静态不够才回落到 dynamic 池，而 dynamic **按需分配**，正撞运行期
+#   碎片 -> 分不到就丢包 -> 不回 ACK -> ARP/ping/TCP 全哑且不自愈。
+#   所以哪怕下行只有 WS 小包，也要留足静态。16 即 IDF 在本配置（SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y）
+#   下的默认值。
+#   ⚠️ 别以为它吃内部 RAM：开了 SPIRAM_TRY_ALLOCATE_WIFI_LWIP 后，WiFi 驱动的缓冲池走
+#   esp_adapter.c 的 wifi_malloc/wifi_calloc（**先 PSRAM**、内部只兜底）。
+#   实测：+8 个缓冲后内部空闲堆 29k 一字节未变。这是"个数不吃内部 RAM"的证据。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+
+# 保持 STATIC_RX_BUFFER_NUM >= RX_BA_WIN 以维持 AMPDU 吞吐（现 16 >= 8，有余量）
+CONFIG_ESP_WIFI_RX_BA_WIN=8
+
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
+CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y
+CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK=y
+
+# esp_cam_sensor settings:
+CONFIG_CAMERA_BF3925=y
+CONFIG_CAMERA_BF3045=y
+CONFIG_CAMERA_BF20A6=y
+CONFIG_CAMERA_BF3A03=y
+CONFIG_CAMERA_GC0308=y
+CONFIG_CAMERA_GC2145=y
+CONFIG_CAMERA_MT9D111=y
+CONFIG_CAMERA_OV2640=y
+CONFIG_CAMERA_OV3660=y
+CONFIG_CAMERA_OV5640=y
+CONFIG_CAMERA_OV5647=y
+CONFIG_CAMERA_SC030IOT=y
+CONFIG_CAMERA_SC101IOT=y
+CONFIG_CAMERA_SENSOR_MOTOR_DETECT_METHOD_STATIC_STORE=y
+
+
+# TLS buffer shrink: in/out 16K->8K to cut handshake contiguous heap need (fix -32512/-17040)
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=8192
+
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+
+# TCP 发送缓冲加大：ESP32 单线程 TLS client 发大 body(多步 prev 可到 48KB) 时,
+# 默认 SND_BUF=5744 窗口太小, write 阻塞卡死(observed 30s timeout / seg 3 w=0)。
+# 放大到 32K 让内核缓冲能窗口化装下, 缓解 window-full 堵塞。
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+
+# --- mbedTLS alloc mode: external SPIRAM ---
+# Root-fix for 偶发 -32512 (握手需内部连续RAM). 依赖 SPIRAM_USE_MALLOC(默认满足).
+# CONFIG_MBEDTLS_MEM_ALLOC_MODE_EXTERNAL is not set
+
+# 软AES+软SHA：规避esp-idf#18640 —— S3的I2S/GDMA活动破坏硬件AES/SHA计算。
+#   - 熵累计(mbedtls_md SHA-256)落软件->不再-52
+#   - 写加密用软AES->不再 esp-aes: Failed to allocate memory
+# 保留硬件MPI(RSA走ROM大数乘法器,非GDMA污染源)以省握手耗时。
+# CONFIG_MBEDTLS_HARDWARE_AES is not set
+# CONFIG_MBEDTLS_HARDWARE_SHA is not set
