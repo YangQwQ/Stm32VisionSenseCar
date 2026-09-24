@@ -416,6 +416,7 @@ func _apply_slash_local(r: Dictionary) -> void:
 			chat("提示", "可用指令:\n" + "\n".join(CP.help_lines()))
 		"clear":
 			_chat_log.clear()
+			AppLog.clear()
 		"stream":
 			stream_requested.emit(bool(r.get("on", true)))
 		"grid":

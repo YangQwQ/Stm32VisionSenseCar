@@ -16,6 +16,12 @@ func _ready() -> void:
 		v.get("string", ""),
 	])
 
+## 清空日志：截断重建空文件（/clear 本地指令调用）。
+func clear() -> void:
+	var w := FileAccess.open(_PATH, FileAccess.WRITE)
+	if w:
+		w.close()
+
 ## 追加一行日志：带当前时间戳与标签 tag。
 func write(tag: String, msg: String) -> void:
 	var now := Time.get_time_dict_from_system()
