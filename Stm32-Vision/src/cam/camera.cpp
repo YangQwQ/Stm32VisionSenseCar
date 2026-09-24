@@ -11,6 +11,10 @@ namespace cam {
 
 static bool s_ready = false;
 
+// AWB/AEC 预热帧数：相机上电/切分辨率后，内部 ISP 增益从默认值起、仅在**出帧**时更新统计收敛
+// （光 sleep 无效）。固定取这么多帧丢弃，喂收敛后再把帧分发给消费者，避免首个业务帧偏色/偏曝。
+static const int HI_WARM = 4;
+
 // ---- 高清快照（request_hires 返回物） ----
 // request_hires 抓到有效高清帧后，必须**在切回 VGA / deinit 之前**把字节拷进这块 PSRAM：
 // deinit 会释放整套帧缓冲池，不拷就返回的是一个悬垂指针（buf/width/len 全被清零）。
@@ -132,6 +136,15 @@ bool init() {
 
   apply_sensor_calib();
 
+  // 上电后 AWB/AEC 增益从默认值开始，前几帧必然偏色（本板 LED 冷白光源下偏绿最明显）。
+  // AWB 只在出帧时更新增益——sleep 等待无效——固定取几帧丢弃喂收敛，让首个被消费的帧就是稳的。
+  // 图传/AI 都在 init 之后才抓帧，此处预热不丢业务帧。
+  for (int i = 0; i < HI_WARM; i++) {
+    camera_fb_t* w = esp_camera_fb_get();
+    if (!w) break;
+    esp_camera_fb_return(w);
+  }
+
   if (!s_cam_mtx) s_cam_mtx = xSemaphoreCreateMutex();   // 一进 init 就先建锁（grab/request_hires 都要用）
   if (!s_snap_mtx) s_snap_mtx = xSemaphoreCreateMutex();
   if (s_snap) { heap_caps_free(s_snap); s_snap = nullptr; }   // 重入 init 先清旧快照
@@ -161,7 +174,6 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
   xSemaphoreTake(s_cam_mtx, portMAX_DELAY);   // 独占相机（等当前任何抓帧用完）
   s_reconfig = true;
   camera_fb_t* fb = nullptr;
-  const int HI_WARM = 4;            // 预热帧数：先喂 AWB/AEC 收敛，前几帧丢弃
   camera_fb_t* d = nullptr;
   // ① 重开为高清（deinit→延时→init hires）并重应用校准。
   // 根因(源码实证 esp_camera.c fb_get L352)：fb->width 按 resolution[sensor.status.framesize] 无边界填；
@@ -220,7 +232,16 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
     camera_config_t vc = make_config(FRAMESIZE_VGA);
     esp_err_t e_lo_init = esp_camera_init(&vc);
     blog::logf(blog::CAM, "[cam] reconfig 回VGA: deinit=%d init=%d", (int)e_de, (int)e_lo_init);
-    if (e_lo_init == ESP_OK) apply_sensor_calib();
+    if (e_lo_init == ESP_OK) {
+      apply_sensor_calib();
+      // 回 VGA 同样是"重开相机"：AWB/AEC 又被重置，立即放行会让 zoom 之后的整幅帧头几帧偏绿。
+      // 同高清段一样固定取帧丢弃喂收敛，收敛后再恢复分发（仍在 s_cam_mtx 锁内，图传会再停一拍）。
+      for (int i = 0; i < HI_WARM; i++) {
+        camera_fb_t* w = esp_camera_fb_get();
+        if (!w) break;
+        esp_camera_fb_return(w);
+      }
+    }
   }
   s_reconfig = false;
   xSemaphoreGive(s_cam_mtx);   // 注意: s_snap_mtx **不放**，快照由调用方 return_frame() 释放

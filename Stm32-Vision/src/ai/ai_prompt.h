@@ -28,7 +28,7 @@ struct PsaBuf {
 // 同时含 assistant=AI 决策 与 user=插话), 逐条作为独立消息回喂, 构成真多轮对话记录;
 // exec_state 执行板状态一行文本(无数据为空串)及"距上次执行"秒数喂当前 user。
 // 系统提示词？(角色+规则+JSON格式+标定, 不含目标)+ 独立 user(目标) 消息先组进 PSRAM。
-// 图预算 ≤2: carry_prev 双帧优先(放弃参考图), 否则 参考图(首轮)+当前帧。
+// 图预算 ≤2: carry 帧(prev/放大/用户图)优先(放弃参考图), 否则 参考图(首轮)+当前帧。
 void build_body(PsaBuf& b, const char* goal, const char* ann, const char* hint,
                 const char* const* hrole, const char* const* htext, int hn,
                 const char* exec_state, unsigned last_age_s,

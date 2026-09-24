@@ -33,7 +33,10 @@ static int16_t s_steer = STEER_CENTER;
 static int16_t s_reach = REACH_CENTER;
 static int16_t s_lift  = LIFT_CENTER;
 static int16_t s_grip  = GRIP_CENTER;
-static bool s_folded = false;   // 是否处于折叠位: fold 置位, 移动臂位的动作清除
+// 机械臂当前"姿态模式": 离散动作(low/raise/clip/grasp/release/fold)落地后记录, 移动臂位的动作
+// (持续步进/pose/reset)清除回普通。给状态行/AI 明确"当前处于什么动作语义", 避免仅靠坐标/爪态猜。
+enum { ARM_NONE = 0, ARM_LOW, ARM_RAISE, ARM_CLIP, ARM_GRASP, ARM_RELEASE, ARM_FOLD };
+static uint8_t s_arm_mode = ARM_NONE;   // 是否处于折叠位: fold 置位, 移动臂位的动作清除
 
 // 缓动分离：s_reach/s_lift = 目标(逻辑/状态读取用)，s_reach_w/s_lift_w = 实际写入板的 PWM。
 // 离散定位(fold/arm_pose/reset/init)在 update_tick 里用 S 形曲线把 s_*_w 追向 s_*；
@@ -352,12 +355,12 @@ static void send_arm(const JsonObjectConst& p) {
   if (!strcmp(act_, "lift_up") || !strcmp(act_, "lift_down")) {
     // 抬落（联动 h 轴）：lift_up = 末端升高（h+）；lift_down = 降低（h-），保持 x 不变。
     int16_t dir = !strcmp(act_, "lift_up") ? +1 : -1;
-    s_folded = false;   // 移动臂位即解除折叠态
+    s_arm_mode = ARM_NONE;   // 移动臂位即脱离固定姿态
     setup_active(1, dir, has_dist, dist);
   } else if (!strcmp(act_, "reach_forward") || !strcmp(act_, "reach_backward")) {
     // 移爪（联动 x 轴）：forward = 前伸（x+）；backward = 缩回（x-），保持高度 h 不变。
     int16_t dir = !strcmp(act_, "reach_forward") ? +1 : -1;
-    s_folded = false;
+    s_arm_mode = ARM_NONE;
     setup_active(0, dir, has_dist, dist);
   } else if (!strcmp(act_, "low")) {
     // 低姿夹取准备位（一次性离散，落点见 Calibration.h ARM_LOW_*）：降到标定过的固定低姿，之后靠
@@ -366,16 +369,19 @@ static void send_arm(const JsonObjectConst& p) {
   } else if (!strcmp(act_, "clip")) {
     clear_active();
     s_grip = GRIP_CLOSE; write_grip();
+    s_arm_mode = ARM_CLIP;   // 已合上夹爪(未抬臂)
   } else if (!strcmp(act_, "grasp")) {
     // 夹取+抬臂组合（合爪 → 等舵机合到位 → 定量抬升）：一步到位省一轮云端往返。
     // 抬升量固定（GRASP_LIFT_CM），不会像持续 lift_up 那样顶到机械止点抽搐。
     clear_active();
     s_grip = GRIP_CLOSE; write_grip();
+    s_arm_mode = ARM_GRASP;   // 合爪并已请求抬臂(抬升在 update_tick 异步完成, 被打断会清回普通)
     s_grasp_lift_cm = (int16_t)GRASP_LIFT_CM;
     s_grasp_lift_at = millis() + (unsigned long)GRASP_SETTLE_MS;
   } else if (!strcmp(act_, "release")) {
     clear_active();
     s_grip = GRIP_HI; write_grip();
+    s_arm_mode = ARM_RELEASE;   // 已松开夹爪
   } else if (!strcmp(act_, "fold")) {
     // 收臂折叠回平台（一次性离散）：抬落 + 移爪都收到 130、夹爪回中；摄像头到最高位扩大视野、避开盲区。
     // 不动车轮（区别于 reset 的全停）。
@@ -383,7 +389,7 @@ static void send_arm(const JsonObjectConst& p) {
     s_lift  = FOLD_LIFT_PWM;  write_lift();
     s_reach = FOLD_REACH_PWM; write_reach();
     s_grip  = GRIP_CENTER;    write_grip();
-    s_folded = true;
+    s_arm_mode = ARM_FOLD;
   }
 }
 
@@ -552,7 +558,7 @@ bool exec::arm_low(void) {
   // 存在意义：低处可达域很窄，让上层凭坐标猜 (x,h) 会猜到够不着的地方、空夹且无报错；改成一个
   // 保证够得着的固定位，再用车的前后移动把目标送进两指之间（机械臂不能左右移动）。
   clear_active();   // 与其它 arm 指令一致：先清残留持续步进，否则首拍会朝旧方向补一枪
-  s_folded = false;
+  s_arm_mode = ARM_LOW;   // 已降入低姿夹取位(后续移动臂位/pose 会清回普通)
   bool ok = exec::arm_pose(ARM_LOW_X_CM, ARM_LOW_H_CM);
   // 逻辑坐标锚到实际落点（连续步进起点/后续 diagnose 的基准），别沿用上一动作的旧值。
   float rx = 0, rh = 0;
@@ -567,7 +573,7 @@ bool exec::arm_raise(void) {
   // 不会像连续步进那样在边界 IDW 反解两解间来回跳、舵机抽搐。
   clear_active();   // 与其它臂指令一致：先清残留持续步进
   clear_grasp_pending();
-  s_folded = false;
+  s_arm_mode = ARM_RAISE;   // 已抬到固定高位(后续移动臂位/pose 会清回普通)
   bool ok = exec::arm_pose(ARM_RAISE_X_CM, ARM_RAISE_H_CM);
   float rx = 0, rh = 0;
   if (exec::arm_pos(&rx, &rh)) { s_claw_x = rx; s_claw_h = rh; }
@@ -594,7 +600,7 @@ bool exec::act(const char* type, const JsonObjectConst& params) {
   if (!strcmp(type, "arm"))    { send_arm(params);  return true; }
   if (!strcmp(type, "arm_pose")) {
     // AI/手动指定位姿：x=夹心车头前方 cm，h=夹心离地高度 cm；不可达返回 false（不动）。
-    s_folded = false;   // 指定位姿同样脱离折叠态
+    s_arm_mode = ARM_NONE;   // 指定位姿脱离固定姿态(通用定位, 不再表达 low/raise/夹取等语义)
     clear_grasp_pending();
     return arm_pose(params["x"] | 0.0f, params["h"] | 0.0f);
   }
@@ -609,7 +615,7 @@ bool exec::act(const char* type, const JsonObjectConst& params) {
     }
     return ok;
   }
-  if (!strcmp(type, "reset"))  { exec::reset(); s_folded = false; return true; }
+  if (!strcmp(type, "reset"))  { exec::reset(); s_arm_mode = ARM_NONE; return true; }
   return false;
 }
 
@@ -664,9 +670,7 @@ bool exec::read_state(char* buf, size_t cap) {
   const char* car = s_spin != 0 ? (s_spin > 0 ? "原地右转" : "原地左转")
                                 : (s_car_motion == 1 ? "前进" : (s_car_motion == 2 ? "后退" : "停止"));
   const char* steer = s_steer_dir == 1 ? "左" : (s_steer_dir == 2 ? "右" : "正");
-  // 夹爪状态文本化：合/开/中按当前 pwm 区间。注意"合"仅代表伺服闭合到位，不代表夹住物体
-  // （AI 曾把"紧"误判为已夹住导致假成功）。
-  const char* grip = s_grip <= GRIP_CLOSE + 5 ? "合" : (s_grip >= GRIP_HI - 5 ? "开" : "中");
+  const char* grip = s_grip <= GRIP_CLOSE + 5 ? "clip" : "release";
   // 机械臂到限位提示：告诉 AI 继续同向动作不会再有变化（需反向或调整姿态）。
   char lim[32] = {0};
   if (s_reach >= REACH_HI - 2) snprintf(lim, sizeof(lim), " 移爪到顶");
@@ -678,10 +682,20 @@ bool exec::read_state(char* buf, size_t cap) {
   float fk_x = 0, fk_h = 0;
   arm_fk(s_reach, s_lift, &fk_x, &fk_h);
   if (fk_x < 0) fk_x = 0;
-  // 臂态语义：是否已折叠回平台（fold 到位/未被打断）。给 AI 明确反馈，避免已折叠后仍反复 fold。
-  const char* fold_stat = s_folded ? " 已折叠" : "";
+  // 臂态语义：当前处于哪个固定姿态（low/raise/clip/grasp/release/fold），移动臂位的动作后清空。
+  // 给 AI 明确反馈，避免"已折叠仍反复 fold / 已夹取却不知处于何态"。爪态(开/合)单独看 s_grip。
+  const char* arm_stat = "";
+  switch (s_arm_mode) {
+    case ARM_LOW:     arm_stat = " low"; break;
+    case ARM_RAISE:   arm_stat = " raise"; break;
+    case ARM_CLIP:    arm_stat = " clip"; break;
+    case ARM_GRASP:   arm_stat = " grasp"; break;
+    case ARM_RELEASE: arm_stat = " release"; break;
+    case ARM_FOLD:    arm_stat = " fold"; break;
+    default: break;
+  }
   snprintf(buf, cap, "小车:%s %s | 抓手:前%.0fcm(%d) 高%.0fcm(%d) 爪:%s%s%s",
-    car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, lim, fold_stat);
+    car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, lim, arm_stat);
   // 撞边界/不可达诊断：反馈"想去哪、实际落到哪/反解成多少"，帮用户/AI 判断机械臂边界
   // （exec_log 推给手机）。reason=1 表示撞边界但已夹到最近合法点继续移动，非错误。
   // 只在诊断新鲜时挂（见 ARM_DIAG_FRESH_MS）：它是"刚下的那条指令的结果"，过期的别重复报。
