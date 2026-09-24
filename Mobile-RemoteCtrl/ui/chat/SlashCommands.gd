@@ -97,18 +97,24 @@ static func _move_parse(args: String) -> Dictionary:
 				return _hint("用法: /move rotate <dir=-1/0/1>")
 			return _cmd(CP.servo(0, _SERVO_CENTER + dir * _SERVO_RANGE), true)
 		"spin":
-			# /move spin <角度> [speed 0..1000]：正=右转、负=左转；0 停。
+			# /move spin <角度> [speed 0..1000]：正=右转、负=左转；0 停。默认统一 800 档。
 			if mv.size() < 2 or not mv[1].is_valid_float():
-				return _hint("用法: /move spin <角度> [speed 0..1000]")
+				return _hint("用法: /move spin <角度> [speed]")
 			var ang := mv[1].to_float()
 			if absf(ang) < 1.0:
 				return _cmd(CP.spin(0), true)
-			var spd := 500
+			var spd := 800
 			if mv.size() > 2 and mv[2].is_valid_int():
 				spd = clampi(mv[2].to_int(), 0, 1000)
 			var dir := 1 if ang > 0 else -1
 			var deg := clampi(int(round(absf(ang))), 0, 500)
 			return _cmd(CP.spin(dir, spd, deg), true)
+		"spin_ms":
+			# /move spin_ms <毫秒>：直接指定通电毫秒（调试/标定口，测真实每度ms）。
+			if mv.size() < 2 or not mv[1].is_valid_int():
+				return _hint("用法: /move spin_ms <毫秒>")
+			var ms := clampi(mv[1].to_int(), 1, 60000)
+			return _cmd(CP.spin(1, 800, 0, ms), true)
 		"fore", "back":
 			# /move fore|back <距离cm 1..500> [油门% -100..100]：定距移动（板端时长近似）。
 			if mv.size() < 2 or not mv[1].is_valid_int():
@@ -158,7 +164,7 @@ static func _move_parse(args: String) -> Dictionary:
 					return _hint("用法: /move to <x> <y> [global|local]")
 			return _cmd(CP.goto(fx, fy, frame), true)
 		_:
-			return _hint("用法: /move rotate|spin|fore|back|to|arm <参数>")
+			return _hint("用法: /move rotate|spin|spin_ms|fore|back|to|arm <参数>")
 
 ## /drive 直驱控制族：motor 电机 / servo 舵机。
 static func _drive_parse(args: String) -> Dictionary:

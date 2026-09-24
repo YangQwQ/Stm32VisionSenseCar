@@ -175,8 +175,9 @@ static uint32_t s_udp_frame_id = 0;          // 帧序号，接收端按它区�
 static void udp_peer_set(uint32_t ip_s_addr, uint16_t port) {
     if (s_udp_fd < 0) {
         s_udp_fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (s_udp_fd < 0) { log_e("UDP socket fail"); return; }
-        int nb = 1;
+        // 走 blog 而不是 log_e：log_e 受 CORE_DEBUG_LEVEL 管，板菜单 DebugLevel=none 时
+        // 整句被编译掉（板子在车上、串口够不着，静默就等于没有）。板端 /log ws on 能看到。
+        if (s_udp_fd < 0) { blog::logf(blog::WS, "UDP socket 创建失败，图传无法建立"); return; }
         // 非阻塞：拿不到发送机会就立刻返回，由 udp_pump 停手、下个 tick 接着续，不在这里等。
         // 注：lwip 的 UDP 出站不实现 SO_SNDBUF（无 socket 级发送缓冲，setsockopt 无效），
         // 背压完全来自 WiFi 驱动 TX 队列 —— sendto 返回 <0 即"队列满"，属正常节流信号。
@@ -348,9 +349,10 @@ static StaticTask_t  s_ws_tcb;
 
 static esp_err_t ws_send_text(int fd, const char *text)
 {
-    // 统一出口消毒，堆拷贝发(1:1)，不动入参、不占发送任务大栈
+    // 统一出口消毒，堆拷贝发(1:1)，不动入参、不占发送任务大栈。缓冲走 PSRAM: 长文本
+    // (AI 思考转发)可达几十 KB, 用内部堆清零一块会威胁 DMA 块红线; 短帧也不受影响。
     size_t n = strlen(text);
-    char* buf = (char*)malloc(n + 1);
+    char* buf = (char*)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
     if (!buf) return ESP_ERR_NO_MEM;
     memcpy(buf, text, n + 1);
     ws_sanitize_utf8(buf);
@@ -425,7 +427,8 @@ static void ws_handle_text(const char *json, int fd)
             // 优先采用手机上报的本机 IP（实测 lwip_getpeername 对 httpd fd 回 0.0.0.0，不可靠）
             if (src_ip[0]) {
                 uint32_t a = 0, b = 0, c = 0, d = 0;
-                if (sscanf(src_ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
+                // %lu 而不是 %u: 本平台上 uint32_t 就是 unsigned long(-Wall 下 %u 会报类型不符)
+                if (sscanf(src_ip, "%lu.%lu.%lu.%lu", &a, &b, &c, &d) == 4)
                     peer_ip = a | (b << 8) | (c << 16) | ((uint32_t)d << 24);  // 首字节在低址 = 网络字节序
                 else
                     peer_ip = 0;
@@ -540,7 +543,9 @@ static void ws_send_text_to_ws_clients(const char *text)
 static void send_log_to_phone(const char *json)
 {
     ws_send_text_to_ws_clients(json);
-    ble::send_status(json);
+    // 长文本(如 AI 思考转发)单一 JSON 可达几十 KB, BLE 分片 notify 无意义且阻塞转发任务,
+    // 只在短文本(常规日志/状态)时走 BLE 兜底。
+    if (strlen(json) <= 512) ble::send_status(json);
 }
 
 // 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧；
@@ -906,7 +911,9 @@ static esp_err_t bmp_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     char ts[32];
-    snprintf(ts, 32, "%ld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
+    // tv_sec 是 time_t(64 位)而 long 只有 32 位: 用 %ld 读 64 位实参在 2038 前"碰巧"对,
+    // 属真 bug 而非风格问题(编译器在 -Wall 下会点出来)。
+    snprintf(ts, 32, "%lld.%06ld", (long long)fb->timestamp.tv_sec, (long)fb->timestamp.tv_usec);
     httpd_resp_set_hdr(req, "X-Timestamp", (const char *)ts);
 
 
@@ -945,39 +952,33 @@ static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_
 
 // /zoomshot: 对当帧按目标区域裁出放大 JPEG —— 手动"凑近看"两指与目标，等价于 AI 的 zoom。
 // 参数(GET query)：px,py=框中心(归一化 0~1，默认 0.5)；scale=倍率(框=全幅 1/scale，默认 2，上限 8)；
-// out_w/out_h=输出尺寸(像素，默认 320×240)；quality=JPEG 质量(默认 80)。
-// 复用 magnify::crop_to_jpg：它内部自持 cam 解码/编码共享锁，与 AI worker/mvfy 的软解并发互斥，安全。
+// out_w/out_h=输出尺寸(像素，默认 640×480)；quality=JPEG 质量(默认 80)。
 static esp_err_t zoomshot_handler(httpd_req_t *req)
 {
-    camera_fb_t *fb = cam::grab();
-    if (!fb || fb->format != PIXFORMAT_JPEG) {
-        if (fb) esp_camera_fb_return(fb);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    // request_hires(库正规切换路径)：reconfigure 重开 SVGA 高清 → 抓整幅高清帧 → 回 VGA，全程持锁。
+    // ⚠️ 用 SVGA(800×600) 而非 SXGA：SXGA(1280×960) 的 esp_camera_init 重建会把板子卡死(实测, 与
+    // TJpgDec 无关, 卡在驱动层)，SVGA 已验证 reconfigure 稳定。
+    // 高清帧用 TJpgDec 部分解码只取中央 (0.25,0.25)-(0.75,0.75) 并重编码回传 —— workbuf/RGB 全走 PSRAM，
+    // 不碰内部堆/DMA，规避"切分辨率缓冲溢出"与"软解整幅吃内部 RAM"两道卡死。
+    int hok = 0;
+    camera_fb_t *fb = cam::request_hires(FRAMESIZE_SVGA, &hok);
+    if (!fb || !hok) { if (fb) cam::return_frame(fb); httpd_resp_send_500(req); return ESP_FAIL; }
     const size_t w = fb->width, h = fb->height;
-    float px = 0.5f, py = 0.5f, sc = 2.0f;
-    int outw = 320, outh = 240, quality = 80;
+    int outw = 640, outh = 480, quality = 80;
     char qs[160];
     if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK) {
         char p[16];
-        if (httpd_query_key_value(qs, "px", p, sizeof(p)) == ESP_OK) px = constrain(atof(p), 0.0f, 1.0f);
-        if (httpd_query_key_value(qs, "py", p, sizeof(p)) == ESP_OK) py = constrain(atof(p), 0.0f, 1.0f);
-        if (httpd_query_key_value(qs, "scale", p, sizeof(p)) == ESP_OK) sc = constrain(atof(p), 1.0f, 8.0f);
-        if (httpd_query_key_value(qs, "out_w", p, sizeof(p)) == ESP_OK) { outw = atoi(p); if (outw <= 0 || outw > 4096) outw = 320; }
-        if (httpd_query_key_value(qs, "out_h", p, sizeof(p)) == ESP_OK) { outh = atoi(p); if (outh <= 0 || outh > 4096) outh = 240; }
+        if (httpd_query_key_value(qs, "out_w", p, sizeof(p)) == ESP_OK) { outw = atoi(p); if (outw <= 0 || outw > 4096) outw = 640; }
+        if (httpd_query_key_value(qs, "out_h", p, sizeof(p)) == ESP_OK) { outh = atoi(p); if (outh <= 0 || outh > 4096) outh = 480; }
         if (httpd_query_key_value(qs, "quality", p, sizeof(p)) == ESP_OK) { quality = atoi(p); if (quality < 1 || quality > 100) quality = 80; }
     }
-    float half = 0.5f / sc;   // 框 = 全幅的 1/scale（宽高各自）
-    float x0 = constrain(px - half, 0.0f, 1.0f), x1 = constrain(px + half, 0.0f, 1.0f);
-    float y0 = constrain(py - half, 0.0f, 1.0f), y1 = constrain(py + half, 0.0f, 1.0f);
-    size_t cap = (size_t)outw * outh + 512;
+    size_t cap = (size_t)outw * outh + 1024;
     uint8_t *out = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
-    if (!out) { esp_camera_fb_return(fb); httpd_resp_send_500(req); return ESP_FAIL; }
+    if (!out) { cam::return_frame(fb); httpd_resp_send_500(req); return ESP_FAIL; }
     size_t olen = 0;
-    bool ok = magnify::crop_to_jpg(fb->buf, cam::jpeg_len(fb), (int)w, (int)h,
-                                   x0, y0, x1, y1, out, cap, &olen, outw, outh, quality);
-    esp_camera_fb_return(fb);
+    bool ok = magnify::crop_center_jpg(fb->buf, cam::jpeg_len(fb), (int)w, (int)h,
+                                       out, cap, &olen, outw, outh, quality);
+    cam::return_frame(fb);   // 高清帧用完归还（锁已在 request_hires 内部放）
     if (!ok || olen == 0) { heap_caps_free(out); httpd_resp_send_500(req); return ESP_FAIL; }
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1015,7 +1016,9 @@ static esp_err_t capture_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     char ts[32];
-    snprintf(ts, 32, "%ld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
+    // tv_sec 是 time_t(64 位)而 long 只有 32 位: 用 %ld 读 64 位实参在 2038 前"碰巧"对,
+    // 属真 bug 而非风格问题(编译器在 -Wall 下会点出来)。
+    snprintf(ts, 32, "%lld.%06ld", (long long)fb->timestamp.tv_sec, (long)fb->timestamp.tv_usec);
     httpd_resp_set_hdr(req, "X-Timestamp", (const char *)ts);
 
     // X-Raw-Len = 驱动自己报的 fb->len（**未**经 jpeg_len 校正）。正文只发校正后的真实长度，
@@ -2040,6 +2043,20 @@ void startCameraServer()
     // httpd 默认栈偏小，WS 指令处理链（cmd::handle → 统一日志转发）加深易触发栈 canary 崩溃
     // （实测收到 spin 时 httpd 栈溢出），调大与 ws_stream 同级避免 WS 指令线程爆栈。
     config.stack_size = 8192;
+    // 会话槽占满时仍要能把新连接接进来：满则踢掉最久未用的那条会话。
+    // ⚠️ 否则只要有几个客户端把 max_open_sockets（默认 7）占满——典型是 /stream 的 MJPEG 长连接——
+    // **整个 80 端口**（含 /update 与 /ai_dump）就再也应答不了：板子活着、ping 通、81 端口 WS 照常，
+    // 唯独 HTTP 面锁死。而这块板**只能靠网络刷固件**，等于把自己锁在门外。
+    // 实测签名（2026-09-22）：重启后头几秒 `GET /update` 返回 200，客户端一重连就又全部超时；
+    // 期间 ping 3/3 通、套接字余 3~4、堆与 DMA 块健康、运行时长只增不减（没有重启 ⇒ httpd 没崩，
+    // 是**新连接进不来**）。长轮询本身有 15s 上限、不是元凶；占槽的是长连接会话。
+    // 代价是被踢的那条会话会断——调试板上用这点代价换"永远还刷得进去"，值。
+    config.lru_purge_enable = true;
+    // 80 假死的第二道闸：max_open_sockets 默认 7 @@ 太小。80 上的 /zoomshot、/capture、
+    // /runai_dump 这些重 handler 若并发堆积，或手机/多个客户端同时连，很快占满槽 → /update 进不去 → OTA 假死。
+    // 调大余量，并让 /stream 这类长连接不占满 80（/stream 本就在 81 的独立 server）。调大后每槽内存有增，
+    // 但相对内部堆余量可控。⚠️ 别超 16：每槽约 1KB 内部堆，应与 heap 预算一起看。
+    config.max_open_sockets = 10;
 
     httpd_uri_t index_uri = {
         .uri = "/",

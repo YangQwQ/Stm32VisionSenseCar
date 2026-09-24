@@ -40,9 +40,13 @@ inline constexpr float ARM_STALL_EPS_CM = 0.05f;
 // 现值是**实机逐点核过、落点无诊断**的一组：(8.0,1.0) → 实际落 (8,1)，pwm 170/232。
 inline constexpr float ARM_LOW_X_CM = 8.0f;
 inline constexpr float ARM_LOW_H_CM = 1.0f;
+// 固定抬臂位（arm 指令 act="raise" 的落点）：夹取后验证/看清爪下时一次到位（S 形缓动，
+// 非持续 lift_up 步进，天然不会在边界抽搐）。低姿位/折叠位之外的第三个固定位，实机复核后调。
+inline constexpr float ARM_RAISE_X_CM = 9.0f;
+inline constexpr float ARM_RAISE_H_CM = 9.0f;
 // 合爪后自动抬臂（arm 指令 act="grasp"）：合成一个动作省一轮往返，且抬升有界 —— 连续 lift_up
 // 抬到最高位会在机械止点附近抽搐（见 ARM_STEP_STALL_N），定量抬升天然避开。
-inline constexpr float GRASP_LIFT_CM = 5.0f;   // 合爪后抬起的高度
+inline constexpr float GRASP_LIFT_CM = 7.0f;  // 合爪后抬起的高度
 inline constexpr int   GRASP_SETTLE_MS = 250;  // 合爪到抬臂之间的等待（让夹爪真合到位再抬）
 // 低姿下**爪口中心相对车头轴线的横向偏置** cm（正=偏右）。机械臂只有前后+抬落两个自由度、横向
 // 为零，故"目标横向要对到哪儿"必须以爪口为准，而不是车头轴线 —— 摄像头与爪同装一车，爪口在画面
@@ -66,12 +70,26 @@ inline constexpr float SPIN_PIVOT_BEHIND_CM = 6.0f;
 inline constexpr int   SPIN_MIN_SPEED = 800;   // 低于此转速原地旋转拖不动，抬升到可靠值
 // 持续旋转（无定角）单次时限折算的最大角度：一圈足够环视，再多只是空烧（车尾还挂着充电线，缠住就走不动）。
 inline constexpr int   SPIN_CONT_MAX_DEG = 360;
-inline constexpr float MV_SPEED_X[] = { 0.25f, 0.5f,  1.0f };
-inline constexpr float MV_SPEED_Y[] = { 10.3f, 11.3f, 12.5f };
-inline constexpr float MV_COAST_X[] = { 0.25f, 0.5f,  1.0f };
+// ⚠️ 0.15 与 0.25 两档是 2026-09-22 真机实测重定的（各 cm=2/4/6/9 正反各一次，共 16 个样本，
+// 用板端同一单应反投影量位移）。这两档此前**全无实测依据**，而它们恰好是 AI 的唯一工作区间：
+// AI 近场发的油门是 0.1~0.25（实测 0.1/0.2），近场闸门更是把油门钉在 AI_NEAR_STEP_TH=0.25。
+//
+// 模型 actual = v·max(0, t − 死区)，分别拟合：
+//   th=0.15 独拟合 v=6.60 B=354ms RMSE 0.46cm（8 点，拟合很干净）
+//   th=0.25 独拟合 v=8.98 B=380ms RMSE 1.51cm（8 点，散布大，单独不足以定值）
+//   两档合并   v=7.80 B=370ms RMSE 1.24cm  ← 0.25 档采用这个（合并拟合、借 0.15 档的强度）
+// 依据：**同一个 ms 下两档的实测位移只差噪声**（都落在各自散布内）⇒ 该区间"油门"几乎不影响结果，
+// 结果由起步死区主导，两档本就统计上分不开，没理由给它们差 56% 的 v。
+// 旧值 10.3 让 2cm 指令只发 514ms、真走 ~1.1cm（残差最大的那个样本只走 0.16cm）—— 近场"时而不动、
+// 时而冲过头"的来路：AI 据记忆以为已顶到位（car_update_pose 按 distance_cm 累加），实际没动。
+// 0.5/1.0 档有各自的实测依据（见下面 c 的注释），未动、也别外推。
+inline constexpr float MV_SPEED_X[] = { 0.15f, 0.25f, 0.5f,  1.0f };
+inline constexpr float MV_SPEED_Y[] = { 6.6f,  7.8f,  11.3f, 12.5f };
+inline constexpr float MV_COAST_X[] = { 0.15f, 0.25f, 0.5f,  1.0f };
 // ⚠️ 0.5 档 2026-09-22 实测定距(理论:实际): 10:12 / 20:21.5 / 30:32.25 / 40:42 ⇒ 恒定超出约 1.75cm
 // (拟合 实际≈理论×1.0075+1.75, 斜率已准, 主要是起停余量偏小)。1.7 → 3.45。其余档未重测, 别外推。
-inline constexpr float MV_COAST_Y[] = { 0.0f,  3.45f, 1.75f };
+inline constexpr float MV_COAST_Y[] = { 0.0f,  0.0f,  3.45f, 1.75f };
+inline constexpr int   MV_N = (int)(sizeof(MV_SPEED_Y) / sizeof(MV_SPEED_Y[0]));
 // 定距脉冲的**起步死区**与**脉冲下限**（ms）。v/c 表是在**长脉冲**上拟合的，短脉冲会整段落进死区：
 // 实测（红灯斑点位移标定，throttle 0.35）指令 3cm(217ms)、5cm(404ms) 整车纹丝不动，8cm(684ms) 起才动，
 // 且每段都比指令少走 2~3.5cm —— 即每段脉冲开头都有一截"电机通电但车不动"的时间。
@@ -80,11 +98,16 @@ inline constexpr float MV_COAST_Y[] = { 0.0f,  3.45f, 1.75f };
 // 闸门都要求"近场单步≤2cm"，那个步长此前恰好整个落在死区里 —— 等于把最后 2cm 的对准变成空转。
 inline constexpr int   MV_START_MS = 320;      // 死区补偿：每段定距脉冲加上这段（它不产生位移）
 inline constexpr int   MV_MIN_PULSE_MS = 500;  // 脉冲下限：宁可多走一两厘米，也不能"指令走了、车没动"
-inline constexpr float SPIN_MSDEG_X[] = { 700.0f, 800.0f, 900.0f, 1000.0f };
-// ⚠️ 800 档原值偏慢近一倍：定角旋转经 SPIN_MIN_SPEED 抬升后就走这一档，实测「计划 45 度」确有转过头
-// 近一倍的情形（正反转各一次），故下调。整表只有该档有实测依据，其余档未重测、别按比例外推。
-// 真值以日志「mvfy 标定读数」的等效 ms/度为准确依据（重标：新值 = 旧值 × 目标角 / 实测角）。
-inline constexpr float SPIN_MSDEG_Y[] = { 53.5f,  15.0f,  13.9f,  8.65f };
+// 原地旋转：**角度→通电ms 查表插值**（spin_ms 直接测，重复执行累计到 90° 取平均）。
+// 实测曲线(用户 2026-09-24, spin_ms 直测)：
+//   t(ms)    1    10   15   25   50   100   500   750   2250  4500
+//   deg    0.96  2.2 3.25 4.5 6.43 10.56   40    60  173.1 337.5
+// 每度所需ms单调上升(启动瞬间快 ~1ms/°, 稳态 ~13ms/°) ⇒ 单斜率+滑行角公式无法拟合，查表最直接。
+// 表内角升序；目标角在表内线性插值、超出末点用末段斜率外推。0 点隐含 (0,0)。
+inline constexpr int   SPIN_TBL_N = 10;
+inline constexpr float SPIN_TBL_DEG[SPIN_TBL_N] = { 0.0f, 2.2f, 3.25f, 4.5f, 6.43f, 10.56f, 40.0f, 60.0f, 173.1f, 337.5f };
+inline constexpr int   SPIN_TBL_MS[SPIN_TBL_N]  = { 0,   10,    15,    25,   50,    100,    500,    750,    2250,   4500 };
+// ⚠️ 上述曲线在特定电池电压/地面下测得；电压下降转速变慢，长时漂移需重测(或走 mvfy 闭环)。
 
 // ---- 运动到位验证（motion_verify）软解缩略图与检测阈值 ----
 // 编译级总开关：置 0 可在不删代码的情况下完全禁用 mvfy（不创建任务、不参与取帧），
@@ -98,8 +121,17 @@ inline constexpr int   MVFY_SCALE         = 2;     // JPEG 软解缩放档（esp
 // （实测每拍 200~500ms，看日志的"抓/解"两列）。故它只占一小部分，调小是白捡一点、不是关键；
 // 关键在软解档 MVFY_SCALE。单拍位移要按**实际**节奏估，别按这个值估。
 inline constexpr int   MVFY_SAMPLE_MS     = 10;
-inline constexpr float MVFY_DIFF_LO       = 2.5f;  // 相邻采样灰差均值低于此值视为"画面没动"（灰度 0..255）
-inline constexpr int   MVFY_BLOCKED_N     = 3;     // move：连续 N 拍"没动"即判受阻
+// 判"画面到底动没动"的灰差门槛（灰度 0..255）。**这个值必须实测标定，凭直觉给必错**——
+// 它同时决定 move 的受阻停车、与 spin 的"画面已变却报零位移,疑重复花纹"交叉校验。
+// 2026-09-22 实测（场景：车被墙卡住、命令后退共 55cm 而画面对比证明实际位移≈0）：
+//     0 像素位移（真静止 / 被卡住，含轮子空转的车身抖动）  d = 8.9 ~ 15.8
+//     位移 1 缩略图像素（真在动的最低量）                  d = 20.0
+//     位移 2~3 像素（车的正常速度：约 10cm/s × 0.34s/拍）   d = 24 ~ 27
+// 门槛就取在这两个总体之间。⚠️ 旧值 2.5 比静止底噪还低 3.5 倍 ⇒ 恒判"在动" ⇒
+// move 的受阻停车曾是**死代码**（车被墙顶住空转磨满 3.2s 上限也没触发过一次），
+// spin 那条提示同理恒误报。改这个值前先按上面口径重测，别只调数字。
+inline constexpr float MVFY_DIFF_LO       = 18.0f; // 相邻采样灰差均值低于此值视为"画面没动"
+inline constexpr int   MVFY_BLOCKED_N     = 3;     // move：连续 N 拍"没动"即判受阻（约 1.0s）
 // 起步缓冲：只用来压住「受阻/卡死」的误判（起转瞬间画面在抖/糊，别急着判没动）。
 // ⚠️ 不要再拿它跳过转角累计：800 转速下 400ms ≈ 14 度，漏掉这段会让实测角系统性偏小，
 // 补偿便按"还差 14 度"多补一段 —— 表现为转得比不验证更久、更过头。
@@ -123,16 +155,10 @@ inline constexpr float MVFY_PATCH_VAR_LO  = 25.f;  // 基准块灰度方差下�
 // 远小于纹理能量自身；残差都超过纹理能量说明没匹配上（重复纹理/纯色/被遮挡）。别调紧到 0.5 以下——
 // 会连正常帧一起挡掉，样本数不够反而静默退回开环（等于没验证），排查时先看日志里的 n。
 inline constexpr float MVFY_MATCH_COST    = 1.0f;
-// 可信度门槛：样本数够 + 累计幅度够，才认这次实测角、才敢据它补转。阀门偏保守是有意的——
-// 测量不可信时退回开环（等于没这套验证），比按噪声补错方向安全。
-// 注意样本数下限不能按"想多要几个样本"来定：每拍 200~400ms、约 70 度/秒 → 一拍就是 15~28 度，
-// 一次 45 度旋转本就只有 2~4 拍。定成 4 会让所有短旋转都"样本不足"而永不验证（等于白装）。
-// 单拍已被严格档逐拍筛过，n=2 的累计也已可用。
-inline constexpr int   MVFY_SPIN_MIN_N    = 2;     // 累计角所需的最少有效样本数
-inline constexpr float MVFY_SPIN_TRUST_DEG = 5.f;  // 可信实测角的最小幅度（度）
 // 每拍原始匹配结果日志（dt/位移/匹配质量/判定）：调 mvfy 参数时置 1，看日志里单拍位移有多大、
-// 有多少拍被哪一条门槛挡掉。参数定稳后置 0 减少刷屏（转角/补偿/到位等结论日志不受影响）。
-inline constexpr int   MVFY_LOG_SAMPLES    = 1;
+// 有多少拍被哪一条门槛挡掉。参数定稳后置 0 减少刷屏。
+// 已置 0：每条指令几十行采样日志会把真正的结论行淹掉（复盘时按签名 grep 的效率全被它拖垮）。
+inline constexpr int   MVFY_LOG_SAMPLES    = 0;
 // 帧龄（抓帧时相机打的时间戳 → 本拍取用的间隔）分两档：
 //   FRESH = 排空兜底门槛：排空以"帧龄落进一个出帧周期内"为停手条件，出帧周期由相邻两抓的曝光差
 //           现测（见 motion_verify 的 grab_thumb）；测不出周期时才退回这个固定值。取值 ≈ 本机一个
@@ -152,28 +178,9 @@ inline constexpr int   MVFY_FRAME_AGE_MAX  = 800;
 // 何时会排空到底：mvfy 空闲时无人取帧，相机填满队列即停摆，队列里那几帧就此定格（实测见过帧龄 109s）；
 // 那时最后一抓会阻塞等相机出新帧（一个出帧周期），换来的是"基准帧尽量贴近起转时刻"。
 inline constexpr int   MVFY_GRAB_TRIES     = 4;
-inline constexpr float MVFY_SPIN_TOL_DEG  = 4.f;   // 旋转到位补偿容差（度）：剩余误差小于此值不再补转
-inline constexpr int   MVFY_SPIN_MAX_COMP = 2;     // 旋转到位补偿最大次数（防反复震荡拖长旋转）
-// 旋转到位补偿总开关：0 = 只测不补（默认）。实测角"可信"与"本身准不准"是两回事——补偿是拿实测值
-// **追加旋转**，测量一旦系统性偏小就朝同方向越补越多（一条 180° 指令能转出 300°+，看起来就是
-// "停不下来一直转"），而这套视觉测角尚未标定到位（用户明确提示"不一定可靠、没做好"）。
-// 关掉补偿后旋转仍是"按标定表时长到点自停"，确定性、有界；测量与"标定读数"日志照打，
-// 拿它对照表值判断准不准，确认可靠后再打开。
-#ifndef MVFY_SPIN_COMP_ENABLED
-#define MVFY_SPIN_COMP_ENABLED 0
-#endif
-// 补转时长换算：用首段实测出的"等效 ms/度"（计划时长 / 实测角），而**不是** SPIN_MSDEG 表值——
-// 表只是先验，实车与表差一倍以上时按表补转必然震荡：转过头 → 按表反向补又转过头 → 越补越偏。
-// 这两个倍数界定"实测等效值"的可信带，超出即判该次实测不可信、退回表值（宁可用先验，也别按野值补）。
-// 带要留宽：表本身就可能偏一倍以上，收窄会把真实偏差当噪声挡掉。
-inline constexpr float MVFY_RATE_LO_RATIO = 0.33f; // 实测等效值 / 表值 的下限
-inline constexpr float MVFY_RATE_HI_RATIO = 3.0f;  // 实测等效值 / 表值 的上限
-// 停轮后的沉降等待上限 ms（不是"必须等满"）：停轮瞬间还有滑行、且实测最多滞后一拍采样，
-// 立刻判定会把这段算成"没转够"而多补一截。窗口内 mvfy 继续采样累计，并尽可能提前收：
-// 一旦测到画面静止（滑行结束、累积角已定）就立刻判，只有迟迟测不到静止才等到这个上限。
-// 取值 ≈ 一次采样的最坏耗时（抓帧+软解 200~400ms）：再短会系统性漏掉尾部滑行 → 每次都多补。
-// ⚠️ 它拖的是"下一条指令的响应"，不是车轮转动时间（此时轮子已停）。
-inline constexpr int   MVFY_SPIN_SETTLE_MS = 400;
+// （旋转到位补偿那一套宏 —— MVFY_SPIN_TOL_DEG / MVFY_SPIN_MAX_COMP / MVFY_SPIN_COMP_ENABLED /
+//   MVFY_RATE_LO|HI_RATIO / MVFY_SPIN_SETTLE_MS —— 已整段删除。原因见 direct_exec.cpp 里
+//   s_spin_goal 上方的注释：mvfy 块匹配在白地砖上测角不可靠，补偿会朝错方向追加旋转。）
 inline constexpr int   MVFY_TASK_CORE     = 0;     // mvfy 软解独立任务所在核心（loop 在核心1，核心0 空闲）
 inline constexpr int   MVFY_TASK_STACK    = 16384; // mvfy 任务栈（jpg2rgb565 软解+串行匹配，给足防栈 canary）
 

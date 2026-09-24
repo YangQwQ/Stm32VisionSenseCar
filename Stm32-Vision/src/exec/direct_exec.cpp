@@ -94,21 +94,6 @@ static int16_t s_grasp_lift_cm = (int16_t)GRASP_LIFT_CM;
 // volatile：worker 任务 / loop(update_tick) / 命令回调跨核读写，防寄存器缓存读到旧值。
 static volatile unsigned long s_move_cap_until = 0;
 
-// 定角原地旋转的到位补偿状态（视觉闭环：到点停后用 mvfy 实测转角差值补转）。
-// mvfy 跨补偿段持续累积实测角；仅在测量可信（样本够、幅度够、方向与命令一致）时才按差值补转。
-static float s_spin_goal = 0;      // 定角目标（abs，度），0=无目标（持续旋转/无定角）
-static int   s_spin_dir = 0;       // 目标旋转方向（±1）
-static int   s_spin_speed = 0;     // 下发转速（残余补转同速）
-static int   s_spin_comp = 0;      // 补转次数（防反复震荡）
-// 本次旋转的"实测等效 ms/度"（首段按 计划时长/实测角 算出，见 spin_after_settle）。0=未知，用表值。
-// ⚠️ 补偿段必须用它而不是 SPIN_MSDEG 表：表只是先验，实车与表差一倍以上时，按表补转必然震荡
-// （转过头 45° → 按表反向补又转过头 45° → 越补越偏，最终比不验证还歪）。
-static float s_spin_rate = 0;
-// 到点停轮后的沉降截止（ms），0=不在沉降。停轮瞬间还有滑行、实测值也最多滞后一拍采样，
-// 立刻判残余会把这段算成"没转够"而多补一截 —— 故停轮后先等一段再判（见 spin_after_settle）。
-// 该截止是**上限**：mvfy 测到画面静止（mvfy::spin_settled()）即提前收口，不白等满。
-static unsigned long s_spin_settle_until = 0;
-
 static void drive_motors(int spd) {
   int16_t u = spd < 0 ? (uint16_t)-spd : (uint16_t)spd;
   bool rev = spd < 0;
@@ -121,13 +106,28 @@ static void drive_motors(int spd) {
 
 static void set_steer_pwm(int16_t p);  // 前向声明：send_spin 在回正转向轮时会调用
 
+// 原地旋转：目标角(deg) → 通电时长(ms)，查 SPIN_TBL_* 表线性插值（角升序，0 点隐含 (0,0)）。
+// 实测曲线启动段与稳态每度 ms 差异大，单斜率公式拟合不了，查表才跟得上（见 Calibration.h）。
+static long spin_ms_for(float deg) {
+  if (deg <= 0) return 0;
+  for (int i = 1; i < SPIN_TBL_N; i++) {
+    if (deg <= SPIN_TBL_DEG[i]) {
+      float t = (deg - SPIN_TBL_DEG[i-1]) / (SPIN_TBL_DEG[i] - SPIN_TBL_DEG[i-1]);
+      return SPIN_TBL_MS[i-1] + (long)(t * (SPIN_TBL_MS[i] - SPIN_TBL_MS[i-1]));
+    }
+  }
+  // 超出末点: 用末段斜率外推(大角度少见, 粗给即可)
+  float k = (float)(SPIN_TBL_MS[SPIN_TBL_N-1] - SPIN_TBL_MS[SPIN_TBL_N-2]) /
+            (SPIN_TBL_DEG[SPIN_TBL_N-1] - SPIN_TBL_DEG[SPIN_TBL_N-2]);
+  return SPIN_TBL_MS[SPIN_TBL_N-1] + (long)((deg - SPIN_TBL_DEG[SPIN_TBL_N-1]) * k);
+}
+
 // 原地旋转（普通四轮滑移式，无需特殊轮子）：左/右侧轮反向拖胎绕中心旋转。
 // dir=+1 左进右退=右转(顺时针) / -1 左退右进=左转(逆时针) / 0 停；speed=单车轮 pwm 0..1000。
 // 车轮映射与 drive_motors 一致：左轮 a 正前、右轮 b 正前，故 dir>0 统一写 (a,0)、dir<0 统一写 (0,b)。
 static void send_spin(const JsonObjectConst& p) {
   int dir = p["dir"] | 0;
   int spd = p["speed"] | 500;
-  s_spin_settle_until = 0;  // 新旋转指令作废上一轮待判的沉降（连同下方重置的补偿状态）
   // 原地旋转前必须回正转向轮（前轮直行位），否则拖胎方向不纯、转不正（Bug6）。
   // dir=0（停车）不动舵机，避免每次停转都无谓地 reset 转向。
   if (dir != 0 && s_steer != STEER_CENTER) {
@@ -147,30 +147,32 @@ static void send_spin(const JsonObjectConst& p) {
     nezha::set_motor(3, 0, u); nezha::set_motor(4, 0, u);
   }
   s_car_motion = 0;  // 原地旋转不算前进/后退
-  // 带 angle_deg = 定角微操：按时长近似自停（无里程计）+ mvfy 视觉到位补偿。记录目标/方向/转速。
+  // 带 angle_deg = 定角微操：按时长近似自停（无里程计，不闭环）。
   int ang = p["angle_deg"] | 0;
   if (ang > 720) ang = 720;  // 粗钳防超长时限（手机/AI 已限 0..500，仅兜底裸前端）
+  if (dir != 0) {
+    // 显式 ms(调试/标定口)优先: 直接指定通电毫秒自停, 不做角度换算与滑行角补偿 —— 标定"真实每度ms"用。
+    // angle_deg 可为 0(持续旋转口), 但带了 ms 就按定长精确到点自停, 不再落进"持续兜底"。
+    long msv = p["ms"].is<int>() ? (long)(p["ms"] | 0) : 0;
+    if (msv > 0) {
+      exec::set_move_cap_ms((int)msv);
+      mvfy::begin("spin", 0);
+      return;
+    }
+  }
   if (dir != 0 && ang > 0) {
-    s_spin_goal = ang; s_spin_dir = dir; s_spin_speed = spd; s_spin_comp = 0;
-    s_spin_rate = 0;   // 本次首段还没测过：等效速率待首段判残余时算出
-    long ms = (long)(ang * plerp(SPIN_MSDEG_X, SPIN_MSDEG_Y, 4, (float)spd));
+    // 目标角 → 通电时长：查表插值（见 spin_ms_for）。实测启动段与稳态速率差异大，查表最准。
+    long ms = spin_ms_for((float)ang);
     exec::set_move_cap_ms(ms > 0 ? (int)ms : 1);
     mvfy::begin("spin", (float)ang);
   } else if (dir == 0) {
-    // 停车：清掉定角目标与补偿状态
-    s_spin_goal = 0; s_spin_dir = 0; s_spin_speed = 0; s_spin_comp = 0;
     mvfy::end(); mvfy::consume();
   } else {
-    // 持续旋转（无定角）：只启动视觉测量，不做补偿。
-    // ⚠️ 必须给时限兜底：此前这一支不设 s_move_cap_until，车轮会**一直转到下一条指令**才停，而
-    // 下一条指令是 AI 的下一轮（秒级）—— 那段时间够转好几圈，且 car_update_pose 因 ang==0 不累积
-    // 车向，于是"真转了几圈、程序以为没转"，此后所有物体坐标的朝向基准全错（实测现象：原地连转
-    // 好几圈，转完再也找不到目标）。上限按"最多再转 SPIN_CONT_MAX_DEG 度"折算，到点自停，
-    // 与定距 move 的时限同一条兜底通路（到期 drive_motors(0)）。
-    long cms = (long)(SPIN_CONT_MAX_DEG * plerp(SPIN_MSDEG_X, SPIN_MSDEG_Y, 4,
-                                                (float)(spd > 0 ? spd : SPIN_MIN_SPEED)));
-    s_spin_goal = 0; s_spin_dir = dir; s_spin_speed = spd; s_spin_comp = 0;
-    s_move_cap_until = millis() + (unsigned long)(cms > 0 ? cms : 500);
+    // 持续旋转（无 angle_deg / 无 ms）：摇杆 SpinMode 的主入口(捏杆转、松手 spin(0) 停)。
+    // 不带任何"自动到点自停"的兜底: 一是它会骗人(用户以为只转一点、实际转 2.6s 半天)，
+    // 二是持续旋转本就不累积车向底座(car_update_pose 只在带 angle_deg 时 +转角)，转了也不进入
+    // 姿态基准，自动停毫无价值。靠显式 stop 或 spin(0) 收尾 —— 这是摇杆天然语义。
+    // AI 侧 spin 一律带 angle_deg(见 ai_client 补默认角)，走的是上面定角分支，不会进这里。
     mvfy::begin("spin", 0);
   }
 }
@@ -210,75 +212,6 @@ static void set_steer_pwm(int16_t p) {
   s_steer_dir = p == STEER_CENTER ? 0 : (p < STEER_CENTER ? 1 : 2);
 }
 
-// 定角旋转到点后的收尾判定（沉降窗口到期时由 update_tick 调一次，轮子此时已停）。
-// 用 mvfy 实测累计角算残余：需要且测得准就补转一段（返回 true=已重新驱动轮子），否则返回 false 收尾。
-static bool spin_after_settle(void) {
-  float got = mvfy::spin_delta_deg();          // mvfy 累计实测转角（有符号）
-  int   n   = mvfy::spin_delta_n();            // 累计所用有效样本数（无纹理/乱匹配的拍不计）
-  float want = s_spin_goal * (s_spin_dir > 0 ? 1.f : -1.f);  // 目标（带方向）
-  // 可信度门槛：模式在位 + 样本够 + 幅度够。测量不可信就退回开环（等于没这套验证），
-  // 比按噪声乱补安全——补偿是"锦上添花"，补错了反而比不补更差（会转过头且拖长）。
-  if (mvfy::mode() != mvfy::VERIFY_SPIN || n < MVFY_SPIN_MIN_N || fabsf(got) < MVFY_SPIN_TRUST_DEG) {
-    blog::logf(blog::EXEC, "mvfy 补偿跳过: 实测不足 got=%.1f n=%d tgt=%.0f", got, n, s_spin_goal);
-    return false;
-  }
-  // 方向自检：实测累计必须与命令方向同号。反号说明这批匹配不可信（画面静止/纹理重复/位移超出
-  // 搜索窗），此时宁可退回开环也不补转——否则会朝反方向补，越补越偏。
-  if (got * want <= 0.f) {
-    blog::logf(blog::EXEC, "mvfy 补偿跳过: 实测方向与命令不符 got=%.1f want=%.1f", got, want);
-    return false;
-  }
-  // 由首段（计划时长 / 实测角）定出本次旋转的"实测等效 ms/度"，供补偿段换算——只用一次，
-  // 后续补偿段沿用（同转速同地面）。实测不可信时退回表值，理由见 s_spin_rate 注释。
-  float tbl = plerp(SPIN_MSDEG_X, SPIN_MSDEG_Y, 4,
-                    (float)(s_spin_speed > 0 ? s_spin_speed : SPIN_MIN_SPEED));
-  if (s_spin_comp == 0) {
-    long plan_ms = (long)(s_spin_goal * tbl);  // 首段旋转的计划时长（与 send_spin 同式）
-    float eq = (float)plan_ms / fabsf(got);
-    bool sane = eq >= tbl * MVFY_RATE_LO_RATIO && eq <= tbl * MVFY_RATE_HI_RATIO;
-    s_spin_rate = sane ? eq : tbl;
-    // 标定读数：SPIN_MSDEG 表准不准就看这行（重标用 新值 = 旧值 × 目标角 / 实测角）。
-    blog::logf(blog::EXEC, "mvfy 标定读数: %ldms 实测 %.1f° → 等效 %.1f ms/度（表值 %.1f，实车偏%s%s）",
-               plan_ms, fabsf(got), eq, tbl, eq < tbl ? "快" : "慢",
-               sane ? "" : "；超可信带,补偿改用表值");
-  }
-  // 补偿总开关（默认关，见 Calibration.h MVFY_SPIN_COMP_ENABLED）：只测不补。放在"标定读数"之后、
-  // 残余计算之前 —— 读数照打（它是判断实测准不准的唯一依据），但绝不据它追加旋转：测量偏小时补偿会
-  // 朝同方向越补越多，而旋转是车尾挂着充电线时最危险的动作（缠住就走不动）。
-  if (!MVFY_SPIN_COMP_ENABLED) {
-    blog::logf(blog::EXEC, "mvfy 补偿已关闭: 保持开环到点自停, got=%.1f want=%.1f", got, want);
-    return false;
-  }
-  float residual = want - got;                 // 残余（正=没转够，负=转过头）
-  if (fabsf(residual) <= MVFY_SPIN_TOL_DEG) {
-    blog::logf(blog::EXEC, "mvfy 到位: got=%.1f want=%.1f 残差=%.1f 在容差内", got, want, residual);
-    return false;
-  }
-  if (s_spin_comp >= MVFY_SPIN_MAX_COMP) {
-    blog::logf(blog::EXEC, "mvfy 补偿达上限(%d 次): got=%.1f want=%.1f 残差=%.1f",
-               s_spin_comp, got, want, residual);
-    return false;
-  }
-  s_spin_comp++;
-  // 补转方向 = 残余的符号本身：residual = want - got 就是"还差的带符号转角"，>0 还差右转、<0 还差左转。
-  // ⚠️ 别写成"residual>0 沿原方向、否则反向"——那只对右转成立：左转时 want/got 均为负，
-  //   没转够的 residual 也是负的，按原方向本该继续左转，这类写法会判成"走回头"而朝右补，越补越偏。
-  int ndir = residual > 0 ? 1 : -1;
-  uint16_t u = (uint16_t)s_spin_speed;
-  if (s_spin_speed <= 0) u = SPIN_MIN_SPEED;
-  if (ndir > 0) { nezha::set_motor(1,u,0); nezha::set_motor(2,u,0); nezha::set_motor(3,u,0); nezha::set_motor(4,u,0); }
-  else          { nezha::set_motor(1,0,u); nezha::set_motor(2,0,u); nezha::set_motor(3,0,u); nezha::set_motor(4,0,u); }
-  s_spin = ndir;
-  s_car_motion = 0;
-  mvfy::begin("spin", 0, true);   // 续测：同模式不重置角度累计，只把"卡死"判定恢复正常
-  // 换算用首段实测等效值（s_spin_rate，见其注释），不是表值：表偏一倍时按表补会来回震荡。
-  long ms = (long)(fabsf(residual) * (s_spin_rate > 0 ? s_spin_rate : tbl));
-  s_move_cap_until = millis() + (unsigned long)(ms > 0 ? ms : 40);
-  blog::logf(blog::EXEC, "mvfy 补偿: got=%.1f want=%.1f → 补 %.0f°(按 %.1f ms/度) n=%d",
-             got, want, fabsf(residual), s_spin_rate > 0 ? s_spin_rate : tbl, s_spin_comp);
-  return true;
-}
-
 void exec::init(void) {
   // 惰性：nezha::init 幂等。回中四个舵机 + 电机 0。
   bivar::arm_init();   // 校验机械臂夹心标定散点并置 ready（setup 期调用一次，幂等）
@@ -287,13 +220,18 @@ void exec::init(void) {
   s_lift  = LIFT_CENTER;   write_lift();
   s_grip  = GRIP_CENTER;   write_grip();
   drive_motors(0);
+  // 灯复位: 哪吒扩展板的灯由**它自己的硬件寄存器**保持(不经本 MCU GPIO), MCU 重启/重新烧录后,
+  // 灯在上一次的状态里**仍然亮着**, 而本板 s_light_* 记忆在重启后是不会自己变 false 的 —— 于是"灯
+  // 实际亮着、状态却记成灭", 手机/状态位跟灯对不上(烧录后发现灯亮着但状态不同步, 就是这个)。
+  // 这里主动关三盏灯并清记忆: 重启/回正 = 回到"灯灭 + 状态灭"的一致初始态(清晰直观, 符合直觉)。
+  nezha::led("front", false); nezha::led("vibe", false); nezha::led("back", false);
+  s_light_front = false; s_light_vibe = false; s_light_back = false;
 }
 
 void exec::reset(void) {
   s_car_motion = 0;
   s_spin = 0;
   s_move_cap_until = 0;
-  s_spin_settle_until = 0;
   clear_active();
   clear_grasp_pending();
   s_arm_rej.armed = false;  // 回正清掉旧的"目标不可达"诊断，避免状态残留误导
@@ -309,8 +247,6 @@ void exec::update_tick(void) {
     s_car_motion = 0;
     s_spin = 0;
     s_move_cap_until = 0;  // 同时清掉可能正在倒计时的定距/定角时限，避免误重写
-    s_spin_settle_until = 0;
-    s_spin_goal = 0; s_spin_dir = 0; s_spin_speed = 0; s_spin_comp = 0;
     mvfy::end();
     blog::logf(blog::EXEC, "mvfy: 视觉判定受阻/转不大, 已停轮");
   }
@@ -320,36 +256,8 @@ void exec::update_tick(void) {
     drive_motors(0);
     s_car_motion = 0;
     s_spin = 0;  // 原地旋转定角到点也一并复位，避免状态误报"仍在原地转"
-    if (s_spin_goal > 0) {
-      // 定角旋转到点：先停轮，再留沉降窗口，到期才判残余（两段式，见 s_spin_settle_until 注释）。
-      // 窗口内 mvfy 继续采样累计；spin_stop 暂停"卡死"判定（轮子已停、画面本就不动，否则误报）。
-      mvfy::spin_stop();
-      s_spin_settle_until = millis() + (unsigned long)MVFY_SPIN_SETTLE_MS;
-    } else {
-      // 定距 move / AI 时限兜底：直接收尾，视觉测量一并结束。
-      // （曾只在 spin 分支结束：定距 move 时 s_spin_goal/s_spin_dir 恒为 0 → mvfy 继续
-      //   按采样周期软解打日志，直到"受阻"误判才停。）
-      mvfy::end();
-      s_spin_goal = 0; s_spin_dir = 0; s_spin_speed = 0; s_spin_comp = 0;
-    }
-  }
-  // 沉降窗口收口：判"补转残余"还是"收尾"。spin_after_settle 返回 true 表示已发起补转
-  // （s_move_cap_until 已续上，交给下一轮到点+沉降再判）。
-  // 两个出口：mvfy 拍到"画面静止"（滑行结束、累积角已定）就提前收——再等只是白拖时间；
-  // 或等到上限（迟迟测不到静止时的兜底，避免整条指令被拖住）。
-  if (s_spin_settle_until != 0 &&
-      (mvfy::spin_settled() || (long)(millis() - s_spin_settle_until) >= 0)) {
-    bool by_still = mvfy::spin_settled();
-    long left = (long)(s_spin_settle_until - millis());
-    s_spin_settle_until = 0;
-    // 这一行是沉降窗口够不够用的判据：总报"超时"说明窗口内压根没测到静止（尾部滑行可能漏测）。
-    blog::logf(blog::EXEC, "mvfy 沉降收口: %s（等到 %ldms/%dms）",
-               by_still ? "画面已静止" : "超时未静止",
-               (long)MVFY_SPIN_SETTLE_MS - (left > 0 ? left : 0), MVFY_SPIN_SETTLE_MS);
-    if (!spin_after_settle()) {
-      mvfy::end();
-      s_spin_goal = 0; s_spin_dir = 0; s_spin_speed = 0; s_spin_comp = 0;
-    }
+    // 到点收尾（定角 spin / 定距 move / AI 时限兜底走同一条通路）：停轮 + 结束视觉测量。
+    mvfy::end();
   }
   // arm grasp 第二步：合爪等够时间后自动定量抬臂（起点锚在舵机真实位置，见 setup_active）。
   if (s_grasp_lift_at != 0 && (long)(millis() - s_grasp_lift_at) >= 0) {
@@ -392,13 +300,19 @@ void exec::update_tick(void) {
   } else {
     s_claw_x = tx; s_claw_h = th;     // 反算越数据范围读不到：回退用目标（夹紧后仍 push）
   }
-  // 到边界即停：连续 N 拍 FK 回读几乎不动，说明已顶到机械/可达域边界，再推只是让 arm_pose 反复
-  // 重解同一个位姿 —— 最高位附近散点稀疏，IDW 会在两个解之间来回跳，舵机就嗡嗡抽搐（实测只在
-  // 抬到最高位时出现）。这里主动停，和"收到 stop(scope=arm)/新离散动作"是同一条清场路径。
+  // 到边界即停：连续 N 拍"被步进的那一轴"FK 回读几乎不动，说明已顶到机械/可达域边界，再推只是让
+  // arm_pose 反复重解同一个位姿 —— 最高位附近散点稀疏，IDW 会在两个解之间来回跳，舵机就嗡嗡抽搐
+  // (实测只在抬到最高位时出现)。这里主动停，和"收到 stop(scope=arm)/新离散动作"是同一条清场路径。
+  // ⚠️ 判定只看**被步进的那一轴**(抬升=这拍 s_claw_h 变 → 看 h；移爪=看 x)，**不看保持轴**：
+  //   保持轴维持命令值、但 arm_pose 每次反解写入的 PWM 在可达域边界附近外插抖动会让 FK 回读跟着微动
+  //   (实测 ±0.03~0.08cm)，若把两轴做成"且"关系，保持轴的噪声会把 stall 计数屡屡清零 → 到顶永远判不出来，
+  //   持续步进就抽插。分轴判据让"动的那轴到位" 独立成立。
   {
     static float s_last_fk_x = -999, s_last_fk_h = -999;
     static int s_fk_stall = 0;
-    if (fabsf(rxx - s_last_fk_x) < ARM_STALL_EPS_CM && fabsf(rhh - s_last_fk_h) < ARM_STALL_EPS_CM) {
+    bool moving_h = (s_active.axis == 1);   // 被步进的是抬落(h)轴(否则是移爪 x 轴)
+    float dv = moving_h ? fabsf(rhh - s_last_fk_h) : fabsf(rxx - s_last_fk_x);
+    if (dv < ARM_STALL_EPS_CM) {
       if (++s_fk_stall >= ARM_STEP_STALL_N) {
         blog::logf(blog::EXEC, "连续动作已到边界(FK 连续 %d 拍停在 (%.1f,%.1f)), 停止步进",
                    s_fk_stall, rxx, rhh);
@@ -454,10 +368,10 @@ static void send_arm(const JsonObjectConst& p) {
     s_grip = GRIP_CLOSE; write_grip();
   } else if (!strcmp(act_, "grasp")) {
     // 夹取+抬臂组合（合爪 → 等舵机合到位 → 定量抬升）：一步到位省一轮云端往返。
-    // 抬升量有界（GRASP_LIFT_CM 或调用方给的 dist_cm），不会像持续 lift_up 那样顶到机械止点抽搐。
+    // 抬升量固定（GRASP_LIFT_CM），不会像持续 lift_up 那样顶到机械止点抽搐。
     clear_active();
     s_grip = GRIP_CLOSE; write_grip();
-    s_grasp_lift_cm = (int16_t)(has_dist && dist > 0 ? dist : (int)GRASP_LIFT_CM);
+    s_grasp_lift_cm = (int16_t)GRASP_LIFT_CM;
     s_grasp_lift_at = millis() + (unsigned long)GRASP_SETTLE_MS;
   } else if (!strcmp(act_, "release")) {
     clear_active();
@@ -473,12 +387,32 @@ static void send_arm(const JsonObjectConst& p) {
   }
 }
 
+// 定距指令的油门要**先于写电机**定下来，且写电机与算时长必须用**同一个**油门，否则模型不自洽。
+// 为什么必须按距离降档：`plerp` 在首档以下整段钳位，而各档的起停余量 c 相差很大（0.5 档 c=3.45cm）。
+// cm ≤ c(a) 时 target 被算成 0 ⇒ 脉冲塌成 MV_MIN_PULSE_MS 的**满油门一冲** —— 那已经不是"走 2cm"了，
+// 而 AI 仍以为自己在做厘米级微调。降档后取 c 小于本次距离的最低已标定档，距离才真的对得上。
+// 档位只在标定表内取；请求油门低于最低档（AI 偶发 0.1）时抬到最低档 —— 低于它的速度没有实测值，
+// 照原样发等于把"指令走了、车没动"重新引入一遍（表外不外推）。
+static float pick_throttle_for(float a, int cm) {
+  for (int i = MV_N - 1; i >= 0; i--) {
+    if (MV_SPEED_X[i] > a + 1e-4f) continue;   // 只降不升（除下面的兜底）
+    if (MV_COAST_Y[i] < (float)cm) return MV_SPEED_X[i];
+  }
+  return MV_SPEED_X[0];
+}
+
 static void send_move(const JsonObjectConst& p) {
   float th = p["throttle"] | 0.0f;
   float st = p["steering"] | 0.0f;
+  int cm = p["distance_cm"] | 0;
+
+  float a = fabsf(th); if (a > 1.0f) a = 1.0f;
+  if (cm > 0 && a > 0.001f) {
+    a = pick_throttle_for(a, cm);
+    th = th < 0 ? -a : a;   // 写回，使 PWM 与下面计时的油门是同一个值
+  }
 
   if (fabsf(th) > 0.001f) {
-    float a = fabsf(th); if (a > 1.0f) a = 1.0f;
     int16_t spd = (int16_t)(a * 1000.0f + 0.5f);
     if (th < 0) spd = -spd;
     drive_motors(spd);
@@ -492,20 +426,17 @@ static void send_move(const JsonObjectConst& p) {
     set_steer_pwm((int16_t)(STEER_CENTER + s * 30.0f));
   }
   s_spin = 0;  // 常规行驶（move）接管后清除原地旋转
-  s_spin_settle_until = 0;
-  s_spin_goal = 0; s_spin_dir = 0; s_spin_speed = 0; s_spin_comp = 0;  // move 接管：清掉旋转补偿目标
   // 运动到位验证：车轮在动即开始检测（画面无变化判定受阻；手动摇杆同模式重发不重置）。
   if (fabsf(th) > 0.001f) mvfy::begin("move");
   else { mvfy::end(); mvfy::consume(); }
-  // 带 distance_cm = 定距微操：本板无里程计，按时长近似自停。实测 actual≈v·t+c，
-  // v/c 都随油门插值标定表（对油门不敏感），时长=(cm-c)/v。
-  // ⚠️ 再补死区与脉冲下限（见 Calibration.h 的 MV_START_MS）：v/c 表拟合自长脉冲，短脉冲整段落在
-  // 起步死区里 —— 车一动不动，而 car_update_pose 照样按 distance_cm 累加 → AI 记忆与实际分家。
-  int cm = p["distance_cm"] | 0;
-  float a = fabsf(th); if (a > 1.0f) a = 1.0f;
+  // 带 distance_cm = 定距微操：本板无里程计，按时长近似自停。实测 actual≈v·(t−死区)+c，
+  // v/c 随油门插值标定表，时长 = MV_START_MS + (cm−c)/v。
+  // ⚠️ 两处都别省：v/c 表拟合自长脉冲，短脉冲会整段落在起步死区里 —— 车一动不动，而
+  // car_update_pose 照样按 distance_cm 累加 → AI 记忆与实际分家（空夹的主要来路）。
+  // 油门 a 已在上面按距离定过档，这里直接用同一个值。
   if (cm > 0 && a > 0.001f) {
-    float v = plerp(MV_SPEED_X, MV_SPEED_Y, 3, a);
-    float c = plerp(MV_COAST_X, MV_COAST_Y, 3, a);
+    float v = plerp(MV_SPEED_X, MV_SPEED_Y, MV_N, a);
+    float c = plerp(MV_COAST_X, MV_COAST_Y, MV_N, a);
     float target = cm > c ? cm - c : 0.0f;
     long ms = MV_START_MS + (long)(target / v * 1000.0f);
     if (ms < MV_MIN_PULSE_MS) ms = MV_MIN_PULSE_MS;
@@ -522,8 +453,6 @@ static void send_stop(const JsonObjectConst& p) {
     drive_motors(0);
     s_car_motion = 0;
     s_spin = 0;
-    s_spin_settle_until = 0;
-    s_spin_goal = 0; s_spin_dir = 0; s_spin_speed = 0; s_spin_comp = 0;  // stop 轮子：不再做旋转补偿
     mvfy::end(); mvfy::consume();  // 停止轮子：结束到位验证，释放帧缓冲预算
   }
 }
@@ -632,6 +561,20 @@ bool exec::arm_low(void) {
   return ok;
 }
 
+bool exec::arm_raise(void) {
+  // 固定抬臂位：一次离散定位到标定过的固定高位（Calibration.h ARM_RAISE_*）。
+  // 与持续 lift_up 的区别：arm_pose 是单发目标（update_tick 里 S 形缓动追到位），
+  // 不会像连续步进那样在边界 IDW 反解两解间来回跳、舵机抽搐。
+  clear_active();   // 与其它臂指令一致：先清残留持续步进
+  clear_grasp_pending();
+  s_folded = false;
+  bool ok = exec::arm_pose(ARM_RAISE_X_CM, ARM_RAISE_H_CM);
+  float rx = 0, rh = 0;
+  if (exec::arm_pos(&rx, &rh)) { s_claw_x = rx; s_claw_h = rh; }
+  else { s_claw_x = ARM_RAISE_X_CM; s_claw_h = ARM_RAISE_H_CM; }
+  return ok;
+}
+
 bool exec::arm_pos(float* x, float* h) {
   // 与 read_state 同源：报"当前命令的 pwm"的 FK（不是缓动途中的中间值），上层据此判"爪是否真的
   // 停在目标身上"时，看到的和自己读状态行是同一个数。标定未就绪返回 false（调用方按未知处理）。
@@ -691,6 +634,18 @@ bool exec::is_continuous(const char* type, const JsonObjectConst& p) {
 }
 
 bool exec::wheels_moving() { return s_car_motion != 0 || s_spin != 0; }
+
+bool exec::arm_moving() {
+  // 机械臂还在动的情形有三类，各自与 wheels_moving()（只盯轮子 PWM）完全无关，缺一不可：
+  // ① s_active.axis >= 0：持续步进（lift_up/down、reach_fwd/bwd）进行中，逐拍 arm_pose 定位。
+  // ② s_grasp_lift_at != 0：grasp 合爪后正等待定时抬臂（第二步还没发起），画面仍在"夹起过程"中。
+  // ③ S 形缓动未收敛：离散定位（fold/arm_pose/reset/init）在 update_tick 里把已写值 s_reach_w /
+  //    s_lift_w 缓动追向目标 s_reach / s_lift，未追到就说明臂还没停。grasp 第二步的 lift 也走这路。
+  // 只要有一类存在，臂就在动 —— AI 出帧若不等它会拍到"夹起过程"的中间态画面。
+  if (s_active.axis >= 0) return true;
+  if (s_grasp_lift_at != 0) return true;
+  return (s_reach_w != s_reach) || (s_lift_w != s_lift);
+}
 
 bool exec::grip_closing() { return s_grip == GRIP_CLOSE; }
 

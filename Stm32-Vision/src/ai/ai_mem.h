@@ -24,6 +24,23 @@ const float AI_GRASP_FWD_MAX = 22.0f;
 // 全都从这条缝里放行。协调误差(单应解算 + 模型自估)在厘米级, 故留 1.5cm 而不是更紧。
 const float AI_GRASP_LAT_MAX = 1.5f;
 
+// 近场与"已到车头/爪后"的距离口径(车头系 前 cm)。**放这里是为了只有一份**: 闸门(ai_client)与
+// 记忆行里那句"看不见该怎么办"(ai_mem 的 mem_feed)必须说同一个数 —— 否则 AI 读到的处方和程序
+// 拦它的线对不上, 它会照着一个程序不认的距离去动作(同源不变量, 见 CLAUDE.md)。
+// 近场线: 与 approach 的停距同值同口径(见 ai_client 的 AI_NEAR_FWD_CM 注释)。
+const float AI_NEAR_FWD_CM = 15.0f;
+// 已到车头/爪后: 报告的 7cm 折算成真距约 5cm, 已越过低姿爪口(ARM_LOW_X_CM=8) ⇒ 方块在臂下。
+const float AI_ARM_UNDER_CM = 7.0f;
+// 上面那条的**迟滞出门线**(施密特): 进门 ≤7cm, 要退到 10cm 以外才算真出去, 中间维持上一轮判定。
+// 为什么不用"连续两轮都成立"去抖: 判据是单条观测的厘米坐标, 这一带解算误差就有 ±10cm 量级, 融合
+// 估计在门线附近来回跳(实测 5.5/6.7/8.5cm), "连续两轮"永远凑不满 ⇒ 每轮都不发处方, 而相反的建议
+// 一轮不落地发出去, AI 就在"前进1cm/后退3cm"之间蹭(实测 50 秒一次夹取都没试)。见 ai_client 的用法。
+// ⚠️ 出门线别取到 AI_NEAR_BLIND_CM(12): 那正是**方块已在两指之间**时坐标会报的值(高报 ⇒ 真距 8cm 报
+// 约 12cm), 一进迟滞带就把"已对准"也吞进去, 于是 AI 会在对齐好的那一刻被赶去收臂后退, 反而夹不上。
+// ⚠️ mem_feed 的丢失文案也拿它当分档线(理由见 ai_mem.cpp): 迟滞只要开着, ufwd 就 ≤ 这条线, 于是
+// "程序说在臂下"与"记忆行说在臂下"永远同时成立, 不会出现一个让抬臂后退、另一个让顶进的情形。
+const float AI_ARM_UNDER_EXIT_CM = 10.0f;
+
 // 横向的**硬**阈值(同样相对爪口, cm): 超过它就不是"没对准"而是"物理上夹不到", 合爪一律拦下。
 // 与 AI_GRASP_LAT_MAX 的分工: 那个是**提醒线**(放行 + 让 AI 自己看画面修), 这个是**拦截线**;
 // 只在合爪(clip/grasp)上判, **不拦 arm low** —— 降爪是准备动作, 拦它等于不让 AI 降爪。
@@ -59,8 +76,21 @@ bool mem_observe(const char* name, bool visible, float rel_deg, float dist_cm);
 bool mem_observe_xy(const char* name, bool visible, float px, float py);
 // 生成喂给 AI 的空间记忆文本(当前车头局部系精确坐标)。
 void mem_feed(char* buf, size_t cap);
+// 记忆里有没有**可用**的物体(观测过、且没旧到喂不回去)。供"还没锁定任何目标"这类引导语判断:
+// 过滤条件与 mem_feed 逐字同源, 免得程序说"没有目标"而同一轮的记忆行里明明列着一个。
+bool mem_have_any();
+// 是否存在"曾被正确观测过、但现已不可见(被标记丢失)"的物体: stale 已超新鲜线(AI_GRASP_STALE)但
+// 记录仍在 —— 即 mem_feed 里会显示"已N轮未见/位置过时"的那一类。与 mem_have_any()(完全没可用目标)
+// 是两种不同情形: 这个回答的是"有物体, 只是最近看不到了", 供"目标可能被机械臂遮挡"这类提示判断。
+// 过滤条件与 mem_grasp_evidence 的"新鲜"线同源(stale > 新鲜线 ⇒ 夹取依据也已过期, 闸门会拒)。
+bool mem_have_lost();
 // 在物体记忆表里定位目标全局坐标。
 bool mem_find(const char* name, float* tx, float* ty);
+// 这条记忆最近一次是"判历史已失效 ⇒ 整条重置"来的吗(见 ai_mem.cpp 的离群判定②)。
+// 重置后这条坐标只由**一条曾被判离群**的观测撑着 —— 是记忆里最不可信的一种。供 approach 拦"照它
+// 开环赶路": navigate_to 是全盲死航, 拿一条错的坐标冲过去不会顶偏, 而是**直接顶到方块**上。
+// 一轮之后正常观测落地即自动解除(那时它已有两条互相支持), 不会把 approach 长期锁死。
+bool mem_untrusted(const char* name);
 // 夹取依据(arm_pose 下探 / arm clip 的闸门用): 从记忆里挑"最近 AI_GRASP_STALE 轮内被画面看到过"
 // 的那个物体(最新鲜优先, 同龄取最近观测的), 输出名字、距上次看到几轮、当前车头系坐标(前+/右+)。
 // ⚠️ 坐标取的是**融合中位数**——与 mem_feed 喂给 AI 的是同一个数, 这条同源关系是硬不变量:

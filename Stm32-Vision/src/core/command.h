@@ -19,8 +19,11 @@ void handle(const char* json, bool has_frames, ReplyFn reply, void* reply_ctx);
 bool streaming();
 void set_streaming(bool on);
 
-// 使最新 WiFi 配置生效：在线重建 STA 连接（不重启，BLE 保活）。
-// BLE 配网写 SSID/PASS 后由 ble 调用；command 的 config 分支内部亦调用。
+// 使最新 WiFi 配置生效：在线重建 STA 连接（不重启，BLE 保活）。调用方（ble 配网写 SSID/PASS 后、command 的 config 分支）调用。
 void apply_network();
+
+// 合成板端状态位字节（bit0 前灯 / bit1 震灯 / bit2 背灯 / bit3 夹爪夹紧 / bit4 AI busy）。
+// WS 的 reply_status 与会话回执已附带；BLE 的 build_status 也用它，让蓝牙下灯/夹爪/AI 能与 WS 走同一套同步。
+uint8_t state_bits();
 
 }  // namespace cmd

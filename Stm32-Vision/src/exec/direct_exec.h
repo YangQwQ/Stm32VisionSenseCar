@@ -23,6 +23,9 @@ bool arm_pose(float x, float h);
 // 低姿夹取准备位：夹心降到 Calibration.h 的 ARM_LOW_X_CM/ARM_LOW_H_CM（实测过的固定低姿）。
 // 降到这儿后靠车的前后移动把目标送进两指之间（机械臂不能左右移动）。不可达返回 false。
 bool arm_low();
+// 固定抬臂位：夹心移到 Calibration.h 的 ARM_RAISE_X_CM/ARM_RAISE_H_CM（固定高位）。
+// 一次离散定位（S 形缓动），非持续步进，不会在边界来回抽搐。不可达返回 false。
+bool arm_raise();
 // 夹心当前位姿（对当前命令的 pwm 做正运动学回读，与状态行同源）。供上层判"爪是否真的在目标身上"。
 // 标定未就绪返回 false（此时调用方应按"位置未知"处理，不要据此拒绝动作）。
 bool arm_pos(float* x, float* h);
@@ -30,6 +33,10 @@ bool arm_pos(float* x, float* h);
 bool is_continuous(const char* type, const JsonObjectConst& params);
 // 当前是否有轮子/原地旋转在动（定距 move / spin 的到段等待用）。返回是否在转。
 bool wheels_moving();
+// 机械臂（移爪/抬落两个舵机，含 grasp 的"合爪后自动抬臂"）当前是否还在动。
+// 供 AI 出帧前等机械臂动作到位再取帧：离散定位走 S 形缓动、持续步进逐拍、grasp 合爪后按定时抬臂，
+// 三者都不被 wheels_moving() 覆盖 —— 不查它就可能在臂没停时抓帧，导致"夹起前后画面几乎一样"。
+bool arm_moving();
 // 给 AI 的持续 move 设一个行驶时限（ms，>0 到期自动停轮；<=0 关闭不限时）。
 // 无里程计兜底：AI 决策间隔可达数秒，避免持续 move 在两次决策间一直冲撞墙。
 void set_move_cap_ms(int ms);

@@ -10,36 +10,24 @@
 
 // 物体记忆表(通用: AI 觉得值得记的都记)。程序存全局坐标, 喂给 AI 时一律换算成
 // "当前车头局部系"(相对车头角度+距离), AI 零换算。stale=每轮未观测+1(过期不清空)。
-// 每条保留最近 AI_OBS_N 次观测, 取中位数融合——DeepSeek 单次报的像素/角度方差大
-// (轮间跳变、reason 与 observe 字段不一致), 中位数对单次离谱值鲁棒, 防记忆被污染。
 #define AI_MEM_MAX 8
-#define AI_OBS_N 5
 // 记忆喂回时效: 未观测轮数 ≤前者仍给精确坐标(供快速找回); 之间只提示"最近未见"不给坐标,
 // 避免 AI 长期拿过时坐标去猜; 超过后者彻底不再喂。辨识: 活跃目标一轮一刷 stale≈1。
 #define AI_MEM_FEED_STALE 10
 // 给精确坐标的时效: 直接取夹取闸门那个时效(ai_mem.h 的 AI_GRASP_STALE), 于是 AI 看到记忆行给了
 // 厘米坐标就一定能夹、看到"已N轮未见"就一定会被拒, 提示词/记忆行/闸门三者一一对应。
 #define AI_MEM_COORD_STALE AI_GRASP_STALE
-// 本次观测与融合坐标差超过此值就进**离群判定**(cm): 取一个明显大于单次观测噪声、又明显小于
-// "夹不住"的量级 —— 方块才 2~3cm 宽, 差 5cm 已经是"记忆说在这边、画面说在那边"了。
-#define AI_MEM_DRIFT_WARN_CM 5.0f
-// 判"连续两次被拒的观测互相吻合"的距离(cm): 两次都离谱、但彼此落在这么近, 才认它俩说的是同一个
-// 新位置(方块被爪推动时正是这个签名)。取略大于方块尺寸、又远小于离群阈值的值 —— 实测坏观测的散布
-// 能到 24cm(同一方块、车没动, 前距报出 3.7~27.9cm), 所以"两次都离谱且彼此差得远"不算吻合, 继续拒。
-#define AI_MEM_REJECT_AGREE_CM 3.0f
 static struct {
   char name[16];
-  float gx, gy;        // 全局坐标 cm(由观测中位数合成)
+  float gx, gy;        // 全局坐标 cm(由观测**直接采纳**合成; 每次观测即覆盖, 不作离群拒收)
   uint32_t t_ms;       // 最近观测时刻
   int16_t stale;       // 0=新鲜; 每轮未观测 +1; >20 时不再喂回
   bool valid;
-  float hx[AI_OBS_N], hy[AI_OBS_N];  // 各次观测的全局坐标环形缓冲(入表时已按当时车位姿转换)
-  uint8_t hn, hi;                    // 已存数量 / 写指针
   int32_t obs_rev;                   // 最近一次观测时的车姿态版本号(见 s_pose_rev)
   float odo_cm, odo_deg;             // 最近一次观测时的路程/转角累积值(见 s_odo_*): 两个差值就是
                                      // "这条坐标从看到到现在被推算推了多远", 闸门据此判它还算不算数
-  uint8_t out_n;                     // 连续被判离群的观测数(见 mem_store 的离群判定); 正常观测清零
-  float rej_gx, rej_gy;              // 上一次**被拒**观测的全局坐标(判"连续两次是否互相吻合")
+  uint8_t just_reset;                // 曾"判历史失效⇒整条重置"来的一次性标志(已不再触发, 恒 0; 为兼容
+                                     // mem_feed/mem_untrusted 旧读取保留字段, 但永不置位)
 } g_mem[AI_MEM_MAX];
 
 namespace ai {
@@ -70,20 +58,11 @@ static bool name_same_obj(const char* a, const char* b) {
   return (la > lb && strstr(a + 3, b + 3)) || (lb > la && strstr(b + 3, a + 3));
 }
 
-// 取数组前 n 个元素的中位数(n≤AI_OBS_N, 插入排序后取中间, 仅用于观测融合)
-static float median_n(const float* a, int n) {
-  float t[AI_OBS_N];
-  memcpy(t, a, n * sizeof(float));
-  for (int i = 1; i < n; i++) {
-    float v = t[i]; int j = i - 1;
-    while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; j--; }
-    t[j + 1] = v;
-  }
-  return t[n / 2];
-}
+// （观测融合已改为无条件采纳, 不再取中位数, median_n 已移除。）
 
 // 把一次"车头系坐标"观测写入物体记忆表: 入表时立即用**观测时刻**的车位姿转成全局坐标,
-// 历史观测各自已是全局坐标, 融合直接取中位数。不再依赖"当前"车位姿, 避免随车移动漂移。
+// 每次观测**无条件采纳**(不作离群拒收/锚定/中位数) —— 用户决定: 旧估计一旦错了, 拒收只会把
+// 错坐标冻住、新观测永远纠正不回。
 static void mem_store(const char* name, float wx, float wy) {
   int slot = -1, oldest = 0;
   for (int i = 0; i < AI_MEM_MAX; i++) {
@@ -92,94 +71,32 @@ static void mem_store(const char* name, float wx, float wy) {
     if (g_mem[i].t_ms < g_mem[oldest].t_ms) oldest = i;
   }
   if (slot < 0) slot = oldest;                        // 满: 覆盖最旧
+  // 这个槽是不是"按名字命中"的: 不是(空槽/最旧槽复用)就意味着里面的内容属于**别的物体** ——
+  // 必须清干净再当新条目用, 避免新物体带着前一个物体的旧状态(标记位)入账。
+  bool named = g_mem[slot].valid && g_mem[slot].name[0] && name_same_obj(g_mem[slot].name, name);
+  if (!named) { g_mem[slot].just_reset = 0; }
   strncpy(g_mem[slot].name, name, 15); g_mem[slot].name[15] = 0;
   // 车头系 (wx右+, wy前+) → 全局: heading 逆时针正(左转+), 前=(-sin,cos)、右=(cos,sin)
   float h = s_car_heading * AI_PI / 180.0f, ch = cosf(h), sh = sinf(h);
   float gx0 = s_car_x + wx * ch - wy * sh;
   float gy0 = s_car_y + wx * sh + wy * ch;
-  // ---------------- 离群判定 ----------------
-  // 排在入表**之前**: "拒收"就是这条压根不进环缓冲, 融合值与记账一概不动。
-  // gap 比的是**本条 vs 入表前的融合值**。旧代码先压入再算, 拿"含本条的中位数"当基准 —— 基准
-  // 本身已被这条拉偏, 判据因此偏松(这是"检出异常后反而采纳了异常"的一半原因), 故顺序一并纠正。
-  float gap = sqrtf((gx0 - g_mem[slot].gx) * (gx0 - g_mem[slot].gx) +
-                    (gy0 - g_mem[slot].gy) * (gy0 - g_mem[slot].gy));
-  if (g_mem[slot].hn >= 2 && gap > AI_MEM_DRIFT_WARN_CM) {
-    // 自这条记忆上次被看到以来, 车挪了多远/转了多少 —— 容差直接取闸门那一条(ai_mem.h), 保持同源:
-    // "这条坐标还算不算看到的位置"与"大落差是否可解释"用的是同一个尺度。
-    float moved_cm  = s_odo_cm  - g_mem[slot].odo_cm;
-    float moved_deg = s_odo_deg - g_mem[slot].odo_deg;
-    // 大落差有两种**截然不同**的成因, 必须分开:
-    //  ① 车动过 ⇒ 历史全局坐标是"当时位姿 + 当时数值"的产物, 位姿累积误差已让它整体错位, 而新观测
-    //     来自画面(单应), 是相对最可信的证据 ⇒ 采信新样本、重置历史(原行为, 保留)。
-    bool car_moved = moved_cm > AI_GRASP_MOVE_TOL_CM || moved_deg > AI_GRASP_TURN_TOL_DEG;
-    //  ② 车**没动** ⇒ 画面根本没变, 同一个方块还在同一个屏幕位置上, 十几厘米的落差只可能来自
-    //     **这一次观测自己报错**。硬证据(2026-09-22): 两帧同一屏幕位置(0.632,0.403)、车一步没动,
-    //     喂回的前距却从 18.3cm 变成 3.4cm, 而 kGroundCal 复算真值约 27cm ⇒ 错的是模型那一次报的
-    //     px/py, **不是**位姿漂移(旧日志把它归因成"车姿态累积疑已漂移", 归因本身也错了)。
-    //     ⇒ **拒收**。但**连续两次互相吻合**的离群观测要认账 —— 方块被爪推动时正是这个签名(车没动、
-    //     画面真变了): 两次都离谱且彼此落在 AI_MEM_REJECT_AGREE_CM 内 ⇒ 判历史已失效, 走①的采信+重置。
-    bool confirmed = g_mem[slot].out_n >= 1 &&
-                     sqrtf((gx0 - g_mem[slot].rej_gx) * (gx0 - g_mem[slot].rej_gx) +
-                           (gy0 - g_mem[slot].rej_gy) * (gy0 - g_mem[slot].rej_gy))
-                       <= AI_MEM_REJECT_AGREE_CM;
-    if (!car_moved && !confirmed) {
-      // 拒收: 坐标/融合值原样保留(它才是画面与历史都支持的那个), 但"这一轮看到过它"照记 ——
-      // 否则 AI 正看着它、记忆行却报"已N轮未见", 两边说法打架(同源不变量)。
-      // odo 也**不动**: 保留的坐标仍来自那一次旧观测, "此后车挪了多远"要从那时候算起。
-      g_mem[slot].stale  = 0;
-      g_mem[slot].t_ms   = millis();
-      g_mem[slot].out_n++;
-      g_mem[slot].rej_gx = gx0; g_mem[slot].rej_gy = gy0;
-      ai::logf("[ai] 拒收 %s 本次观测: 与融合坐标差 %.0fcm, 而车此后只挪了 %.0fcm/转 %.0f°(画面没变)"
-               " ⇒ 判**本次观测**不可信(非姿态漂移), 保留原估计(全局 %.0f,%.0f; 连续第%d次)",
-               name, gap, moved_cm, moved_deg, g_mem[slot].gx, g_mem[slot].gy, (int)g_mem[slot].out_n);
-      return;
-    }
-    if (car_moved)
-      ai::logf("[ai] %s 观测与融合坐标差 %.0fcm, 但车此后挪了 %.0fcm/转 %.0f° ⇒ 落差可解释, 采信本次并重置历史",
-               name, gap, moved_cm, moved_deg);
-    else
-      ai::logf("[ai] %s 连续两次观测互相吻合、且都与历史差 %.0fcm(车未动) ⇒ 判历史已失效, 采信新观测并重置历史",
-               name, gap);
-    // 重置: 只留本条观测。hn=1 且 gx/gy=本条, 后续观测从干净的起点重新融合。
-    g_mem[slot].hn = 1;
-    g_mem[slot].hx[0] = gx0;
-    g_mem[slot].hy[0] = gy0;
-    g_mem[slot].hi = 1;
-    g_mem[slot].gx = gx0;
-    g_mem[slot].gy = gy0;
-    g_mem[slot].t_ms = millis();
-    g_mem[slot].stale = 0;
-    g_mem[slot].valid = true;
-    g_mem[slot].obs_rev = s_pose_rev;
-    g_mem[slot].odo_cm = s_odo_cm;
-    g_mem[slot].odo_deg = s_odo_deg;
-    g_mem[slot].out_n = 0;
-    return;
-  }
-  g_mem[slot].out_n = 0;      // 正常观测: 清掉离群计数(见上)
-  // 压入本次观测(全局坐标)
-  g_mem[slot].hx[g_mem[slot].hi] = gx0;
-  g_mem[slot].hy[g_mem[slot].hi] = gy0;
-  g_mem[slot].hi = (g_mem[slot].hi + 1) % AI_OBS_N;
-  if (g_mem[slot].hn < AI_OBS_N) g_mem[slot].hn++;
-  // 历史观测(已是全局)直接取中位数
-  float gxl[AI_OBS_N], gyl[AI_OBS_N];
-  for (int i = 0; i < g_mem[slot].hn; i++) {
-    int idx = (g_mem[slot].hi - g_mem[slot].hn + i + AI_OBS_N) % AI_OBS_N;  // 最旧→最新
-    gxl[i] = g_mem[slot].hx[idx];
-    gyl[i] = g_mem[slot].hy[idx];
-  }
-  g_mem[slot].gx = median_n(gxl, g_mem[slot].hn);
-  g_mem[slot].gy = median_n(gyl, g_mem[slot].hn);
+  // ---------------- 无条件采纳 ----------------
+  // 每次观测**直接覆盖**融合值, 不做离群拒收、不做"新名字锚定"、不取中位数。原因(用户拍板):
+  //   · 旧坐标一旦错了, 离群门会把"每次都差好远"的新观测一遍遍拒掉, 把错估计冻住 —— 而画面(单应)
+  //     才相对最可信, 应该让新观测把它纠正回来, 而不是让旧估计永远压着新观测。
+  //   · 锚定"新名字贴已有物体"同样会按旧错坐标把新观测拉偏, 一并移除。
+  // 代价: 单次离群实测(模型一次报错 px/py)会立刻写进记忆 —— 但下一轮画面观测又会把它纠正, 不锁死。
+  g_mem[slot].gx = gx0;
+  g_mem[slot].gy = gy0;
   g_mem[slot].t_ms = millis();
   g_mem[slot].stale = 0;
   g_mem[slot].valid = true;
   g_mem[slot].obs_rev = s_pose_rev;
   g_mem[slot].odo_cm = s_odo_cm;                     // 记下"看到它时车走了多远", 供闸门算推算误差
   g_mem[slot].odo_deg = s_odo_deg;
-  ai::logf("[ai] 观测 %s 车头系(%.0f,%.0f) 融合n=%d → 全局(%.0f,%.0f)", name, wx, wy,
-           g_mem[slot].hn, g_mem[slot].gx, g_mem[slot].gy);
+  g_mem[slot].just_reset = 0;
+  ai::logf("[ai] 观测 %s 车头系(%.0f,%.0f) → 全局(%.0f,%.0f)", name, wx, wy,
+           g_mem[slot].gx, g_mem[slot].gy);
 }
 
 // AI 每步执行 move/spin 后调用: 按定距/定角近似累积车姿态。持续(无定距/定角)移动
@@ -282,7 +199,10 @@ void mem_feed(char* buf, size_t cap) {
   // 原先直接 snprintf 进 buf, 一条写不下就被切成半句 —— 而被切掉的恰是末尾那半句"该怎么做"
   // (实测末尾只剩"...近处被自身夹爪挡住看不见是常"), 等于把最关键的指令吃掉, 比不写还坏
   // (它读到一个没说完的句子, 只能自己猜)。半句还可能切在多字节字符中间。
-  char rec[256];
+  // 384 而不是 256: 最长的那条(丢失分流里"已被两指挡住"档)整句实测已到 ~280B(三位数厘米值 +
+  // 满长物体名), 顶到 256 的截断线就会把句尾"该怎么做"吃掉 —— 那正是本块开头记的那条教训。
+  // 栈上多这 128B 无所谓: 调用方是 ai_worker, 栈 16384。
+  char rec[384];
   auto add = [&](const char* fmt, ...) -> bool {
     va_list ap;
     va_start(ap, fmt);
@@ -303,24 +223,71 @@ void mem_feed(char* buf, size_t cap) {
     float wy = -sinf(h) * dx + cosf(h) * dy;  // 车头系: 前+ 后-
     bool ok;
     if (g_mem[i].stale <= AI_MEM_COORD_STALE) {
-      // 最近观测过: 给精确坐标(供快速找回当前方位)
-      ok = add("; %s(%s%.1fcm,%s%.1fcm)",
-               g_mem[i].name, wx >= 0 ? "右" : "左", fabsf(wx),
-               wy >= 0 ? "前" : "后", fabsf(wy));
+      if (wy > 0 && wy <= AI_NEAR_FWD_CM) {
+        // 近场(前距 ≤AI_NEAR_FWD_CM, 与 approach 停距同值): 这一带的 cm 是单应高报解算值、近场每轮 ±5cm 抖,
+        // 拿它判"进没进两指"就是拿噪声开车 —— 近场**只给远近档位、不给坐标**, 对准按画面两根手指判断。
+        // 措辞用提示词同款的 [接近]: wy≤7 且明显不在两指间是 [过近], 7<wy≤15 是 [接近]。
+        const char* nstate = (wy <= AI_ARM_UNDER_CM) ? "[过近]" : "[接近]";
+        ok = add("; %s 已%s(近场不报坐标, 是否[对准]凭视觉判断)", g_mem[i].name, nstate);
+      } else {
+        // 最近观测过且不在近场: 给精确坐标(供快速找回当前方位)
+        ok = add("; %s(%s%.1fcm,%s%.1fcm)",
+                 g_mem[i].name, wx >= 0 ? "右" : "左", fabsf(wx),
+                 wy >= 0 ? "前" : "后", fabsf(wy));
+        // 附上该全局坐标按**当前**车位姿反投影的屏幕位置, 供 AI 去画面那个位置核对目标是否还在。
+        // 用实时反解而非存观测时的 px/py: 车一 move/spin, 目标在画面里的位置就变了, 存旧的反而误导;
+        // 反投影随车姿每轮更新, 始终指示"此刻该往画面哪看"。world_to_screen 越出标定区返回 false 不显示。
+        if (ok) {
+          float su, sv;
+          if (ground::world_to_screen(wx, wy, &su, &sv)) {
+            ai::logf("[ai] 目标 %s 车头(%.0f,%.0f) → 屏幕(%.2f,%.2f)", g_mem[i].name, wx, wy, su, sv);
+            ok = add(" 屏幕[%.2f,%.2f]", su, sv);
+          }
+        }
+      }
     } else if (s_odo_cm - g_mem[i].odo_cm <= AI_GRASP_MOVE_TOL_CM &&
                s_odo_deg - g_mem[i].odo_deg <= AI_GRASP_TURN_TOL_DEG) {
       // 这几轮没再看到它, 但车几乎没动: 那条坐标仍是"看到的位置"(与闸门同一判据, 见 ai_mem.h)。
       // 要说清两件事, 少一件都会被 AI 走偏:
       //  (1) **不等于对准** —— 这句以前写的是"照它夹", 实测 AI 拿它当合爪依据(前场坐标有 1~2cm
       //      级系统偏差, 实测差 1.3cm 时方块还在两指指尖前方两三厘米), 连夹两次全空。
-      //  (2) **别只为看它而后退** —— 实测 AI 为找回画面会后退, 退出去目标又变远, 来回摆(整轮 90s
-      //      没走到过 arm low)。近处被两指/车头挡住本就是常态。
+      //  (2) **丢失的尝试次序** —— 标准流程: 先动臂查遮挡(降臂/抬臂), 还看不见才小步后退找。这里曾经
+      //      只写"别后退找": 实测 AI 会为找回画面一路后退、退出去目标更远, 来回摆(整轮 90s 没走到过
+      //      arm low) —— 但把后退**整个划掉**又违背标准(后退是第三步), 且低姿下被两指挡住本来就查不出
+      //      来。故改成有序三步并保留那句告诫: 先动臂, 后小步退, 且别"一丢就退"。
+      //  (3) **但"先动臂查遮挡"不能无条件套** —— 实测 2026-09-22 20:33:44~20:35:18: AI 反复
+      //      low→看不见→fold→看见→low, 90 秒一次夹取都没试。查画面留档(frame 0019 等)后确认
+      //      **不是模型漏检**: 低姿下小车前挪两三厘米后, 方块真的被爪/臂挡出画面(同一位置
+      //      前一帧还清清楚楚)。机制是结构性的: 可见≈前13~14cm, 被挡≈前10~11cm, 而夹取要前8cm
+      //      ⇒ **最后那段永远看不见**。此时"再抬臂"等于退回起点, 下一轮必然重演, 死循环。
+      //      所以按离爪口的远近分三种说法(与闸门同一条线, 值都在 ai_mem.h):
+      //        · 前距 ≤ AI_ARM_UNDER_EXIT_CM: 已在臂下/车头前 —— 用户的纠正1, 抬臂 + 后退重来;
+      //        · 那条线 ~ AI_NEAR_FWD_CM: 刚贴近就被挡 ⇒ 这是**到了**, 不是丢了:
+      //          别抬臂, 小步顶进送进两指之间再夹;
+      //        · > AI_NEAR_FWD_CM: 真远场丢失 ⇒ 原三步。
+      // ⚠️ 但**臂下那一档必须再按横向分一次**, 否则它会专门在最该扣扳机的那一刻喊"抬臂后退":
+      //    低姿爪口前 8cm 处的报值正是 10 上下(单应高报, AI_NEAR_SCALE 折算回 8) —— 与出门线
+      //    重合。实测 2026-09-22 22:29~22:33 整轮: 闸门自己打出「前10=折算8 横向差0.7 前后差
+      //    0.3cm」(几何完全就位、合爪会被放行), 而同一轮记忆行喊的是"已在臂下 ⇒ fold 抬臂再
+      //    后退再降臂" ⇒ AI 只 low→fold→low 打转, 240 秒里 arm grasp **一次都没发**。横向又是
+      //    爪子唯一补不了的一轴(也只有它决定夹不夹得住), 故拿它分档: 横向在容差内(与闸门同一条
+      //    硬拦线同源, 值在 ai_mem.h) ⇒ 这就是夹取位, 直接夹; 偏出去才走用户的纠正1。
+      // ⚠️ 第一档取的是**出门线**(10)而不是进门线(7): 闸门那边的迟滞只要开着, ufwd 就一定 ≤ 出门线,
+      //    所以"程序判在臂下"与"记忆行判在臂下"永远同时成立。若这里用 7, 就会在 7~10cm 那段出现
+      //    闸门说"抬臂+后退"、记忆行说"别抬臂、顶进"的**相反处方** —— AI 能看见的只有这些字, 它
+      //    只会来回蹭(这正是这次要修的病, 不能换个地方再犯一遍)。
       // 所以: 坐标只用来判"方位没变", 对准一律看画面。措辞要短: 这条最长, 而 mem_s 预算还得分给别人。
-      ok = add("; %s(%s%.1fcm,%s%.1fcm; %d轮前看到, 车只挪%.0fcm/转%.0f° → 坐标没过时但**≠对准**; "
-               "看不见多是被两指挡住(正常, 别后退找); 降臂后 zoom 看两指之间, 在里面就 clip, 不在就小步补)",
-               g_mem[i].name, wx >= 0 ? "右" : "左", fabsf(wx),
-               wy >= 0 ? "前" : "后", fabsf(wy), (int)g_mem[i].stale,
-               s_odo_cm - g_mem[i].odo_cm, s_odo_deg - g_mem[i].odo_deg);
+      // 这几轮没再看到它、但车几乎没动: 那条坐标仍是"看到的位置"。近场**不报坐标、不给长处方**:
+      // 坐标是单应高报解算值, 长处方(抬臂/后退/分横向档)之前实测正是"该扣扳机时反向拆台"的源头。
+      // 这里只给一个对齐提示词远近档位的简短状态 + 一句"看不见先动臂查遮挡"的通用指引, 让 AI 自己看画面。
+      {
+        const char* st;
+        if (wy <= AI_ARM_UNDER_CM) st = "已[过近]";
+        else if (wy <= AI_NEAR_FWD_CM) st = "已[接近]";
+        else st = "[较远]";
+        ok = add("; %s %s(%d轮前看到, 车没动; 看不见先动臂查遮挡, 还看不见才小步后退, 别一丢就退)",
+                 g_mem[i].name, st, (int)g_mem[i].stale);
+      }
     } else {
       // 久未观测: 不再给坐标, 只提醒它存在但位置已过时。措辞与闸门对应: 这种时效下 arm_pose
       // 下探/arm clip 会被程序直接拒绝(见 mem_grasp_evidence), 先说清楚省得它白试一轮。
@@ -335,7 +302,27 @@ void mem_feed(char* buf, size_t cap) {
       break;
     }
   }
+  buf[n] = '\0';
   ai::logf("[ai] 记忆 %s", buf);   // 喂回内容同步到 ai_log, 便于观察 AI 看到的物体位置理解
+}
+
+// 记忆里有没有可用的物体。判据与 mem_feed 的过滤条件**同源**(valid + stale 未过喂回线):
+// 两处若不同步, 程序会在记忆行明列着目标的那一轮说"你还没锁定任何目标"。
+bool mem_have_any() {
+  for (int i = 0; i < AI_MEM_MAX; i++)
+    if (g_mem[i].valid && g_mem[i].stale <= AI_MEM_FEED_STALE) return true;
+  return false;
+}
+
+// 是否存在"曾被正确观测、现已不可见"的物体: stale 已超新鲜线(因而夹取依据也过期、闸门会拒), 但记录
+// 还在(valid)。stale=1..新鲜线内的是近期正看着的对象, 不算"丢失"; stale 超喂回线(>AI_MEM_FEED_STALE)
+// 的早已连喂都不喂, 那属于 mem_have_any 的"空"。中间这档(新鲜线<stale≤喂回线)正是"还记得它、但当前
+// 这一两轮没在画面里看到"—— AI 若同时上一轮回收了机械臂/后退, 目标很可能被挡在镜头外, 见 ai_client。
+bool mem_have_lost() {
+  for (int i = 0; i < AI_MEM_MAX; i++)
+    if (g_mem[i].valid && g_mem[i].stale > AI_GRASP_STALE && g_mem[i].stale <= AI_MEM_FEED_STALE)
+      return true;
+  return false;
 }
 
 // 在物体记忆表里定位目标全局坐标: name 非空=精确/近似名匹配(找不到返回 false);
@@ -356,6 +343,24 @@ bool mem_find(const char* name, float* tx, float* ty) {
   if (best < 0) return false;          // 无任何可用记忆
   *tx = g_mem[best].gx; *ty = g_mem[best].gy;
   return true;
+}
+
+// 这条坐标现在还站得住吗(见 ai_mem.h)。**挑条目的口径必须与 mem_find 逐字同源**(同一批 slot、同一条
+// 过期线、不点名时同样挑离车最近的那条)—— 否则会出现"mem_find 说导航目标是它、mem_untrusted 却查的
+// 是另一条"的两边打架, 那种不一致正是本仓库反复踩过的同源不变量。
+bool mem_untrusted(const char* name) {
+  int best = -1; float bd = 0.0f;
+  for (int i = 0; i < AI_MEM_MAX; i++) {
+    if (!g_mem[i].valid || g_mem[i].stale > AI_MEM_FEED_STALE) continue;
+    if (name && name[0]) {
+      if (name_same_obj(g_mem[i].name, name)) return g_mem[i].just_reset != 0;
+      continue;
+    }
+    float dx = g_mem[i].gx - s_car_x, dy = g_mem[i].gy - s_car_y;
+    float d = dx * dx + dy * dy;
+    if (best < 0 || d < bd) { bd = d; best = i; }
+  }
+  return best >= 0 && g_mem[best].just_reset != 0;
 }
 
 // 夹取依据(见 ai_mem.h): 取时效内"最新鲜"的那条记忆(不判远近/方位)。新鲜度优先, 同新鲜度再取

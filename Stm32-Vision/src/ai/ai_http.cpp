@@ -442,12 +442,14 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
     //   停顿N次/最长Mms: 正文读取中">200ms 没新字节"的次数与最长间隔 —— 数它就能判断
     //                    "慢"是服务端在挤牙膏(停顿多且长)还是链路/客户端(停顿少但密集)
     //   sse=1: 正文以 "data:" 开头, 说明服务端按 SSE 分帧回(那 ai_client 的 SSE 分支就会走)
-    ai::logf("[ai] POST 成功 %d 总%ums 复用%d 写@%ums 发完@%ums 首收@%ums 正文@%ums 收完@%ums 收%uB 正文%uB 停顿%u次/最长%ums sse=%d body=%uB",
-             code, (unsigned)(millis() - t0), reused ? 1 : 0, (unsigned)g_client.first_wr_ms,
-             (unsigned)g_client.last_wr_ms, (unsigned)g_client.first_rx_ms, (unsigned)st.first_ms,
-             (unsigned)st.done_ms, (unsigned)g_client.rx_bytes, (unsigned)resp.length(),
-             (unsigned)st.stalls, (unsigned)st.max_gap_ms, resp.startsWith("data:") ? 1 : 0,
-             (unsigned)body_len);
+    // ⚠️ 下面这条"POST 成功"日志常年在刷屏(每轮都有), 对日常分析价值不大; 要排查每轮延迟,
+    //    打开下面注释即可(信号就在那几个时间戳里)。平时关着, 让 /log ai on 的日志更干净。
+    // ai::logf("[ai] POST 成功 %d 总%ums 复用%d 写@%ums 发完@%ums 首收@%ums 正文@%ums 收完@%ums 收%uB 正文%uB 停顿%u次/最长%ums sse=%d body=%uB",
+    //          code, (unsigned)(millis() - t0), reused ? 1 : 0, (unsigned)g_client.first_wr_ms,
+    //          (unsigned)g_client.last_wr_ms, (unsigned)g_client.first_rx_ms, (unsigned)st.first_ms,
+    //          (unsigned)st.done_ms, (unsigned)g_client.rx_bytes, (unsigned)resp.length(),
+    //          (unsigned)st.stalls, (unsigned)st.max_gap_ms, resp.startsWith("data:") ? 1 : 0,
+    //          (unsigned)body_len);
     return resp.length() > 0;
   }
   return false;

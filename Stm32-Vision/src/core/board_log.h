@@ -38,6 +38,12 @@ void state_text(char* buf, size_t n);
 // 统一日志输出：始终写串口（带 [类] 前缀）；enabled(c) 时同步转发手机。
 void logf(Cat c, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 
+// 转发一条**任意长度**的文本（如 AI 思考 reasoning，常超 logf 的 256B 栈缓冲）为
+// {type:"log",params:{src,text}} 给手机。文本副本用 PSRAM 构造（不挤内部堆/DMA 块），
+// 与 logf 同一转发开关（enabled(c) 才转）；串口打印由调用方负责（本函数不打串口）。
+// 转发任务收到的长文本默认只走 WS（BLE 兜底通道对长文本无意义，见 app_httpd 发送器）。
+void forward_text(Cat c, const char* text);
+
 // 转发器：由 app_httpd 启动时注册（WS 广播 + BLE status 通知）。在转发任务线程执行。
 typedef void (*SendFn)(const char* json);
 void set_forwarder(SendFn fn);

@@ -43,7 +43,7 @@ const _JOY_STEER := 0.8
 const _DRIVE_MAX := 1000       # 油门满量程 PWM
 const _SERVO_CENTER := 150     # 转向舵中位
 const _SERVO_RANGE := 30       # 转向舵单侧偏转量
-const _SPIN_SPEED := 900       # 原地旋转模式下左右推摇杆的单轮 PWM
+const _SPIN_SPEED := 800       # 原地旋转模式下左右推摇杆的单轮 PWM（全系统统一 800 档）
 ## 最近一次成功连接的设备名，用于顶栏「已连接: xxx」。
 var _device_name := ""
 var _page_tween: Tween = null
@@ -360,6 +360,11 @@ func _on_ble_status(data: Dictionary) -> void:
 	#  1) build_status 包装：{"ip",...,"reply":"<JSON>"}（词表应答/状态），无顶层 type → 解包 reply 再路由；
 	#  2) send_status 直推的独立 JSON：顶层带 type（如 exec_status）。
 	# 统一解出消息体后交给公共处理器（_handle_board_msg），与 WS 通道同一套展示逻辑。
+	# 顶层 bits（build_status 附带的状态位）先同步灯/夹爪按钮 —— 纯蓝牙下没有 WS 的 status 回执，
+	# 灯等按钮能不能亮起来就靠它（不覆盖本地 AI 运行态，见 _apply_state_bits）。
+	var _b: Variant = data.get("bits")
+	if _b is int or _b is float:
+		_apply_state_bits(int(_b))
 	var msg := data
 	if not data.has("type") and data.has("reply"):
 		var r: Variant = data.get("reply")
@@ -450,18 +455,24 @@ func _apply_state(data: Dictionary) -> void:
 		var b: Variant = (st as Dictionary).get("bits")
 		# Godot JSON 解析把数字存成 float（typeof=3），兼容 int/float。
 		if b is int or b is float:
-			_apply_state_bits(int(b))
+			# 主动 get_state（重连/刷新）是 AI 运行态的初始化点：此时按 bit4 同步「中止/发送」。
+			_apply_state_bits(int(b), true)
 
-## 按板端状态位字节同步直控按钮（灯/夹爪/AI 运行态）。WS 与 BLE 通道共用。
-## bit 布局与 Stm32-Vision/command.cpp（make_state_bits）逐位 mirror，改一侧必改另一侧：
+## 按板端状态位字节同步直控按钮。WS 与 BLE 通道共用。
+## apply_ai=true 仅在主动 get_state/reconnect 首同步时传：此时按 bit4 初始化「中止/发送」；
+## 其余（动作回执/BLE status 的 bits）不覆盖本地 AI 运行态 —— AI 的「中止/发送」由
+## ai_goal/ai_result(done)/手动接管/掉线 管理，避免一次普通回执的 bit4 把正在运行的任务误打回「发送」。
+## 灯/夹爪(bits0-3)始终按位同步。
+## bit 布局与 Stm32-Vision/command.cpp（state_bits）逐位 mirror，改一侧必改另一侧：
 ##   bit0 前灯 / bit1 震灯 / bit2 背灯 / bit3 夹爪夹紧 / bit4 AI busy；bit5-7 留空。
-func _apply_state_bits(bits: int) -> void:
+func _apply_state_bits(bits: int, apply_ai: bool = false) -> void:
 	$BodyControl/CtrlArea.call("sync_state", {
 		"front": (bits & 1) != 0,
 		"vibe": (bits & 2) != 0,
 		"back": (bits & 4) != 0,
 	}, (bits & 8) != 0)
-	_chat_panel.set_ai_running((bits & 16) != 0)
+	if apply_ai:
+		_chat_panel.set_ai_running((bits & 16) != 0)
 
 func _on_ws_connected() -> void:
 	_chat_panel.chat("板", "WS 已连接")
@@ -496,7 +507,16 @@ func _handle_board_msg(data: Dictionary) -> bool:
 	var t: String = str(data.get("type", ""))
 	match t:
 		"pong":
-			_chat_panel.chat("板", "pong")
+			# 板端保活应答（每心跳周期一次）：带当场状态位（bits），**只同步不打印**——打印就成了
+			# 每几秒一行的噪声。保活是板端当场现测的，不像动作回执可能陈旧 ⇒ 可用它覆盖本地 AI
+			# 运行态（apply_ai=true）。这正是"AI 任务在跑、发送按钮却没变成中止"的兜底：任务由
+			# 另一侧起停、或漏收了一次 ai_result 时，按钮会在一个心跳周期内自行纠正。
+			var pp: Variant = data.get("params")
+			if pp is Dictionary:
+				var pb: Variant = (pp as Dictionary).get("bits")
+				# Godot JSON 解析把数字存成 float（typeof=3），兼容 int/float。
+				if pb is int or pb is float:
+					_apply_state_bits(int(pb), true)
 		"ai_result":
 			_chat_panel.show_ai_result(data)
 		"log":

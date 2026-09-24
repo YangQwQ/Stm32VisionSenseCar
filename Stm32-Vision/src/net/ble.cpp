@@ -67,6 +67,9 @@ static String build_status(const char* reply) {
   d["wifi_ssid"] = cfg::wifi_ssid();
   d["ws"] = g_ws_connected;
   d["ai_busy"] = ai::busy();
+  // 顶层带状态位：让 BLE 的 status(连接首包/每次指令回执/周期状态)都携带灯/夹爪/AI 运行态，
+  // 手机端与 WS 走同一套 _apply_state_bits 同步按钮(否则纯蓝牙下灯等按钮永不更新)。
+  d["bits"] = cmd::state_bits();
   if (reply && reply[0]) d["reply"] = reply;
   String s;
   serializeJson(d, s);

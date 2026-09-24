@@ -116,3 +116,44 @@ bool ground::screen_to_world(float u, float v, float* x, float* y) {
   *x = xx; *y = yy;
   return true;
 }
+
+// 齐次坐标 3×3 矩阵求逆(伴随矩阵/Frob 形式, 纯解析, 无迭代)。
+// 返回 det; 若 |det| 过小(奇异)返回 0, 调用方判失败。
+static double inv3(const float a[9], float r[9]) {
+  double d = a[0] * ((double)a[4] * a[8] - (double)a[7] * a[5])
+           - a[1] * ((double)a[3] * a[8] - (double)a[6] * a[5])
+           + a[2] * ((double)a[3] * a[7] - (double)a[6] * a[4]);
+  if (fabs(d) < 1e-12) return 0;
+  r[0] = (float)(((double)a[4] * a[8] - (double)a[7] * a[5]) / d);
+  r[1] = (float)(((double)a[2] * a[7] - (double)a[1] * a[8]) / d);
+  r[2] = (float)(((double)a[1] * a[5] - (double)a[2] * a[4]) / d);
+  r[3] = (float)(((double)a[6] * a[5] - (double)a[3] * a[8]) / d);
+  r[4] = (float)(((double)a[0] * a[8] - (double)a[2] * a[6]) / d);
+  r[5] = (float)(((double)a[2] * a[3] - (double)a[0] * a[5]) / d);
+  r[6] = (float)(((double)a[3] * a[7] - (double)a[6] * a[4]) / d);
+  r[7] = (float)(((double)a[6] * a[1] - (double)a[0] * a[7]) / d);
+  r[8] = (float)(((double)a[0] * a[4] - (double)a[1] * a[3]) / d);
+  return d;
+}
+
+// 车头系地面 (x右+, y前+) cm → 屏幕归一化像素 (u,v)。
+// 单应对称可逆: 正向 A·(un,vn,1)∝(xn,yn,1), 反解即 A⁻¹·(xn,yn,1)。归一化 (mean/std) 亦然。
+// 精度: 记忆坐标本就是无里程计的推算值+单应前瞻误差(几 cm), 投影回屏幕也就对应几十像素的
+// 位置指示 —— 只用于"去画面那个大概位置看一眼目标在不在", 不做导航, 这点误差可接受。
+bool ground::world_to_screen(float x, float y, float* u, float* v) {
+  if (!s_ready) return false;
+  float xn = (x - SX_MU) / SX_S, yn = (y - SY_MU) / SY_S;   // 归一化到标定区
+  float A[9] = { H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7], 1.0f };  // 行优先 3×3
+  float Ai[9];
+  if (inv3(A, Ai) == 0) return false;
+  // (un, vn, 1) ∝ Ai·(xn, yn, 1), 除 w 得非齐次
+  double w = Ai[6] * xn + Ai[7] * yn + Ai[8];
+  if (fabs(w) < 1e-9) return false;
+  double un = (Ai[0] * xn + Ai[1] * yn + Ai[2]) / w;
+  double vn = (Ai[3] * xn + Ai[4] * yn + Ai[5]) / w;
+  float uu = (float)(un * SU_S + SU_MU);        // 反归一化回 0..1 屏幕
+  float vv = (float)(vn * SV_S + SV_MU);
+  if (uu < -0.05f || uu > 1.05f || vv < -0.05f || vv > 1.05f) return false;  // 标定区外不指示
+  *u = uu; *v = vv;
+  return true;
+}

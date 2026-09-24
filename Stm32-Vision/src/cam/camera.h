@@ -34,6 +34,13 @@ bool init();
 // 取一帧（同步接口），使用后必须调用 return_frame() 归还缓冲
 camera_fb_t* grab();
 
+// ---- 高频取帧仲裁：切高清真拍一帧（放大镜用） ----
+// 一次性完成"切到 hires → 抓一帧高清 → 立即切回 VGA → 放锁"，取帧与切分辨率在同一把互斥锁里串行，
+// 与 grab() 不并发，杜绝 set_framesize 与 esp_camera_fb_get 同时操作驱动导致的死锁。
+// 返回高清 fb，调用方用完必须 return_frame() 归还（归还不涉及切回，高清帧抓完锁已放）。
+// *ok: 成功=1；失败(传感器不支持/取帧失败)=0 且返回 nullptr。
+camera_fb_t* request_hires(framesize_t hires, int* ok);
+
 // 摄像头是否可用（init 后即定），供调用方做"无画面降级"判断
 bool available();
 

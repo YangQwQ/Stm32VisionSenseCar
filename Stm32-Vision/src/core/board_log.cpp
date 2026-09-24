@@ -99,6 +99,81 @@ void logf(Cat c, const char* fmt, ...) {
   Serial.printf("[%s] %s\n", k_name[c], buf);
 }
 
+// 转发一条任意长度文本（AI 思考等）为 {type:"log",params:{src,text}}。
+// 手工拼接 JSON（含必做的转义），副本整体放 PSRAM——不用 ArduinoJson：大文本逐字符
+// 转义会先落到内部堆，几十 KB 思考直接威胁 DMA 块红线。转发开关同 logf；不打串口。
+void forward_text(Cat c, const char* text) {
+  if (c >= CAT_MAX) return;
+  if (!(g_all || g_en[c])) return;      // 与 logf 同一开关
+  if (!text) return;
+  const char* sc = k_name[c];
+  // 前缀 {"type":"log","params":{"src":" + src + 常量 + 转义后的 text + "}}
+  const char* pre = "{\"type\":\"log\",\"params\":{\"src\":\"";
+  const char* pre2 = "\",\"text\":\"";
+  const char* suf = "\"}}";
+  size_t pre_len = strlen(pre) + strlen(sc) + strlen(pre2);
+
+  // 第一趟：数出 text 转义 + 清洗后的长度（JSON 引号/反斜杠/控制符会扩容）。
+  size_t body = 0;
+  for (const unsigned char* p = (const unsigned char*)text; *p;) {
+    unsigned char cc = *p;
+    // 控制符 / 需转义字符：一律 JSON 转义或替换
+    if (cc == '"' || cc == '\\')           { body += 2; p++; continue; }
+    if (cc == '\n')                        { body += 2; p++; continue; }   // \n
+    if (cc == '\r')                        { body += 2; p++; continue; }   // \r
+    if (cc == '\t')                        { body += 2; p++; continue; }   // \t
+    if (cc < 0x20 || cc == 0x7f)           { body += 1; p++; continue; }   // 其余控制符→'?'
+    if (cc < 0x80)                         { body += 1; p++; continue; }   // 普通 ASCII(数字/英文/标点)原样
+    // 多字节 UTF-8：校验引导符 + 续字节，合法整段原样，非法首字节→'?'（同 sanitize_utf8 策略）
+    int need = 0;
+    if (cc >= 0xC2 && cc <= 0xDF) need = 1;
+    else if (cc >= 0xE0 && cc <= 0xEF) need = 2;
+    else if (cc >= 0xF0 && cc <= 0xF4) need = 3;
+    if (need == 0)                         { body += 1; p++; continue; }   // 非法首字节→'?'
+    bool ok = true;
+    for (int i = 1; ok && i <= need; i++) {
+      unsigned char co = p[i];
+      if (!co || !(co >= 0x80 && co <= 0xBF)) ok = false;
+    }
+    if (!ok) { body += 1; p++; }
+    else     { body += 1 + need; p += 1 + need; }
+  }
+  size_t cap = pre_len + body + strlen(suf) + 1;
+  char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+  if (!buf) return;                       // PSRAM 不足：静默丢弃（宁缺毋滥）
+  char* w = buf;
+  memcpy(w, pre, strlen(pre)); w += strlen(pre);
+  memcpy(w, sc, strlen(sc));   w += strlen(sc);
+  memcpy(w, pre2, strlen(pre2)); w += strlen(pre2);
+  for (const unsigned char* p = (const unsigned char*)text; *p;) {
+    unsigned char cc = *p;
+    if (cc == '"' || cc == '\\') { *w++ = '\\'; *w++ = (char)cc; p++; continue; }
+    if (cc == '\n') { *w++ = '\\'; *w++ = 'n'; p++; continue; }
+    if (cc == '\r') { *w++ = '\\'; *w++ = 'r'; p++; continue; }
+    if (cc == '\t') { *w++ = '\\'; *w++ = 't'; p++; continue; }
+    if (cc < 0x20 || cc == 0x7f) { *w++ = '?'; p++; continue; }
+    if (cc < 0x80) { *w++ = (char)cc; p++; continue; }   // 普通 ASCII(数字/英文/标点)原样
+    int need = 0;
+    if (cc >= 0xC2 && cc <= 0xDF) need = 1;
+    else if (cc >= 0xE0 && cc <= 0xEF) need = 2;
+    else if (cc >= 0xF0 && cc <= 0xF4) need = 3;
+    if (need == 0) { *w++ = '?'; p++; continue; }
+    bool ok = true;
+    for (int i = 1; ok && i <= need; i++) {
+      unsigned char co = p[i];
+      if (!co || !(co >= 0x80 && co <= 0xBF)) ok = false;
+    }
+    if (!ok) { *w++ = '?'; p++; }
+    else     { for (int i = 0; i <= need; i++) *w++ = (char)p[i]; p += 1 + need; }
+  }
+  memcpy(w, suf, strlen(suf) + 1);        // 含结尾 '\0'
+  if (g_q) {
+    if (xQueueSend(g_q, &buf, 0) != pdTRUE) heap_caps_free(buf);  // 满则释放，自带 free
+  } else {
+    heap_caps_free(buf);
+  }
+}
+
 // 就地把一条待发文本转为合法 UTF-8（RFC6455 TEXT 帧必须为 UTF-8）。
 // 云端 AI 响应被日志原样嵌入（如 "HTTP %s body=%s" / "原始读取"）时，偶发残缺 UTF-8
 // 或非法字节；若原样送进 WS TEXT 帧，手机 Godot 会以关闭码 1007 断链。与 ai_client 的

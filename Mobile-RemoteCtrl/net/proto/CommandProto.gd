@@ -110,13 +110,16 @@ static func drive(speed: int) -> Dictionary:
 	# 调试直驱：一键全车前进/后退/停（单条命令；speed=-1000..1000, 0=停）
 	return {"type": "drive", "params": {"speed": speed}, "id": _new_id()}
 
-static func spin(dir: int, speed: int = 500, angle_deg: int = 0) -> Dictionary:
+static func spin(dir: int, speed: int = 800, angle_deg: int = 0, ms: int = 0) -> Dictionary:
 	# 原地转向：普通四轮滑移式。dir=+1左进右退 / -1左退右进 / 0停；speed=单轮pwm 0..1000。
-	# angle_deg>0 时按板端时长近似"转指定度数"到点自停（无里程计，粗略，供微操/标定）。
+	# angle_deg>0 按时长近似"转指定度数"到点自停（无里程计，粗略，供微操/标定）。
+	# ms>0 直接指定通电毫秒（调试/标定口，绕开角度换算，用于测真实每度ms）。
 	# 需要转向舵回正前轮直行才转得正。
 	var params: Dictionary = {"dir": dir, "speed": speed}
 	if angle_deg > 0:
 		params["angle_deg"] = angle_deg
+	elif ms > 0:
+		params["ms"] = ms
 	return {"type": "spin", "params": params, "id": _new_id()}
 
 static func move_dist(throttle: float, cm: int, steering: float = 0.0) -> Dictionary:
@@ -157,7 +160,8 @@ const COMMAND_HINTS := {
 	"/ws [connect [IP]|disconnect|status]": "WS 手动连接/断开/状态",
 	"/connect <IP>": "不经蓝牙直连 WS",
 	"/move rotate <dir=-1/0/1>": "转向舵三档(左/回正/右)",
-	"/move spin <角度> [speed]": "原地旋转(正=右转, 负=左转; 0=停; 板端时长近似到点自停)",
+	"/move spin <角度> [speed]": "原地旋转(正=右转, 负=左转; 0=停; 默认speed=800; 板端时长近似到点自停)",
+	"/move spin_ms <毫秒>": "原地旋转直接转N毫秒(标定口, 测真实每度ms)",
 	"/move fore|back <距离cm> [油门%]": "定距前进/后退(时长近似到点自停)",
 	"/move to <x> <y> [global]": "板端本地导航到坐标(local原点=当前位姿,y向前x向右; global=沿用全局系)",
 	"/move arm <x> <h>": "机械臂末端到指定位姿(车头系前方cm, 离地高度cm)",

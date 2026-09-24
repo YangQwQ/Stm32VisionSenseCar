@@ -18,4 +18,9 @@ bool ready();
 // 输入越界(非 0..1)或输出超可接受范围（单应外推分母趋零会爆炸）时返回 false。
 bool screen_to_world(float u, float v, float* x, float* y);
 
+// 车头系地面 (x右+, y前+) cm → 屏幕归一化像素 (u,v)。单应正变换的可逆映射:
+// 用当前车位姿把记忆里的全局目标坐标重投影回屏幕, 供 AI 去画面那个位置核对目标是否还在。
+// 仅指示型定位(去画面大概位置看一眼), 不用于导航 —— 屏幕像素误差不敏感。越界/数值失败返回 false。
+bool world_to_screen(float x, float y, float* u, float* v);
+
 }  // namespace ground

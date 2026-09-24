@@ -18,6 +18,7 @@
     uv run tools/carctl.py reboot                    # 远程重启（链路卡死时的解药）
     uv run tools/carctl.py doctor                    # 分层体检：哪层断的，顺手 BLE 救活
     uv run tools/carctl.py fw                        # 列出本机编出的 .bin 及其指纹
+    uv run tools/carctl.py warns --only-trunc        # 补 -Wall 重编，揪出 snprintf 截断（先 build 一次）
     uv run tools/carctl.py ota <file.bin>            # 推固件 → 等板子回来 → 核对指纹
     uv run tools/carctl.py build --flash             # 编译 → 直接 OTA → 核对指纹（一条龙）
     uv run tools/carctl.py build --clean             # 全量重编（改了源文件或内核 sdkconfig.h）
@@ -54,6 +55,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -70,6 +72,8 @@ except ImportError:  # pragma: no cover - 提示装依赖而不是抛栈
 WS_PORT = 81                    # 板端 WS 端口（指令/状态/日志）
 HTTP_PORT = 80                  # 板端 HTTP（/update 读写固件信息）
 HTTP_TIMEOUT_S = 8.0            # 普通 HTTP 请求上限（板端现算页面，秒回）
+HTTP_DIRECT_TRY_S = 3.0         # 直连那一路的短试上限：正常时它最快(0.2s)，挂住时别拖满整个预算
+
 OTA_HTTP_TIMEOUT_S = 120.0      # OTA 的 POST：整包固件传完 + 板端写 flash 都在这个窗口里
 PING_EVERY_S = 5.0              # 保活周期（< 板端 WS_IDLE_PING_MS 6s）
 REASSERT_S = 30.0               # 重申 /log on 的周期（板端 log 开关全局单选，手机会改掉）
@@ -82,17 +86,19 @@ def _find_arduino_cli() -> Path:
     """定位 arduino-cli，按可信度从高到低：
 
     1. 环境变量 `ARDUINO_CLI` —— 显式指定，**换机器首选**；
-    2. PATH 里已有 `arduino-cli`；
-    3. Arduino IDE **内置**的那份（与 IDE 同版、缓存目录同源），它在 IDE 安装目录下的
+    2. Arduino IDE **内置**的那份（与 IDE 同版、缓存目录同源），它在 IDE 安装目录下的
        `resources/app/lib/backend/resources/`，**不在 PATH**，只能猜安装位置；
-    4. 都找不到就返回第 3 步的第一个候选，由调用处报错并提示改用 `ARDUINO_CLI`。
+    3. PATH 里的 `arduino-cli`；
+    4. 都找不到就返回第 2 步的第一个候选，由调用处报错并提示改用 `ARDUINO_CLI`。
+
+    ⚠️ 第 2 步排在第 3 步前面（哪怕 PATH 上有一个）：本仓库的构建缓存要与 IDE 共用，
+    而**不同大版本的 arduino-cli 连缓存布局都不一样**（1.x 是 `cores\\<md5>`，0.35 那代是
+    `cores\\<fqbn下划线化>_<md5>`），用错版本 = 缓存全废、core 每次都重编，还查不出原因。
+    要指定别的版本请显式给 `ARDUINO_CLI`。
     """
     env = os.environ.get("ARDUINO_CLI")
     if env:
         return Path(env)
-    on_path = shutil.which("arduino-cli")
-    if on_path:
-        return Path(on_path)
     tail = "resources/app/lib/backend/resources/arduino-cli"
     names = [tail + ".exe", tail] if os.name == "nt" else [tail]
     bases = [Path(v) for v in (os.environ.get("PROGRAMFILES"),
@@ -114,15 +120,68 @@ def _find_arduino_cli() -> Path:
     for c in cands:
         if c.is_file():
             return c
+    on_path = shutil.which("arduino-cli")
+    if on_path:
+        return Path(on_path)
     return cands[0]
 
 
 ARDUINO_CLI = _find_arduino_cli()
 SKETCH_DIR = Path(__file__).resolve().parent.parent          # Stm32-Vision/
+
+# ── 与 IDE 共用同一份构建缓存的两个前提（缺任一个 ⇒ 每次互切都全量重编 5~10 分钟）──
+# arduino-cli 编译前把本次构建参数写进 <草图缓存>/build.options.json，与上一次逐字段比对，
+# **只要有一个字段不等就 RemoveAll 整个构建目录重编**（arduino-cli 源码
+# internal/arduino/builder/build_options_manager.go：比对 hardwareFolders、
+# otherLibrariesFolders、fqbn、customBuildProperties、compiler.optimization_flags、
+# builtInLibrariesFolders、additionalFiles；sketchLocation 同名则忽略）。
+# ⚠️ 草图缓存目录 sketches\<hash> **只由草图路径决定**（fqbn 不参与）；按 fqbn 分家的是
+# core 归档 %LOCALAPPDATA%\arduino\cores\<hash>——所以 fqbn 不一致时既换缓存又重编内核。
+# 实测（2026-09-22）命令行与 IDE 差三项：
+#   ① fqbn：IDE 发 18 项全展开（板菜单每一项都显式写出），命令行原来只发 6 项；
+#   ② builtInLibrariesFolders、③ otherLibrariesFolders：来自 arduino-cli 的配置文件——
+#      IDE 用 ~/.arduinoIDE/arduino-cli.yaml（含 directories.builtin.libraries，且
+#      directories.user 的盘符大小写也与命令行默认不同），命令行不带 --config-file 就没这两项。
+# 故本脚本改为：fqbn **取 IDE 日志里那一串**（见 ide_fqbn）+ 编译时**带上 IDE 的配置文件**。
+IDE_CLI_YAML = Path.home() / ".arduinoIDE" / "arduino-cli.yaml"
+IDE_LOG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "Arduino IDE"
+# 兜底 fqbn：只在内置 IDE 日志拿不到时用（数值取自 2026-09-22 IDE 实际发出的那串）。
 # ⚠️ arch 段是 esp32 不是 esp32s3（写成 esp32:esp32s3: 会被当成"本平台未安装"）。
-# 与 Stm32-Vision/CLAUDE.md §构建要点 逐字一致，改一处就要同步另一处。
-FQBN = ("esp32:esp32:esp32s3:FlashSize=16M,FlashMode=dio,PartitionScheme=huge_app,"
-        "DebugLevel=debug,PSRAM=opi,EraseFlash=none")
+FQBN = ("esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=default,"
+        "MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=dio,"
+        "FlashSize=16M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=opi,LoopCore=1,"
+        "EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default")
+
+
+def ide_fqbn() -> str | None:
+    """取 IDE **最近一次**发给 arduino-cli 的 fqbn 串（拿不到返回 None）。
+
+    IDE 每次启动、以及每次改板菜单项都会往 `%APPDATA%\\Arduino IDE\\<日期>_log.log` 写一行
+    `Starting language server: <fqbn>`；那一串正是 build.options.json 里要比对的 fqbn。
+    只认本板的（日志里可能有别的板子/别的工作区），且关键项被改坏时宁可不认——
+    免得悄悄编出一份不能用的固件。
+    """
+    logs = sorted(IDE_LOG_DIR.glob("*_log.log"),
+                  key=lambda p: p.stat().st_mtime, reverse=True) if IDE_LOG_DIR.is_dir() else []
+    for lg in logs[:2]:                      # 只看最新两份：IDE 跨零点会换日志文件
+        try:
+            lines = lg.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        got = None
+        for line in lines:
+            if "Starting language server: " in line:
+                got = line.split("Starting language server: ", 1)[1].strip()
+        if not got:
+            continue
+        if not got.startswith("esp32:esp32:esp32s3:"):
+            return None                      # IDE 现在指着别的板子，别跟着它走
+        need = ("FlashSize=16M", "PSRAM=opi", "PartitionScheme=huge_app")
+        if not all(k in got for k in need):
+            log(f"[警告] IDE 日志里的 fqbn 与预期关键项不符，本次忽略它：{got}")
+            return None
+        return got
+    return None
 
 # 状态位（与 command.cpp make_state_bits / 手机 Main.gd 逐位 mirror）
 BIT_NAMES = ("前灯", "震灯", "背灯", "夹爪夹紧", "AI忙碌")
@@ -305,13 +364,24 @@ def kill_stale_clients(host: str) -> None:
 
 # ---------------- HTTP：/update 的读（运行信息）与写（推固件） ----------------
 
+_ROUTE: int | None = None       # 保留：兼容 car_logcat 的旧实现引用（本文件 http_get 已改直连）
+
+
 def http_get(host: str, path: str, timeout: float = HTTP_TIMEOUT_S, port: int = HTTP_PORT) -> bytes:
-    """GET 板端 HTTP。显式关掉代理：本机 127.0.0.1:7897 会把局域网请求截胡。"""
-    req = urllib.request.Request(f"http://{host}:{port}{path}",
-                                 headers={"Cache-Control": "no-store"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout) as r:
-        return r.read()
+    """GET 板端 HTTP，**强制直连**（不经本机系统/全局代理）。
+
+    ⚠️ 别再用 urllib —— 本机配了全局代理 127.0.0.1:7897，urllib 会拿它截胡局域网请求，`/update`
+    GET 反复 TimeoutError，把 `status`/`ota` 的预检误记成"板子 HTTP 半死"（其实 WS 一直好好的）。
+    这里直接用 http.client 硬连到目标 host:port，天然绕开所有代理。2026-09-23 实机：直连 /update
+    0.1s 即回、裸 TCP 探测端口也通，代理那路反而失败吊死 —— 故不再做双路切换，只走直连。
+    """
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request("GET", path, headers={"Cache-Control": "no-store"})
+        with conn.getresponse() as r:
+            return r.read()
+    finally:
+        conn.close()
 
 
 def _strip_tags(s: str) -> str:
@@ -685,25 +755,148 @@ def wait_board_up(host: str, timeout_s: float) -> float | None:
     return None
 
 
+def cmd_warns(args) -> int:
+    """把本草图每个编译单元**补上 -Wall 重编一遍**，把编译器告警收回来。
+
+    为什么需要这个：arduino-cli 给本项目的命令行里带 **`-w`**（抑制全部告警）且没有 `-Wall`
+    ⇒ **编译器一个字都不说，"编译通过"完全不能证明没有 snprintf 截断**。而提示语被截断时丢掉的
+    恰好是末尾那句"该怎么做"，AI 只看得见这些字，属静默失效（实测 `spin_warn` 固定文字 331B
+    塞进 224B、`zoom_warn` 245B 塞进 192B，两处都在截，谁也没报）。
+
+    做法：从草图缓存的 `compile_commands.json` 取**真实编译参数**（-I/-D 一个不差），
+    删掉 `-w`、加上 `-Wall`，逐文件重编到一个临时目录。先用一个**故意截断**的样例自证
+    这套参数真能报出 `-Wformat-truncation`，再查真实文件——否则"零告警"可能只是探针瞎了。
+
+    ⚠️ 编的是**缓存里的草图副本**（arduino-cli 先拷进 `<缓存>/sketch/` 再编），所以要**先
+    `build` 一次**再跑本命令，否则查的是上一版源码。
+    """
+    cc = None
+    for p in sorted(SKETCH_CACHE.glob("*/compile_commands.json"),
+                    key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            if SKETCH_DIR.name in p.read_text(encoding="utf-8", errors="replace")[:8000]:
+                cc = p
+                break
+        except OSError:
+            continue
+    if cc is None:
+        sys.exit(f"没找到指向 {SKETCH_DIR.name} 的 compile_commands.json"
+                 f"（{SKETCH_CACHE} 下；先跑一次 `carctl.py build`）")
+
+    entries = json.loads(cc.read_text(encoding="utf-8", errors="replace"))
+    # 只看本草图自己的 TU：arduino-cli 把依赖库做成预编译归档，不在这份列表里
+    mine = [e for e in entries
+            if "\\sketch\\" in e["file"] and e["file"].endswith((".cpp", ".ino"))
+            and (not args.filter or args.filter in Path(e["file"]).name)]
+    if not mine:
+        sys.exit("compile_commands.json 里没有匹配的编译单元")
+
+    tmp = Path(tempfile.mkdtemp(prefix="carctl-warns-"))
+    try:
+        base = _warn_args(mine[0])
+        probe = tmp / "selftest.cpp"
+        probe.write_text('#include <stdio.h>\n'
+                         'void f(const char*s){char b[8];snprintf(b,sizeof(b),"abcdefghij%s",s);}\n',
+                         encoding="utf-8")
+        hits = _compile_warn(base, probe, tmp / "selftest.o")
+        log(f"[告警] 自证（故意截断的样例）命中 {len(hits)} 条")
+        if not any("truncat" in h for h in hits):
+            sys.exit("自证失败：这套参数认不出 format-truncation，结果不可信（编译器或 flags 变了？）")
+
+        log(f"[告警] {cc.parent.name} 下 {len(mine)} 个编译单元，-w 已剥、-Wall 已加")
+        n_warn, n_file, shown = 0, 0, 0
+        for i, e in enumerate(mine, 1):
+            name = Path(e["file"]).name
+            hits = _compile_warn(_warn_args(e), Path(e["file"]), tmp / (Path(e["file"]).stem + ".o"))
+            if args.only_trunc:
+                hits = [h for h in hits if "truncat" in h]
+            if not hits:
+                continue
+            n_file += 1
+            n_warn += len(hits)
+            log(f"\n  ⚠ {name}")
+            for h in hits:
+                shown += 1
+                log("      " + h.replace(e["file"], name))
+            if args.limit and shown >= args.limit:
+                log(f"\n[告警] 已达 --limit {args.limit}，其余文件跳过")
+                break
+        log(f"\n[告警] {n_file} 个文件共 {n_warn} 条"
+            + ("（--only-trunc）" if args.only_trunc else ""))
+        if not n_warn:
+            log("[告警] 干净。注意本命令覆盖的是**本草图**的编译单元，依赖库不在其中。")
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _warn_args(entry) -> list[str]:
+    """真实参数里去掉输出/输入/依赖生成，并在 `@cpp_flags` **之前**插入 `-Wall`。
+
+    -Wall 必须插在那份 flags 之前：它里面有一串 `-Wno-*`，插到最后会把它们全部重新打开，
+    淹掉真正要找的那几条。`-iprefix` 千万别删 —— `@flags/includes` 里是 `-iwithprefixbefore`，
+    靠它定根，删了连 `freertos/FreeRTOS.h` 都找不到（自证那步会"通过"，真实文件全报 fatal error）。
+    """
+    drop_with_value = {"-o", "-MF", "-MT", "-MQ", "-x"}
+    drop_alone = {"-c", "-E", "-S", "-MD", "-MMD", "-MP", "-w"}
+    if "arguments" in entry:
+        args = list(entry["arguments"])
+    else:   # 少数 arduino-cli 版本只给拼好的 command 字符串（见 probe_macro.py 同款处理）
+        args = re.split(r'\s+(?=(?:[^"]*"[^"]*")*[^"]*$)', entry["command"])
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in drop_with_value:
+            i += 2
+            continue
+        if a in drop_alone or a == entry["file"]:
+            i += 1
+            continue
+        if a.endswith("cpp_flags"):
+            out.append("-Wall")
+        out.append(a)
+        i += 1
+    return out
+
+
+def _compile_warn(args: list[str], src: Path, obj: Path) -> list[str]:
+    r = subprocess.run(args + ["-c", str(src), "-o", str(obj)],
+                       capture_output=True, text=True, errors="replace")
+    return [l for l in (r.stdout + r.stderr).splitlines() if "warning:" in l or "error:" in l]
+
+
 def cmd_build(args) -> Path | None:
     """编译草图，返回新产出的 .bin（失败返回 None）。加 --flash 就直接推上板。
 
-    fqbn 写死在这里的理由：它必须与 IDE 里逐字一致（**缓存目录是按 fqbn 哈希分的**，
-    差一个字就是另一份缓存 → 全量重编，还查不出原因），而这条命令长到没人能凭记忆打对。
+    fqbn 与 arduino-cli 配置文件都必须与 IDE 那边逐字一致，否则 arduino-cli 会把整个
+    草图构建目录删掉重编（见 FQBN 上方那段注释），而那条命令长到没人能凭记忆打对——
+    所以默认自动从 IDE 日志里取，取不到才用内置兜底；`--fqbn` 可显式指定。
     """
     if not ARDUINO_CLI.is_file():
         sys.exit(f"找不到 arduino-cli：{ARDUINO_CLI}\n"
                  "（已按 环境变量 ARDUINO_CLI → PATH → IDE 安装目录 依次找过。"
                  "请显式指定：`ARDUINO_CLI=<arduino-cli 全路径>` 或先把它加进 PATH。）")
+    if args.fqbn:
+        fqbn, src = args.fqbn, "--fqbn 指定"
+    else:
+        auto = ide_fqbn()
+        fqbn, src = (auto, "取自 IDE 日志") if auto else (FQBN, "内置兜底")
     t0 = time.time()
-    cmd = [str(ARDUINO_CLI), "compile", "--fqbn", FQBN]
+    cmd = [str(ARDUINO_CLI)]
+    if IDE_CLI_YAML.is_file():
+        # 不带它，builtInLibrariesFolders / otherLibrariesFolders 两项就与 IDE 不同 ⇒ 每次互切全量重编
+        cmd += ["--config-file", str(IDE_CLI_YAML)]
+    cmd += ["compile", "--fqbn", fqbn]
     if args.clean:
         # --clean 交给 arduino-cli 自己清构建目录：比 rm -rf <缓存hash> 稳，
         # 不用知道那个哈希是怎么算的。**改/增/删源文件、或改了内核 sdkconfig.h 后必须加它**
         # ——后者在 74 个文件的 .d 依赖里，增量构建不保证认这个变更（静默不生效）。
         cmd.append("--clean")
     cmd.append(".")
-    log(f"[编译] fqbn={FQBN}")
+    log(f"[编译] fqbn={fqbn}（{src}）")
+    if not IDE_CLI_YAML.is_file():
+        log(f"[提示] 没找到 IDE 的 arduino-cli 配置（{IDE_CLI_YAML}）——"
+            "本次缓存不与 IDE 共享，下次在 IDE 里编译会全量重编")
     if args.clean:
         log("[编译] --clean：全量重编（慢，但换来「改动确实进了固件」）")
     r = subprocess.run(cmd, cwd=str(SKETCH_DIR), capture_output=True, text=True,
@@ -737,6 +930,9 @@ def cmd_build(args) -> Path | None:
         log(f"[产物] 本次没有新产出 .bin（源码未变时 arduino-cli 会跳过链接）——"
             f"用缓存里最新的那份，产于 {stamp}")
     fp = bin_fingerprint(bin_path)
+    # 编译命令里带 `-w`（抑制全部告警）⇒ 这个"编译通过"不含任何告警信息。指个去处，
+    # 免得又靠"现象反推"（见 cmd_warns 的注释）。
+    log("[提示] 本次输出不含告警（编译器带 -w）；要查 snprintf 截断等：carctl.py warns")
     log(f"[产物] {bin_path}")
     log(f"       {bin_path.stat().st_size / 1024 / 1024:.2f}MB  指纹 {fp}  耗时 {time.time() - t0:.0f}s")
     archive_build(bin_path, fp)
@@ -1038,7 +1234,9 @@ def cmd_ota(host: str, args) -> None:
     log(f"        {len(data) / 1024 / 1024:.2f}MB  指纹 {fp}")
 
     try:
-        before = parse_runtime(http_get(host, "/update").decode("utf-8", "replace"))
+        # 预检撞上板端 httpd 的周期性忙窗口（实测某 handler 会卡住 server 最长 ~15s）时，8s 默认必死。
+        # 给 20s 盖过忙窗口；上传本身走 socket 直连长超时（OTA_HTTP_TIMEOUT_S），不受此限。
+        before = parse_runtime(http_get(host, "/update", timeout=20.0).decode("utf-8", "replace"))
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         sys.exit(f"推之前读 /update 失败（板子不通就别推了）：{type(e).__name__}: {e}")
     log(f"[板上] 跑 {before.get('running_stamp', '?')}（分区 {before.get('running_part', '?')}）")
@@ -1386,10 +1584,21 @@ def parse_args():
     p.add_argument("bin", nargs="*", help=".bin 路径（可多个）")
     p.set_defaults(func=cmd_fw)
 
+    p = sub.add_parser("warns", help="补 -Wall 重编本草图，把编译器告警揪出来（先 build 一次）")
+    p.add_argument("-f", "--filter", default="", metavar="SUBSTR",
+                   help="只查文件名含此子串的编译单元，如 --filter ai_")
+    p.add_argument("--only-trunc", action="store_true",
+                   help="只看 -Wformat-truncation（snprintf 会被截断）那一类")
+    p.add_argument("--limit", type=int, default=0, metavar="N",
+                   help="最多打印 N 条告警后收工（默认不限）")
+    p.set_defaults(func=cmd_warns)
+
     p = sub.add_parser("build", parents=[common],
                        help="编译草图（--flash 则连编译带上板一条龙）")
     p.add_argument("--clean", action="store_true",
                    help="全量重编（改/增/删源文件、或改了内核 sdkconfig.h 后必须加）")
+    p.add_argument("--fqbn", default="", metavar="FQBN",
+                   help="显式指定 fqbn（默认自动取 IDE 日志里那串，以共用构建缓存）")
     p.add_argument("--flash", action="store_true", help="编完直接 OTA 上板并核对指纹")
     p.add_argument("--force", action="store_true", help="配合 --flash：板上已是这份固件也照推")
     p.add_argument("--wait-up", type=float, default=90.0, metavar="SEC",
@@ -1663,6 +1872,8 @@ def main() -> None:
     if args.cmd == "fw":       # fw 只读本机文件，不碰网络，不需要定位板子
         cmd_fw(args)
         return
+    if args.cmd == "warns":    # warns 只编本机文件，同样不碰网络
+        sys.exit(cmd_warns(args))
     if args.cmd == "build":
         # 先编译再定位板子：编译不需要网络，板子不通时也该能编（编完再报连不上，
         # 而不是"因为找不到板子所以没编"）。--flash 才走下面这段。

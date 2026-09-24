@@ -115,6 +115,7 @@ QUEUE_MAX = 20000               # 落盘队列上限（主循环只入队，落�
 CONSOLE_MAX = 2000              # 回显队列上限（控制台堵死时只丢回显，别在内存里堆日志）
 HTTP_PORT = 80                  # 板端 HTTP（日志走 WS 的 81，抓帧走这里）
 HTTP_TIMEOUT_S = 8.0            # 单次 HTTP 上限（取图只是 PSRAM 拷贝，应远快于此）
+HTTP_DIRECT_TRY_S = 3.0         # "试路"用的短超时：正常时直连最快(0.2s)，挂住时别拖满整个预算
 FOLLOW_TIMEOUT_S = 25.0         # 抓帧长轮询的请求上限：必须 > 板端挂起上限(AI_DUMP_FOLLOW_MS 15s)
 HELD_MIN_S = 1.5                # 清单请求耗时超过它 = 板端确实挂起过（即支持长轮询）
 FRAMES_MIN_RUN_S = 10.0         # 跑这么久才敢说"板端没有留档"（此前开关刚开上/首轮 AI 还没跑完）
@@ -315,26 +316,62 @@ def _port_open(host: str, timeout: float) -> bool:
 
 # ---------------- 板端 HTTP（抓帧用；日志那条链路走 WS，互不相干） ----------------
 
+_ROUTE: int | None = None       # 哪条路通: None=还没试出来, 0=直连, 1=代理。见 get()
+
+
+def _opener(i: int):
+    """0=直连（显式关代理）; 1=走环境/注册表里的代理。"""
+    return urllib.request.build_opener(*( (urllib.request.ProxyHandler({}),) if i == 0 else () ))
+
+
 def get(host: str, path: str, timeout: float = HTTP_TIMEOUT_S, port: int = HTTP_PORT) -> bytes:
-    """GET 板端 HTTP。显式关掉代理：本机 127.0.0.1:7897 会把局域网请求截胡（见 strip_proxy_env）。"""
+    """GET 板端 HTTP。**两条路都留，并记住哪条通。**
+
+    ⚠️ 别改回"只走直连"。历史上这里显式关代理，是因为本机 127.0.0.1:7897 会截胡局域网请求
+    （见 strip_proxy_env）。但 2026-09-22 实测：**同一个请求，两条路的快慢会反过来，且直连会间歇性
+    挂住** —— urllib 直连稳定慢到 10.7s、裸 socket 直连超时，而走代理只要 0.11~0.20s，返回内容还
+    一致（确系板子那份，不是代理的错页）。8s 的默认超时压在 10.7s 的直连上就必然 TimeoutError。
+    `has_dump` 里那句"实测板子会间歇性这样：同一时刻手 curl 都 200、而板端却在超时"，当初记成板子
+    抽风，其实就是这一条 —— **是客户端选错了路，不是板子**。
+
+    实现上把选中的路记进 `_ROUTE`：首次（没有 `after` 的短清单请求）两条都短试一遍定下来，之后
+    直接用那条，免得**每次长轮询都在坏路上白等一个短超时**。已定路失败时另一条仍会被试到并改记。
+    """
+    global _ROUTE
     req = urllib.request.Request(f"http://{host}:{port}{path}",
                                  headers={"Cache-Control": "no-store"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout) as r:
-        return r.read()
+    order = ([_ROUTE] if _ROUTE is not None else []) + [i for i in (0, 1) if i != _ROUTE]
+    last: Exception | None = None
+    for i in order:
+        # 已确定的那条用满预算; 只是"试试看"的那条给短超时（长轮询挂起时不能拿它当失败）
+        tmo = timeout if i == _ROUTE else min(timeout, HTTP_DIRECT_TRY_S)
+        try:
+            with _opener(i).open(req, timeout=tmo) as r:
+                _ROUTE = i
+                return r.read()
+        except Exception as e:      # noqa: BLE001 —— 两条路都可能以任意异常失败, 一律换下一条
+            last = e
+    assert last is not None
+    raise last
 
 
-def has_dump(host: str, port: int = HTTP_PORT) -> bool:
-    """板上固件带不带抓帧留档？
+def has_dump(host: str, port: int = HTTP_PORT) -> bool | None:
+    """板上固件带不带抓帧留档？ 三态: True=有, False=**确定**没有, None=这一问没问出来。
 
     `/ai_dump` 是留档固件才有的入口，返回的 {"slots":…} 既是存在性也是能力判定。注意它**不依赖**
     /log 开关：留档没开时板端照样回一份合法的空清单（slots 在），所以这一问拿到的"能不能抓"是准的。
     不带 after 的清单请求是立刻返回的（长轮询只在带 after 时挂起），所以这一问不会把启动拖住。
+
+    ⚠️ 但"超时/连不上"**不等于**"固件没有这个入口"：板子 HTTP 池忙、链路一时卡，都会让这一问拿不到
+    应答（实测板子会间歇性这样：同一时刻手 curl `/` 与 `/update` 都 200，而板端却在超时）。调用方
+    只该拿 False 去下"整场不抓帧"的结论，None 必须当"暂时问不到、交给归档线程自己重试"。
     """
     try:
         return get(host, "/ai_dump", port=port).lstrip().startswith(b'{"slots"')
+    except urllib.error.HTTPError:
+        return False   # 板子**明确**回了一个非清单应答(典型 404) ⇒ 固件确实没带这个入口
     except (urllib.error.URLError, OSError, TimeoutError, ValueError):
-        return False
+        return None    # 没应答: 只是问不到, 不能据此判"没有"
 
 
 def frames_dir_for(log_path: Path, override: str | None = None) -> Path:
@@ -1062,10 +1099,14 @@ def main() -> None:
         # 留档跟着板端 AI 类别走：--cat exec 时板端根本不 memcpy，抓也只会一直空等
         emit(wr, "抓帧", "跳过：--cat exec 不含 ai 类别，板端不会留画面"
                         "（改用 --cat ai 或 all，或去掉 --no-frames）", st)
-    elif not has_dump(host, args.http_port):
-        emit(wr, "抓帧", f"跳过：{host} 的 /ai_dump 不可用（404 或超时）——多半是板上固件还没有"
-                        "抓帧留档；本次只记日志", st)
+    elif has_dump(host, args.http_port) is False:
+        emit(wr, "抓帧", f"跳过：{host} 的 /ai_dump 无此入口（固件没带抓帧留档）；本次只记日志", st)
     else:
+        # True / None 都起线程。None 只是"这一问没问出来"，不该判"整场不抓"：本脚本恰好在刚开
+        # /log ai on 之后问，那一刻板端还一轮都没跑完、留档环必然是空的，板子 HTTP 池也常一时忙
+        # ⇒ 一问问不到就锁死，会**白白丢掉整场的画面**（实测 22:51 那轮就是这样，而同一时刻手
+        # curl /ai_dump 0.18s 就回）。归档线程 poll() 自己会对失败退避重试，且首次清单 after=None
+        # 会从环里**最旧**那帧起回填，所以晚起步也不会从中间开始丢。
         frames_dir = frames_dir_for(out_path, args.frames_dir)
         fr = Frames(host=host, outdir=frames_dir, args=args, wr=wr, st=st,
                     log_ref=str(args.out or f"logs/{out_path.stem}.log"))

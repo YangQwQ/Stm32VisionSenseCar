@@ -28,7 +28,7 @@ static bool has_id(const JsonDocument& doc) {
 // 合成板端状态位字节，供 get_state 与 reply_status 统一附带，手机端按位解析同步按钮。
 // bit 布局与 Mobile-RemoteCtrl/Main.gd（_apply_state_bits）逐位 mirror，改一侧必改另一侧：
 //   bit0 前灯 / bit1 震灯 / bit2 背灯 / bit3 夹爪夹紧 / bit4 AI busy；bit5-7 留空。
-static uint8_t make_state_bits() {
+uint8_t cmd::state_bits() {
   uint8_t b = 0;
   if (exec::light_on("front")) b |= 1u << 0;
   if (exec::light_on("vibe"))  b |= 1u << 1;
@@ -83,7 +83,7 @@ static void reply_status(JsonDocument& src, cmd::ReplyFn reply, void* ctx,
   out["type"] = "status";
   JsonObject params = out["params"].to<JsonObject>();
   params["reason"] = reason;
-  params["bits"] = make_state_bits();  // 附带状态位，让"会触发动作重置"的回执驱动手机端自动同步按钮
+  params["bits"] = cmd::state_bits();  // 附带状态位，让"会触发动作重置"的回执驱动手机端自动同步按钮
   if (has_id(src)) out["id"] = src["id"].as<long>();
   String s;
   serializeJson(out, s);
@@ -91,10 +91,17 @@ static void reply_status(JsonDocument& src, cmd::ReplyFn reply, void* ctx,
 }
 
 // 与手机 /ping 对齐：回 {type:pong}（手机 WSCarClient 对 pong 直接读文本）。
+// 附带状态位（与 status/get_state 同一个字节，见 state_bits）：保活是手机**自己每几秒就会发**的，
+// 于是"AI 任务在不在跑"不必等一次动作回执。任务由另一侧起停（另一台手机 / 另一个客户端发的
+// ai_goal）、或手机漏收了一次 ai_result 时，按钮能在一个保活周期内自行纠正回来 —— 这正是
+// "发送按钮没在任务运行时变成中止"那类不同步的兜底来源。每次 pong 都是**当场现测**的板端状态，
+// 不是某条陈旧的回执，所以手机端可以放心用它覆盖本地 AI 运行态。
 static void reply_pong(JsonDocument& src, cmd::ReplyFn reply, void* ctx) {
   if (!reply) return;
   JsonDocument out;
   out["type"] = "pong";
+  JsonObject params = out["params"].to<JsonObject>();
+  params["bits"] = cmd::state_bits();
   if (has_id(src)) out["id"] = src["id"].as<long>();
   String s;
   serializeJson(out, s);
@@ -154,7 +161,10 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
       return;
     }
     // drive/spin/servo/motor/arm_pose/reset 继续走下方各自分支（取消后落各自直驱逻辑）。
-  } else {
+  } else if (strcmp(type, "ping") && strcmp(type, "pong") && strcmp(type, "get_state")) {
+    // 保活/纯查询三件套（ping / pong / get_state）不打这一行：手机每几秒就一来一回，打出来只是刷屏，
+    // 而它们的应答本身就是自描述的状态（pong 带 bits、get_state 回 bits）。其余类型（ai_goal / config /
+    // goto…）仍留这一行当"收到过"的凭据。
     blog::logf(blog::CMD, "type=%s has_frames=%u", type, has_frames);
   }
 
@@ -323,7 +333,7 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     JsonDocument out;
     out["type"] = "state";
     JsonObject params = out["params"].to<JsonObject>();
-    params["bits"] = make_state_bits();
+    params["bits"] = cmd::state_bits();
     if (has_id(doc)) out["id"] = doc["id"].as<long>();
     String s;
     serializeJson(out, s);

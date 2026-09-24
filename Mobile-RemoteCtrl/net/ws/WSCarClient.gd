@@ -163,8 +163,11 @@ func _handle_text(text: String) -> void:
 		return
 	var t: String = str(data.get("type", ""))
 	if _probe_pending and t == "pong":
-		# 探测应答：确认仍在线，撤销"疑似断开"，不转发给 UI（避免像 /ping 那样把 pong 刷进消息区）。
+		# 探测应答：确认仍在线，撤销"疑似断开"。**仍然上抛**——pong 带板端当场状态位（bits：AI 运行态/
+		# 灯/夹爪），是按钮同步最及时的一条来源；由上层决定不显示（Main 的 pong 分支只同步不打印，
+		# 所以照旧不会像 /ping 那样把 pong 刷进消息区）。
 		_probe_pending = false
+		text_received.emit(data)
 		return
 	if t == "ping":
 		# 板子 WS 活体探测：回 pong（同样静默，不进消息区）。

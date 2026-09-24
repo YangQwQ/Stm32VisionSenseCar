@@ -60,12 +60,14 @@ def check(cond, msg):
 class Board:
     """桩板端。frames 按 seq 升序；note 为空串表示那一轮没画面。"""
 
-    def __init__(self, support_follow=True, hold_s=2.0, alive=True, garbage=False):
+    def __init__(self, support_follow=True, hold_s=2.0, alive=True, garbage=False,
+                 no_dump=False):
         self.frames = []
         self.support_follow = support_follow
         self.hold_s = hold_s
         self.alive = alive
         self.garbage = garbage                      # 回一份不是 JSON 的东西（量退避用）
+        self.no_dump = no_dump                      # 旧固件：/ai_dump 不存在 ⇒ 404
         self.frame_hits = 0
         self.dump_queries = []
         self.lock = threading.Lock()
@@ -101,7 +103,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         b = Handler.board                       # 每次请求现取，方便测试中途换板子
-        if u.path == "/ai_dump":
+        if u.path == "/ai_dump" and not b.no_dump:
             after = q.get("after", [None])[0]
             with b.lock:
                 b.dump_queries.append(after)
@@ -271,7 +273,15 @@ def main():
     check(str(d2).replace("\\", "/") == "C:/tmp/myframes", f"--frames-dir 覆盖生效：{d2}")
     Handler.board = b
     check(logcat.has_dump("127.0.0.1", port) is True, "桩板端 /ai_dump 在 → has_dump=True")
-    check(logcat.has_dump("127.0.0.1", dead_port()) is False, "端口没人听 → has_dump=False")
+    # 三态的意义全在这里：只有"明确回了非清单应答"才能判"固件没带留档"，
+    # 而"端口没人听/超时"只是**问不到**——原先把它也当 False，会让一次瞬时的问不到
+    # 变成"整场不抓帧"（实测板上那轮就是这样丢的图）。
+    check(logcat.has_dump("127.0.0.1", dead_port()) is None, "端口没人听 → has_dump=None（问不到，≠没有）")
+    Handler.board = Board(no_dump=True)
+    check(logcat.has_dump("127.0.0.1", port) is False, "旧固件 /ai_dump 回 404 → has_dump=False（确定没有）")
+    Handler.board = Board(garbage=True)
+    check(logcat.has_dump("127.0.0.1", port) is False, "回的不是清单 → has_dump=False")
+    Handler.board = b
     check(logcat.safe_name("被闸门拒(未执行) arm clip: 还没对准") == "被闸门拒(未执行)_arm_clip_还没对准",
           "文件名净化：冒号/空格处理正确")
 
