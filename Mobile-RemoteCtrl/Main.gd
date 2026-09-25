@@ -9,6 +9,8 @@ const CP := preload("res://net/proto/CommandProto.gd")
 @onready var _joystick: VirtualJoystick = $BodyControl/CtrlArea/Joystick
 @onready var _wifi_popup: PanelContainer = $WifiPopup
 @onready var _editor: Control = $ImageEditor
+@onready var _editor_panel: Control = $ImageEditor/Panel
+@onready var _dim: ColorRect = $BGDimSharder
 var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 
 @onready var _scan_panel: Control = $BodyBTScan
@@ -20,6 +22,9 @@ var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 
 @onready var _chat_panel = $BodyControl/ChatPanel
 @onready var _stream_toggle: CheckButton = $BodyControl/VidControls/StreamToggle
+@onready var _direct_ctrl_btn: CheckButton = $BodyControl/VidControls/DirectCtrlToggle
+@onready var _ctrl_area: Control = $BodyControl/CtrlArea
+@onready var _bottom_padding: Panel = $BodyControl/BottomPadding
 
 @onready var _body_ctrl: Control = $BodyControl
 @onready var _body_about: Control = $BodyAbout
@@ -87,6 +92,10 @@ func _ready() -> void:
 	_scan_panel.device_selected.connect(_on_device_item_selected)
 	# /append：聊天区发起的"从图库选图"由 Main 弹出系统文件选择器并打开标注编辑器。
 	_chat_panel.image_pick_requested.connect(_on_chat_image_pick_requested)
+	# 两个模态弹窗（配网 / 标注）共用背景遮罩：谁显隐就同步一次。
+	_wifi_popup.visibility_changed.connect(_sync_modal_dim)
+	_editor.visibility_changed.connect(_sync_modal_dim)
+	_sync_modal_dim()
 
 	# 用 toggled + bind 页码；按钮同属一个 ButtonGroup，互斥单选。
 	_nav_bt.toggled.connect(_on_nav_toggled.bind(0))
@@ -101,6 +110,12 @@ func _ready() -> void:
 	_auto_conn_btn.set_pressed_no_signal(Store.get_auto_conn())
 	_disable_ws_btn.set_pressed_no_signal(Store.get_disable_auto_ws())
 	_spin_mode_btn.set_pressed_no_signal(Store.get_spin_mode())
+	# 图传 / 虚拟摇杆区开关按上次退出时的状态恢复：图传只回填开关与画面区，
+	# 真正的起流待 WS 连上后由 _on_ws_connected 重发（此刻还没有链路可发）。
+	_stream_toggle.set_pressed_no_signal(Store.get_stream_on())
+	_video.visible = Store.get_stream_on()
+	_direct_ctrl_btn.set_pressed_no_signal(Store.get_direct_ctrl_on())
+	_ctrl_area.visible = Store.get_direct_ctrl_on()
 	if Store.get_auto_conn():
 		# 启动即自动连接：直接进控制页（页 1，触发 _on_nav_toggled → _switch_page），不再停在蓝牙扫描页。
 		_nav_ctrl.button_pressed = true
@@ -167,6 +182,10 @@ func _sync_nav(page: int) -> void:
 ## 画面上左右滑动切页：直接在 _input 里全量处理（不依赖 unhandled 传播，保证任何位置都响应）。
 ## 横移超过阈值且横向占主导才切页；落在摇杆区内整段跳过，避免和转向拖动冲突。
 func _input(event: InputEvent) -> void:
+	# 弹窗期间不翻页：只处理"点遮罩关弹窗"，其余交给弹窗自己（遮罩已挡住下层）。
+	if _modal_open():
+		_modal_input(event)
+		return
 	if event is InputEventScreenTouch:
 		var t := event as InputEventScreenTouch
 		if t.pressed:
@@ -257,6 +276,62 @@ func _track_velocity(px: float) -> void:
 	else:
 		_last_sample = _drag_accum
 		_last_sample_tick = now
+
+# ============================== 模态弹窗（配网 / 图片标注） ==============================
+# 两个弹窗共用 Main 根下这层背景遮罩 BGDimSharder（原 ImageEditor 自带的 Dim 提取而来）：
+# 显隐跟随弹窗的 visibility_changed，各条关闭路径（确认/取消/采用）都不用单独通知，淡出期间也保持。
+# 遮罩自身 mouse_filter 为 STOP，挡住下层的翻页手势与摇杆/按钮。
+
+const _MODAL_TAP_SLOP := 20.0   # 按下到抬起的位移超过它就不算"点"，按拖动忽略
+
+var _modal_tap_pos := Vector2.ZERO
+var _modal_tap_armed := false
+
+func _modal_open() -> bool:
+	return _wifi_popup.visible or _editor.visible
+
+## 弹窗显隐变化时同步遮罩（信号驱动，不必每帧轮询；淡出到真正隐藏前遮罩都保持）。
+func _sync_modal_dim() -> void:
+	_dim.visible = _modal_open()
+
+## 弹窗期间的输入：按下与抬起都在遮罩空白处、且几乎没移动 → 关弹窗；
+## 落在弹窗内容上的点击、以及任何拖动都不响应（也不翻页）。
+func _modal_input(event: InputEvent) -> void:
+	var pos := Vector2.INF
+	var down := false
+	if event is InputEventScreenTouch:
+		var t := event as InputEventScreenTouch
+		pos = t.position
+		down = t.pressed
+	elif event is InputEventMouseButton \
+			and (event as InputEventMouseButton).button_index == MOUSE_BUTTON_LEFT:
+		var mb := event as InputEventMouseButton
+		pos = mb.position
+		down = mb.pressed
+	else:
+		return
+	if down:
+		_modal_tap_pos = pos
+		_modal_tap_armed = not _modal_panel_rect().has_point(pos)
+		return
+	if not _modal_tap_armed:
+		return
+	_modal_tap_armed = false
+	if pos.distance_to(_modal_tap_pos) <= _MODAL_TAP_SLOP and not _modal_panel_rect().has_point(pos):
+		_dismiss_modal()
+
+## 当前弹窗的内容区（配网弹窗本体 / 标注面板）：其中的输入归弹窗，不触发遮罩关闭。
+func _modal_panel_rect() -> Rect2:
+	if _editor.visible:
+		return _editor_panel.get_global_rect()
+	return _wifi_popup.get_global_rect()
+
+## 点遮罩关闭：配网弹窗等同取消，标注面板等同放弃这张图。
+func _dismiss_modal() -> void:
+	if _editor.visible:
+		_editor.call("close_modal")
+	elif _wifi_popup.visible:
+		_wifi_popup.call("close")
 
 # ============================== BLE ==============================
 
@@ -559,7 +634,23 @@ func _handle_board_msg(data: Dictionary) -> bool:
 	return true
 
 func _on_stream_toggled(on: bool) -> void:
+	Store.set_stream_on(on)
 	_apply_stream(on)
+
+## 虚拟按键开关：整块摇杆/直控区显隐（持久化，下次启动按此恢复）。
+func _on_direct_ctrl_visible_toggled(on: bool) -> void:
+	Store.set_direct_ctrl_on(on)
+	_ctrl_area.visible = on
+	_sync_bottom_padding()
+
+## 摇杆区隐藏时输入框贴底，软键盘会盖住它：撑起底部占位把聊天区抬起来，键盘收起即还原。
+## 弹窗期间不抬（弹窗自带输入框，遮罩下面的聊天区不该跟着动）。
+func _sync_bottom_padding() -> void:
+	var want: bool = not _modal_open() and not _ctrl_area.visible \
+		and DisplayServer.has_feature(DisplayServer.FEATURE_VIRTUAL_KEYBOARD) \
+		and DisplayServer.virtual_keyboard_get_height() > 0
+	if _bottom_padding.visible != want:
+		_bottom_padding.visible = want
 
 ## 图传开关统一出口：开 → 先起 UDP 接收拿本地端口，再发 stream(udp_port) 让板子向该端口推 JPEG；
 ## 关 → 停 UDP 接收并发 stream off。_on_ws_connected / /stream 均走这里，保证端口上报一致。
@@ -658,6 +749,7 @@ func _on_editor_cancelled() -> void:
 ## 聊天区「图传」旁路请求（/stream 由 ChatPanel 解析后交给 Main 统一起停 UDP 接收）。
 func _on_chat_stream_requested(on: bool) -> void:
 	_stream_toggle.set_pressed_no_signal(on)
+	Store.set_stream_on(on)
 	_apply_stream(on)
 
 ## 图传标定网格叠加（/grid 本地开关，配合单应标定测量）。
@@ -669,6 +761,7 @@ func _on_chat_grid_requested(on: bool) -> void:
 func _process(_delta: float) -> void:
 	if _joy_held:
 		_update_joystick()
+	_sync_bottom_padding()
 
 func _update_joystick() -> void:
 	# 内置 VirtualJoystick 把分量写入 4 个 vjoy_* action，据此还原方向向量

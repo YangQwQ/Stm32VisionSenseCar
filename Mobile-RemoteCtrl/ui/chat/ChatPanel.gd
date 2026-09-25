@@ -14,6 +14,7 @@ signal image_pick_requested()
 const CP := preload("res://net/proto/CommandProto.gd")
 const SC := preload("res://ui/chat/SlashCommands.gd")
 const MAX_IMAGES := 3
+const MAX_HISTORY := 50   # 输入历史落盘保留的条数上限
 
 ## 底部面板（TabContainer）两种内容各自需要的面板高度（anchored 于 ChatLog 底部）。
 const _HINT_AREA_H := 43.0
@@ -37,6 +38,7 @@ var _ai_running := false
 var _attachments: Array = []
 ## 输入历史（仅纯文本）：上/下键翻阅，_history_idx 指向当前展示项。
 ## _history_idx == size() 表示停在"当前草稿位"；_draft 存首次上翻前未发送的输入，供下键恢复。
+## 历史落盘持久化（Store），启动时读回。
 var _input_history: PackedStringArray = []
 var _history_idx: int = -1
 var _draft: String = ""
@@ -45,6 +47,8 @@ func _ready() -> void:
 	# 删除按钮在脚本里连接（tscn 逐个连太啰嗦）。
 	for i in _panels.size():
 		_panels[i].get_node("delBtn").pressed.connect(_on_del_pressed.bind(i))
+	_input_history = Store.get_input_history()
+	_history_idx = _input_history.size()
 	set_process_input(true)
 	_refresh_bottom()
 
@@ -342,6 +346,9 @@ func _push_to_history(text: String) -> void:
 		return
 	if _input_history.is_empty() or _input_history[-1] != text:
 		_input_history.append(text)
+		if _input_history.size() > MAX_HISTORY:
+			_input_history = _input_history.slice(_input_history.size() - MAX_HISTORY)
+		Store.set_input_history(_input_history)
 	_history_idx = _input_history.size()  # 指向"末尾之后"=草稿位
 	_draft = ""                            # 发送后重置待恢复的草稿
 

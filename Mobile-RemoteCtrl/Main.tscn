@@ -12,7 +12,6 @@
 [ext_resource type="FontFile" uid="uid://cj1s2ldyof8o4" path="res://res/MapleMono-NF-CN-Regular.ttf" id="7_fpfj3"]
 [ext_resource type="Script" uid="uid://cnuwqenuysr1h" path="res://ui/provision/WifiConfigPopup.gd" id="7_trn2v"]
 [ext_resource type="Texture2D" uid="uid://216chvs4p2dt" path="res://res/control.png" id="8_5vvyt"]
-[ext_resource type="PackedScene" uid="uid://b3nn00g0v4o37" path="res://ui/editor/ImageEditor.tscn" id="8_editor"]
 [ext_resource type="Texture2D" uid="uid://bg3hhwm1rvnco" path="res://res/control_a.png" id="9_j4qnp"]
 [ext_resource type="Texture2D" uid="uid://b23cof1akfklg" path="res://res/YP.jpg" id="9_kjvhd"]
 [ext_resource type="Texture2D" uid="uid://dni0iuv07coxu" path="res://res/SYF.jpg" id="10_5tuhn"]
@@ -20,6 +19,8 @@
 [ext_resource type="Texture2D" uid="uid://1uxvy1j5nvue" path="res://res/settings.png" id="12_sc1dx"]
 [ext_resource type="Script" uid="uid://dugospfdag2u2" path="res://ui/video/GridOverlay.gd" id="13_grid"]
 [ext_resource type="Script" uid="uid://dgct6qpk5wr7s" path="res://ui/bluetooth/ScanPanel.gd" id="14_scan"]
+[ext_resource type="Script" uid="uid://64g1jpram2nr" path="res://ui/editor/ImageEditor.gd" id="20_devvj"]
+[ext_resource type="Script" uid="uid://btli42s8fbnmg" path="res://ui/editor/EditorCanvas.gd" id="21_3b0ty"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_03owx"]
 content_margin_left = 20.0
@@ -772,6 +773,20 @@ corner_detail = 5
 shadow_color = Color(0, 0, 0, 0.5)
 shadow_size = 14
 
+[sub_resource type="StyleBoxFlat" id="StyleBox_editor"]
+content_margin_left = 24.0
+content_margin_top = 24.0
+content_margin_right = 24.0
+content_margin_bottom = 24.0
+bg_color = Color(0.059, 0.09, 0.165, 0.98)
+corner_radius_top_left = 12
+corner_radius_top_right = 12
+corner_radius_bottom_right = 12
+corner_radius_bottom_left = 12
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_f4ese"]
+bg_color = Color(0.022776132, 0.041815445, 0.08869488, 0.73333335)
+
 [node name="Main" type="Control" unique_id=642551059]
 layout_mode = 3
 anchors_preset = 15
@@ -870,10 +885,13 @@ vertical_alignment = 1
 
 [node name="BodyBTScan" type="VBoxContainer" parent="." unique_id=1424407206]
 layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+anchor_bottom = 1.0
 offset_left = 10.0
 offset_top = 240.0
-offset_right = 1430.0
-offset_bottom = 2950.0
+offset_right = -10.0
+offset_bottom = -250.0
 offset_transform_enabled = true
 offset_transform_visual_only = false
 theme_override_constants/separation = 16
@@ -929,9 +947,8 @@ theme_override_constants/separation = 16
 
 [node name="Video" type="Control" parent="BodyControl" unique_id=1319034480]
 visible = false
-custom_minimum_size = Vector2(1080, 720)
+custom_minimum_size = Vector2(1080, 1080)
 layout_mode = 2
-size_flags_vertical = 3
 mouse_filter = 1
 script = ExtResource("5_trn2v")
 
@@ -974,13 +991,20 @@ script = ExtResource("13_grid")
 
 [node name="VidControls" type="HBoxContainer" parent="BodyControl" unique_id=1105787060]
 layout_mode = 2
-theme_override_constants/separation = 12
+theme_override_constants/separation = 20
 
 [node name="StreamToggle" type="CheckButton" parent="BodyControl/VidControls" unique_id=1274197512]
 custom_minimum_size = Vector2(300, 100)
 layout_mode = 2
 focus_mode = 0
 text = "图传"
+
+[node name="DirectCtrlToggle" type="CheckButton" parent="BodyControl/VidControls" unique_id=1967660234]
+custom_minimum_size = Vector2(350, 100)
+layout_mode = 2
+focus_mode = 0
+button_pressed = true
+text = "虚拟按键"
 
 [node name="AnnotateBtn" type="Button" parent="BodyControl/VidControls" unique_id=506274721]
 custom_minimum_size = Vector2(220, 100)
@@ -1322,12 +1346,25 @@ theme_override_styles/hover_pressed = SubResource("StyleBoxFlat_c2s76")
 toggle_mode = true
 text = "尾灯"
 
+[node name="BottomPadding" type="Panel" parent="BodyControl" unique_id=1250738945]
+visible = false
+custom_minimum_size = Vector2(0, 740)
+layout_mode = 2
+size_flags_stretch_ratio = 1.22
+mouse_filter = 1
+theme_override_styles/panel = SubResource("StyleBoxEmpty_3y6u5")
+
 [node name="BodyAbout" type="VBoxContainer" parent="." unique_id=19168388]
 layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+anchor_bottom = 1.0
 offset_left = 10.0
 offset_top = 240.0
-offset_right = 1430.0
-offset_bottom = 2950.0
+offset_right = -10.0
+offset_bottom = -250.0
+grow_horizontal = 2
+grow_vertical = 2
 offset_transform_enabled = true
 offset_transform_position = Vector2(40, 0)
 offset_transform_position_ratio = Vector2(2, 0)
@@ -1521,6 +1558,16 @@ texture_pressed = ExtResource("12_sc1dx")
 ignore_texture_size = true
 stretch_mode = 3
 
+[node name="BGDimSharder" type="ColorRect" parent="." unique_id=560222472]
+visible = false
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0, 0, 0, 0.65)
+
 [node name="WifiPopup" type="PanelContainer" parent="." unique_id=1667705642]
 visible = false
 layout_mode = 1
@@ -1612,12 +1659,103 @@ layout_mode = 2
 size_flags_horizontal = 3
 text = "连接"
 
-[node name="ImageEditor" parent="." unique_id=204808822 instance=ExtResource("8_editor")]
+[node name="ImageEditor" type="Control" parent="." unique_id=204808822]
 visible = false
 layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("20_devvj")
+
+[node name="Panel" type="PanelContainer" parent="ImageEditor" unique_id=1162974657]
+layout_mode = 1
+anchors_preset = -1
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -576.0
+offset_top = -440.0
+offset_right = 576.0
+offset_bottom = 550.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_styles/panel = SubResource("StyleBox_editor")
+
+[node name="VBox" type="VBoxContainer" parent="ImageEditor/Panel" unique_id=1927840336]
+layout_mode = 2
+theme_override_constants/separation = 25
+
+[node name="Toolbar" type="HBoxContainer" parent="ImageEditor/Panel/VBox" unique_id=325984816]
+custom_minimum_size = Vector2(0, 80)
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="RectBtn" type="Button" parent="ImageEditor/Panel/VBox/Toolbar" unique_id=816937480]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+toggle_mode = true
+text = "方框"
+
+[node name="CircleBtn" type="Button" parent="ImageEditor/Panel/VBox/Toolbar" unique_id=752401855]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+toggle_mode = true
+text = "圆圈"
+
+[node name="UndoBtn" type="Button" parent="ImageEditor/Panel/VBox/Toolbar" unique_id=633847790]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "撤销"
+
+[node name="ClearBtn" type="Button" parent="ImageEditor/Panel/VBox/Toolbar" unique_id=1414112505]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "清除"
+
+[node name="Spacer" type="Control" parent="ImageEditor/Panel/VBox/Toolbar" unique_id=1622606467]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CancelBtn" type="Button" parent="ImageEditor/Panel/VBox/Toolbar" unique_id=1684055791]
+custom_minimum_size = Vector2(80, 0)
+layout_mode = 2
+text = "取消"
+
+[node name="DoneBtn" type="Button" parent="ImageEditor/Panel/VBox/Toolbar" unique_id=1792465908]
+custom_minimum_size = Vector2(80, 0)
+layout_mode = 2
+text = "采用"
+
+[node name="ViewportWrap" type="PanelContainer" parent="ImageEditor/Panel/VBox" unique_id=1824597902]
+layout_mode = 2
+size_flags_vertical = 3
+theme_override_styles/panel = SubResource("StyleBoxFlat_f4ese")
+
+[node name="SubViewportContainer" type="SubViewportContainer" parent="ImageEditor/Panel/VBox/ViewportWrap" unique_id=1028011752]
+layout_mode = 2
+stretch = true
+
+[node name="Viewport" type="SubViewport" parent="ImageEditor/Panel/VBox/ViewportWrap/SubViewportContainer" unique_id=792698952]
+transparent_bg = true
+handle_input_locally = false
+size = Vector2i(1104, 837)
+render_target_update_mode = 0
+
+[node name="Canvas" type="Control" parent="ImageEditor/Panel/VBox/ViewportWrap/SubViewportContainer/Viewport" unique_id=716677853]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("21_3b0ty")
 
 [connection signal="toggled" from="BodyBTScan/RefreshBtn" to="." method="_on_refresh_toggled"]
 [connection signal="toggled" from="BodyControl/VidControls/StreamToggle" to="." method="_on_stream_toggled"]
+[connection signal="toggled" from="BodyControl/VidControls/DirectCtrlToggle" to="." method="_on_direct_ctrl_visible_toggled"]
 [connection signal="pressed" from="BodyControl/VidControls/AnnotateBtn" to="." method="_on_annotate_pressed"]
 [connection signal="grid_requested" from="BodyControl/ChatPanel" to="." method="_on_chat_grid_requested"]
 [connection signal="stream_requested" from="BodyControl/ChatPanel" to="." method="_on_chat_stream_requested"]
@@ -1634,3 +1772,9 @@ layout_mode = 1
 [connection signal="pressed" from="WifiPopup/VBox/Btns/Confirm" to="WifiPopup" method="_on_confirm_pressed"]
 [connection signal="cancelled" from="ImageEditor" to="." method="_on_editor_cancelled"]
 [connection signal="image_sent" from="ImageEditor" to="BodyControl/ChatPanel" method="_on_image_sent"]
+[connection signal="pressed" from="ImageEditor/Panel/VBox/Toolbar/RectBtn" to="ImageEditor" method="_on_rect_pressed"]
+[connection signal="pressed" from="ImageEditor/Panel/VBox/Toolbar/CircleBtn" to="ImageEditor" method="_on_circle_pressed"]
+[connection signal="pressed" from="ImageEditor/Panel/VBox/Toolbar/UndoBtn" to="ImageEditor" method="_on_undo_pressed"]
+[connection signal="pressed" from="ImageEditor/Panel/VBox/Toolbar/ClearBtn" to="ImageEditor" method="_on_clear_pressed"]
+[connection signal="pressed" from="ImageEditor/Panel/VBox/Toolbar/CancelBtn" to="ImageEditor" method="_on_cancel_pressed"]
+[connection signal="pressed" from="ImageEditor/Panel/VBox/Toolbar/DoneBtn" to="ImageEditor" method="_on_done_pressed"]

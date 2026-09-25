@@ -10,7 +10,11 @@ var _data: Dictionary = {
 	"last_device": {"address": "", "name": ""},
 	"wifi": {"ssid": "", "password": ""},
 	"ai": {"url": "", "key": "", "model": ""},
-	"settings": {"auto_conn": false, "disable_auto_ws": false, "spin_mode": false},
+	"settings": {
+		"auto_conn": false, "disable_auto_ws": false, "spin_mode": false,
+		"stream_on": false, "direct_ctrl_on": true,
+	},
+	"input_history": [],
 }
 
 func _ready() -> void:
@@ -35,6 +39,22 @@ func get_disable_auto_ws() -> bool:
 
 func get_spin_mode() -> bool:
 	return bool(_data.get("settings", {}).get("spin_mode", false))
+
+func get_stream_on() -> bool:
+	return bool(_data.get("settings", {}).get("stream_on", false))
+
+## 虚拟摇杆区默认可见（与 tscn 中开关默认态一致）。
+func get_direct_ctrl_on() -> bool:
+	return bool(_data.get("settings", {}).get("direct_ctrl_on", true))
+
+## 输入框历史（旧→新，与输入时序一致）；条数上限由使用方裁剪。
+func get_input_history() -> PackedStringArray:
+	var out := PackedStringArray()
+	var a: Variant = _data.get("input_history", [])
+	if a is Array:
+		for it: Variant in a:
+			out.append(str(it))
+	return out
 
 # ============================== 写入 ==============================
 
@@ -86,6 +106,22 @@ func set_spin_mode(v: bool) -> void:
 	_data["settings"] = s
 	_save()
 
+func set_stream_on(v: bool) -> void:
+	var s: Dictionary = _data.get("settings", {})
+	s["stream_on"] = v
+	_data["settings"] = s
+	_save()
+
+func set_direct_ctrl_on(v: bool) -> void:
+	var s: Dictionary = _data.get("settings", {})
+	s["direct_ctrl_on"] = v
+	_data["settings"] = s
+	_save()
+
+func set_input_history(items: PackedStringArray) -> void:
+	_data["input_history"] = Array(items)
+	_save()
+
 # ============================== 文件 ==============================
 
 func _load() -> void:
@@ -116,7 +152,10 @@ func _default_group(grp: String) -> Dictionary:
 		"ai":
 			return {"url": "", "key": "", "model": ""}
 		"settings":
-			return {"auto_conn": false, "disable_auto_ws": false, "spin_mode": false}
+			return {
+				"auto_conn": false, "disable_auto_ws": false, "spin_mode": false,
+				"stream_on": false, "direct_ctrl_on": true,
+			}
 		_:
 			return {}
 
