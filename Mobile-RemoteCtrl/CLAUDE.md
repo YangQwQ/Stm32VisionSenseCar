@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本文档基准：仓库 HEAD `dda6b05`（2026-09-22）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `0a3e8e1`（2026-09-25）。只覆盖已提交内容；未提交改动不收录。
 
 本项目维护指南，供后续编码助手 / 会话快速对齐上下文。
 
@@ -23,19 +23,21 @@
 | WiFi UDP | 图传 JPEG 分片（低延迟；缺片/超时自愈） | 真实（`UDPVideoClient.gd`，分片协议与板侧 `udp_send_frame` 对齐） |
 | 云端多模态 AI | DIRECT：板子直调云端，手机只下发 `ai_goal` | DIRECT（不经手机侧） |
 
-- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `fold` 收臂折叠回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角）/ `light` / `reset` / `stream` / `log`（`cat=exec|ai|all`,`on` 统一日志转发，替代原 `exec_log`/`ai_log`）/ `get_state`（回 `bits` 位图）/ `config` / `ping` / `ai_goal` / `ai_oneshot` / `ai_cancel` / `ai_chat`（`message` 插话）/ `goto`（`x`/`y`，可选 `frame`）/ `nz_read`，另含调试直驱 `servo / motor / drive / arm_pose`。
+- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `low` 低姿夹取准备位、`fold` 收臂折叠回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角或 `ms` 直给通电毫秒）/ `light` / `reset` / `stream` / `log`（`cat=exec|ai|all`,`on` 统一日志转发）/ `get_state`（回 `bits` 位图）/ `config` / `ping` / `pong`（板端保活应答，**带 `bits`**）/ `ai_goal` / `ai_oneshot` / `ai_cancel` / `ai_chat`（`message` 插话）/ `goto`（`x`/`y`，可选 `frame`）/ `nz_read`，另含调试直驱 `servo / motor / drive / arm_pose`。
 - **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）。`ai_oneshot` = 只执行一轮决策即收尾。AI 运行中发送键变「中止」：空文本走 `ai_cancel`，非空文本走 `ai_chat` 插话（补充要求、不打断闭环）。
-- **定距 / 定角**：`move` 的 `distance_cm`、`spin` 的 `angle_deg` 由板端按**时长近似**到点自停（无里程计，靠实测标定表插值），非闭环，供微操与标定粗用；不带则持续动作，靠 `stop` 收尾。
-- **调试与本地指令**：移动/直驱按族收敛——`/move rotate|spin|fore|back|to|arm`（转向舵三档 / 原地旋转 / 定距前进后退 / `to <x> <y> [global]` 移动到指定坐标 → `goto` / 机械臂位姿，`arm` 含 `reset|fold`）与 `/drive motor|servo`（单轮电机或 n=0 全车 / 直驱舵机）经词表下发；`/log <exec|ai|all> [on|off]`（旧 `/exec_log`、`/ai_log` 为别名）与 `/nz_read`（哪吒 I2C 探测）同理；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点。
+- **定距 / 定角**：`move` 的 `distance_cm`、`spin` 的 `angle_deg` 由板端按**时长近似**到点自停（无里程计，靠实测标定表插值），非闭环，供微操与标定粗用；不带则持续动作，靠 `stop` 收尾。`spin` 另有 `ms`（直接给通电毫秒，绕开角度换算与滑行补偿）——**板端 `ms` 优先于 `angle_deg`**，但 `CommandProto.spin` 是 `angle_deg` 优先、`ms` 走 `elif`，故两侧实际只会发其中一个。
+- **调试与本地指令**：移动/直驱按族收敛——`/move rotate|spin|spin_ms|fore|back|to|arm`（转向舵三档 / 原地旋转 / **`spin_ms <毫秒>`** 直接指定通电毫秒、绕开角度换算（标定"真实每度 ms"用）/ 定距前进后退 / `to <x> <y> [global]` 移动到指定坐标 → `goto` / 机械臂位姿，`arm` 含 `reset|fold|low`）与 `/drive motor|servo`（单轮电机或 n=0 全车 / 直驱舵机）经词表下发；`/log <exec|ai|all> [on|off]`（旧 `/exec_log`、`/ai_log` 为别名）与 `/nz_read`（哪吒 I2C 探测）同理；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点；`/clear` 除清聊天区外**同时截断重写本地日志文件**（`AppLog.clear()`）。
 - **重连同步**：WS 连上后主动发一次 `get_state`，板端回 `type:"state"`，`Main.gd._apply_state` → `DirectControl.sync_state` 同步灯光/夹爪按钮（`set_pressed_no_signal`，不回灌指令）。
+- **保活即纠偏**：板端每个心跳周期的 `pong` 都带**当场现测的** `bits`，`WSCarClient` 收到后**照旧上抛**（不吞），由 `Main.gd` 的 `pong` 分支 `_apply_state_bits(bits, true)` 同步——`apply_ai=true`，即**连 AI 运行态也一并覆盖**。这是「AI 任务在跑、发送按钮却没变成中止」的兜底：任务由另一侧起停、或漏收了一次 `ai_result` 时，按钮会在一个心跳周期内自行纠正。`pong` 只同步不打印（否则每几秒一行噪声）。
+  ⚠️ bit 布局与板端 `command.cpp::state_bits()` **逐位 mirror，改一侧必改另一侧**：灯 bit0-2（front/vibe/back）、夹爪 bit3、AI 运行态 bit4。
 
 ## 目录结构
 
 ```
 res://
-  Main.tscn / Main.gd          # App 壳：连接编排、页面切换（含左右滑动切页）、摇杆映射、图传开关、连接状态；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）
-  state/LocalStore.gd          # autoload 本地持久化（last_device / wifi / ai 配置 / 设置项）
-  state/AppLog.gd              # autoload 本地日志落盘：每次启动截断重写 user://logs/app.log，聊天区每行统一写入
+  Main.tscn / Main.gd          # App 壳：连接编排、页面切换（含左右滑动切页）、摇杆映射、连接状态；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）；**图传开关与直控面板开关在控制页 `BodyControl/VidControls`（`StreamToggle`/`DirectCtrlToggle`），不在「关于」页**；**图片标注（ImageEditor）节点内联于本场景**
+  state/LocalStore.gd          # autoload 本地持久化（last_device / wifi / ai 配置 / 设置项 / `input_history` 输入历史）
+  state/AppLog.gd              # autoload 本地日志落盘：每次启动截断重写 user://logs/app.log，聊天区每行统一写入；`clear()` 供 `/clear` 截断
   animation/AnimationManager.gd # autoload 通用动画（淡入+缩放滑入/滑出、上下浮动）
   net/
     DeviceConn.gd              # 统一连接层（单一事实源）：持有 BLE/WS/UDP、send_command 统一出口、最新帧 current_image
@@ -54,7 +56,7 @@ res://
     chat/SlashCommands.gd      # /指令 解析器（文本 → 词表指令/本地动作，纯解析，无副作用）
     bluetooth/BTDeviceListItem.tscn+.gd  # 蓝牙设备列表项
     bluetooth/ScanPanel.gd     # 蓝牙扫描页（设备列表/刷新动画/空提示，挂 BodyBTScan 节点）
-    editor/ImageEditor.tscn+.gd + EditorCanvas.gd  # 图片标注（框/箭头/文字）
+    editor/ImageEditor.gd + EditorCanvas.gd  # 图片标注（框/箭头/文字）；节点整块内联在 `Main.tscn`（`Main.tscn:1662` 起，含 SubViewport），两个脚本在本目录
     provision/WifiConfigPopup.gd  # 配网弹窗（脚本建树）
 ```
 
@@ -96,14 +98,6 @@ res://
 - 导出预置：`export_presets.cfg` 中 `gradle_build/use_gradle_build=true`，但实际走的是 **Godot 标准模板导出**（未真正跑 gradle assemble）；`plugins/GDBLE=false`、`plugins/GDBLEBridge=false`（插件经导出插件注入，不勾这两个开关）。
 
 - **已知坑（MIUI/HyperOS BLE 扫描结果门禁）**：Godot 导出器把 **toggle 勾出来的** `ACCESS_FINE_LOCATION` 固定写成 `android:maxSdkVersion="30"`（API≥31 等于未声明），MIUI 蓝牙栈投递扫描结果前仍检查该权限（日志 `Permission denial: Need ACCESS_FINE_LOCATION...`），不声明+不授予则 onScanResult 永不回调。
-  **已解（2026-09-06，双声明，无需 apktool/pm grant）**：`export_presets.cfg` 里 `access_fine_location=true` **且** `custom_permissions` 含 `android.permission.ACCESS_FINE_LOCATION`，二者**缺一不可**——Godot 会给 custom 那条逐字写一条**无 cap** 的 FINE，与 toggle 的 capped 条共存，Android≥31 认无 cap 那条 → 运行时权限 → `Main.gd._request_ble_permissions()` 启动弹窗授权即过门禁。只 toggle 或只 custom 都会退回单条 capped（无效）。apktool 后处理与 `adb pm grant` 不再需要。
+  **解**：`export_presets.cfg` 里 `access_fine_location=true` **且** `custom_permissions` 含 `android.permission.ACCESS_FINE_LOCATION`，二者**缺一不可**——Godot 会给 custom 那条逐字写一条**无 cap** 的 FINE，与 toggle 的 capped 条共存，Android≥31 认无 cap 那条 → 运行时权限 → `Main.gd._request_ble_permissions()` 启动弹窗授权即过门禁。只 toggle 或只 custom 都会退回单条 capped（无效）。apktool 后处理与 `adb pm grant` 不再需要。
 
-- **已知坑（扫描必现 `扫描失败: JNI call failed`，2026-09-06 已解）**：该字面量是 jni crate 对 `Error::JniCall(ThreadDetached)` 的 Display = 某线程**未 attach JVM** 就调进 Java。gdble 的 gdble-core 工作线程驱动 btleplug 前须 `attach_current_thread_permanently`（`src/android.rs::attach_core_thread`，core.rs 线程闭包调用）；若 .so 缺这段，`start_scan` 里 `global_jvm().get_env()` 直接 JNI_EDETACHED。**根因：主工程 `addons/gdble/android/gdble-release.aar` 里的 libgdble.so 是旧编译产物（缺 attach）**；worktree 同目录 AAR（09-05 20:36）含 attach、才是好的——AAR 是二进制品，不同步导致从主工程导出的包必坏。重编 gdble 后要把 `gdble/target/aarch64-linux-android/release/libgdble.so` 换入**主工程** AAR。查 .so 含不含 attach：字节里搜 `attach_current_thread_permanently failed` / `[GDBLE] Failed to attach core thread`。另：`BLEClient._on_error` 在扫描态失败也发 `scan_finished([])`，下拉框不再卡"扫描中…"。
-
-## 后续待办（不在当前阶段）
-
-- **遗留命名**：板侧本地直驱状态（`exec_status`）在 `Main.gd` / `ChatPanel.gd` 中仍以 `"执行板"` 作为消息来源标签显示，如需改为「状态」需同步两处。
-
-- **遗留不一致（2026-09-16 核对）**：`Main.gd` 摇杆释放分支（非原地旋转模式）发 `CP.servo(1, _SERVO_CENTER)`，而同文件其它「转向回正」路径发 `servo(0, …)`；按 `CommandProto.servo` 的约定 `n=1` 是移爪而非转向舵，该处疑似写错通道号。
-
-- **遗留字段不符**：`CommandProto.arm()` 发 `params.duration_ms`，而板端 `direct_exec.cpp` 的 `arm` 只读 `params.dist_cm`（`duration_ms` 被忽略，等同无定距的持续动作）——违反「词表两侧逐字对应」。目前该 builder 无调用方（UI 走 `DirectControl.gd` 只发 `act`，持续动作靠 `stop` 收尾），启用前需先在两侧统一字段名。
+- **扫描必现 `扫描失败: JNI call failed`（2026-09-06 解）**：该字面量是 jni crate 对 `Error::JniCall(ThreadDetached)` 的 Display = 某线程**未 attach JVM** 就调进 Java。gdble 的 gdble-core 工作线程驱动 btleplug 前须 `attach_current_thread_permanently`（`src/android.rs::attach_core_thread`，core.rs 线程闭包调用）；若 .so 缺这段，`start_scan` 里 `global_jvm().get_env()` 直接 JNI_EDETACHED。**根因：主工程 `addons/gdble/android/gdble-release.aar` 里的 libgdble.so 是缺 attach 的旧编译产物**；worktree 同目录 AAR 含 attach、才是好的——AAR 是二进制品，不同步导致从主工程导出的包必坏。重编 gdble 后要把 `gdble/target/aarch64-linux-android/release/libgdble.so` 换入**主工程** AAR。查 .so 含不含 attach：字节里搜 `attach_current_thread_permanently failed` / `[GDBLE] Failed to attach core thread`。另：`BLEClient._on_error` 在扫描态失败也发 `scan_finished([])`，下拉框不再卡"扫描中…"。

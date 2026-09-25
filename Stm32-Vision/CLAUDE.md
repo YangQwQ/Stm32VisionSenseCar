@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本文档基准：仓库 HEAD `dda6b05`（2026-09-22）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `0a3e8e1`（2026-09-25）。只覆盖已提交内容；未提交改动不收录。
 
 本文件为当前项目（ESP32-S3-CAM / OV3660 摄像头板）的 AI 助手工作指南。
 
@@ -10,7 +10,7 @@
 
 ### 工作模式
 
-1. **WiFi 直连 AI 模式**：板子经 WiFi 直调多模态 AI 接口，上传画面 → 解析返回控制指令 → **本板直接执行**（`exec::act`）。✅ 已实现（DIRECT：`ai_goal` → `ai_client` 迭代闭环，真机联调中）。AI 侧另维护**画面标定（单应）+ 物体空间记忆 + 车姿态累积**并把结果换算成当前车头局部系喂回模型；是否携带上一帧做运动对比由模型用 `carry_prev` 自行决定。云端持续无有效响应会逐轮退避、超限即中止任务并回报手机。
+1. **WiFi 直连 AI 模式**：板子经 WiFi 直调多模态 AI 接口，上传画面 → 解析返回控制指令 → **本板直接执行**（`exec::act`）。✅ 已实现（DIRECT：`ai_goal` → `ai_client` 迭代闭环，真机联调中）。AI 侧另维护**画面标定（单应）+ 物体空间记忆 + 车姿态累积**并把结果换算成当前车头局部系喂回模型；下轮是否额外带一张图由模型用 `carry_image` 自行决定。云端持续无有效响应会逐轮退避、超限即中止任务并回报手机。
 2. **蓝牙配置模式**：BLE（GATT Server，广播名 VisionS3）接收配置（WiFi 账号密码 / AI 接口等）→ 存 NVS → **在线重建 STA 生效，不整板重启**（BLE 保活，手机无需重连）。✅ 已实现。**生命周期**：手机在 WS 连上后断开本机 BLE 让出射频（WS_ONLY）；广播开关由 `ble::set_transmission` 统一控制——仅当**真在推帧**（UDP 图传 / MJPEG）时停广播让 WiFi 独占射频；WS 指令/状态通道在位时不关广播，保持可发现（手机随时可重连/兜底，`onDisconnect` 尊重该状态）。
 
 > 本板既是视觉/控制大脑，也是执行器：动作由 `direct_exec`（namespace `exec`）经 `nezha_direct`（namespace `nezha`）软件 I2C 直接下发哪吒扩展板。
@@ -22,30 +22,36 @@
 | 文件 | 作用 |
 | --- | --- |
 | `Stm32-Vision.ino` | 入口：setup 按 cfg→ble→exec→cam→net→web→ai 初始化；loop 调各模块 update + `exec::update_tick()` |
-| `src/cam/camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`；抓帧模式 `CAMERA_GRAB_WHEN_EMPTY`——图传与 AI 是两个并发取帧方，用 `LATEST` 会与之抢缓冲导致取帧卡死）。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*` 并包含 `camera_pins.h`；画质参数（分辨率/JPEG 质量）与画面回正（`vflip`/`hmirror`，使所见即真实方位）集中在 `camera.cpp` `init()` 顶部，推流帧率在 `net/app_httpd.cpp`（`WS_STREAM_FPS`，图传走 UDP） |
+| `src/cam/camera.h/.cpp` | 摄像头初始化 + 抓帧（JPEG 双缓冲，同步取帧 `cam::grab()`；抓帧模式 `CAMERA_GRAB_WHEN_EMPTY`——图传与 AI 是两个并发取帧方，用 `LATEST` 会与之抢缓冲导致取帧卡死）。取帧全经 `s_cam_mtx` 串行。**高清真拍** `request_hires()`（放大镜用）：deinit → init(SVGA) → **连续预热 `HI_WARM` 帧挑有效帧** → 存进常驻 PSRAM 快照 `s_snap` → 回 VGA 再预热；期间 `grab()` 返回 **nullptr**（各方须容错），图传停一拍。⚠️ **只支持 SVGA**：SXGA 会卡死驱动。**型号唯一配置点**：在 `camera.h` 顶部选 `CAMERA_MODEL_*`（AI_THINKER 在 S3 上会空指针崩溃，勿用）；画质与画面回正（`vflip`/`hmirror`）在 `make_config(fs)` + `apply_sensor_calib()`（重建后必须重调，否则校准被清零），`jpeg_buffer_size` 已抬到 256KB，推流帧率在 `net/app_httpd.cpp`（`WS_STREAM_FPS`，图传走 UDP） |
 | `src/cam/camera_pins.h` | 各摄像头型号 GPIO 引脚定义（按 `CAMERA_MODEL_*` 分支） |
 | `src/cam/camera_index.h` | Web 前端页面（HTML/JS 内嵌数组，源自例程，现基本不用） |
-| `src/net/config.h/.cpp` | WiFi / AI 接口配置，NVS 持久化（不再写死 ssid/password） |
+| `src/net/config.h/.cpp` | WiFi / AI 接口配置，NVS 持久化 |
 | `src/net/wifi_net.h/.cpp` | STA 连接 + 断线重连 + 在线换网 `net::reconnect`（namespace `net`）。⚠️ 勿改回 `network`：会与核心库 `Network.h` 在 Windows 大小写不敏感 FS 上遮蔽冲突 |
 | `src/exec/nezha_direct.h/.cpp` | 哪吒扩展板软 I2C 直驱底座：`set_servo(ch,pwm)` / `set_motor(ch,a,b)` / `led(kind,on)`；从机 `0x80`，协议与哪吒硬件一致 |
-| `src/exec/direct_exec.h/.cpp` | **执行层**：`act()` 分发 move/stop/arm/arm_pose/light/reset/spin、连续机械臂动作步进 `update_tick()`（兼管定距/定角到点自停）、离散定位走 S 形缓动 `advance_smooth()`（`ARM_SMOOTH_PEAK`，目标值与实际写入值分离）、二连杆 IK `arm_pose()`、本地合成状态 `read_state()`（含末端前/高与爪限位）、持续型判定 `is_continuous()` |
+| `src/exec/direct_exec.h/.cpp` | **执行层**：`act()` 分发 move/stop/arm/arm_pose/light/reset/spin、连续机械臂动作步进 `update_tick()`（兼管定距/定角到点自停）、离散定位走 S 形缓动 `advance_smooth()`（`ARM_SMOOTH_PEAK`）、二连杆 IK `arm_pose()`、固定位 `arm_low()`/`arm_raise()`、本地合成状态 `read_state()`、持续型判定 `is_continuous()`、`arm_moving()`（持续步进 / grasp 待抬臂 / S 形未收敛三类，供 AI 取帧前等停稳） |
 | `src/exec/bivar.h/.cpp` | 机械臂"夹心坐标"双向散点反距离加权(IDW)插值：FK 用 pwm 距、IK 用 x/h 距；散点表 `kArmPts` 在 Calibration.h，`arm_set()` 实现在 Calibration.cpp |
-| `src/exec/motion_verify.h/.cpp` | **动作后校验**（`mvfy`，namespace 未导出为公共 API）：动作落地后抓帧软解 RGB565、经单应反投影，判"车/臂到底动没动、动到哪"，供死区与"命令发了但没到位"的补救用（阈值/缩放档 `MVFY_*` 在 Calibration.h）。⚠️ 任务栈从 **PSRAM** 分配：内部堆在 AI/TLS/网络初始化后很紧，16384 字节从内部堆 `xTaskCreate` 极易失败（曾实测"任务创建失败"⇒ 全程不采样） |
 | `src/core/heap_watch.h/.cpp` | **内部堆水位哨兵**：20ms 采样内部堆与 DMA 块（`MALLOC_CAP_DMA` 最大连续块），跌到危险线即告警（限流 2s），另出周期"最低/当前"汇总。⚠️ 判"小车是不是要挂了"看**DMA 块**而不是总空闲堆——**碎片化**才是真闸门；DMA 块跌破 `4096B` 时 1600B 的 RX 缓冲已在悬崖边（判据与救活流程见「PC 侧工具」的 `doctor`） |
-| `src/core/command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；手动指令先 `ai::cancel` 打断 AI 闭环再落地；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal`、`goto`→`ai::goto_target`、`ai_chat`→`ai::append_chat`；`log` 统一日志指令走 `blog` 开关；`get_state` 回灯/夹爪/AI busy 位图 `params.bits`；`nz_read` 走 `nezha::probe` I2C 在线探测 |
-| `src/core/board_log.h/.cpp` | 统一日志模块（namespace `blog`）：`logf(cat,...)` 统一串口调试输出（带 `[类]` 前缀），按 `/log` 开关（exec/ai/all）把 `{type:"log",params:{src,text}}` 入队，由转发任务（栈 8192）经 app_httpd 注册的转发器（WS 广播+BLE status）发手机 |
-| `src/ai/ai_client.h/.cpp` | 板载多模态 AI 任务级闭环（DIRECT 直调云端）：可输出的动作见「AI 层要点」的指令词表（`wait`/`approach`/`zoom` 由 worker **本地处理**，其余最终走 `exec::act`）；任务进度以 `tasks` 列表每轮渲染回喂、前几轮思考按 `AI_HIST_N` 环缓存多轮喂回；默认单帧，仅当上轮 `carry_prev:true` 才附带上一帧做运动对比；WS 文本出口统一过 `sanitize_ws_utf8` 消毒（云端偶发残缺 UTF-8，原样进 TEXT 帧会让手机端以 `1007` 断链）；发往云端的长字符串按 UTF-8 边界截断（截半个中文字节会被判 400）；服务端持续无有效响应则逐轮退避，超限中止任务并回报手机。⚠️ 模型回复的**校验与 params 透传**（`validate_cmd`）有一条易踩的不变量，见「AI 层要点」。组包 / 发送 / 记忆三块已拆到下面三个模块 |
-| `src/ai/ai_prompt.h/.cpp` | 系统提示词与请求 body 组装：`PsaBuf`（PSRAM 增长缓冲，`heap_caps_realloc`+`MALLOC_CAP_SPIRAM`，worker 亦用它组 body）；`build_body()` 拼「系统提示词（角色+规则+JSON 格式+标定，不含目标）+ 独立 user(目标) 消息」，历史环逐条作为独立消息回喂构成真多轮对话，另喂执行板状态行与"距上次执行"秒数；图预算 ≤2：`carry_prev` 双帧优先（放弃参考图），否则 参考图(首轮)+当前帧 |
-| `src/ai/ai_mem.h/.cpp` | 空间记忆 + 车姿态（自 `ai_client` 拆出）：`mem_reset()` 新任务起点（车位置=原点、车头=0°、清物体记忆）；`car_update_pose()` 按定距/定角近似累积位姿（move→平移 / spin→转向）；`mem_observe()`（相对车头角，正=右）与 `mem_observe_xy()`（屏幕归一化像素，经单应解算）入表；`mem_feed()` 生成车头局部系记忆文本喂 AI；`mem_find()` 查目标全局坐标；`mem_tick_stale()` 未观测过期轮数 +1。车姿态 `s_car_x/y/heading` 与 `navigate_to` 共享 |
-| `src/ai/ai_http.h/.cpp` | AI TLS 发送层（自 `ai_client` 拆出）：`http_post()` 复用连接 POST 并读响应（keep-alive，成功尽量保留连接供下次复用）；`http_last_status()` 供 worker 做 4xx/429 快速失败判定；`http_stop()` 立即中止在途请求/连接（cancel / set_goal / goto 打断用） |
-| `src/ai/ground_proj.h/.cpp` | 屏幕→地面坐标换算（namespace `ground`）：实测标定点拟合单应，`ground::screen_to_world(px,py,&x,&y)`；标定点 `kGroundCal` 在 Calibration.h，加测点改那里 |
-| `src/ai/ai_dump.h/.cpp` | **AI 抓帧留档**（debug，供 PC 侧复盘）：把**实际发往云端的那一帧原始 JPEG**连同该轮标注（动作、被闸门拒的原因等）留在 PSRAM，6 槽环形；`seq==0` 表示该槽尚未定案、对 HTTP 不可见。每槽缓冲**按需增长**（8KB 步进，只按实际见过的最大帧分配——预留 6×128KB 会白占近 800KB PSRAM）。HTTP 出口：`/ai_dump`（清单，`?after=N` 长轮询）、`/ai_frame?seq=N`（原始字节）。取回与配日志见「PC 侧工具」的 `car_logcat.py` |
-| `src/ai/magnify.h/.cpp` | **放大镜**（namespace `magnify`）：按 AI 给的归一化 `px`/`py` + **绝对倍数** `scale` 裁一小块并放大成新 JPEG 回喂，供"看不清就凑近看"。`crop_to_jpg()` + `last_cost_ms()`/`last_src_px()`（诊断）。解码用**全分辨率**（`JPG_SCALE_NONE`）——**勿退回 1/2**：1/2 解码后放大的是一张已丢掉 3/4 像素的图，看着大了其实全是插值糊出来的。失败时本轮回全幅 |
+| `src/core/lock_guard.h` | `ScopedLock`（RAII：构造取锁 / 析构放锁，`held()` 判是否真拿到，禁拷贝），用于需要显式限界的临界区（如 `ai_dump`） |
+| `src/core/command.h/.cpp` | 统一词表 JSON 分发（与传输解耦、回调应答）；手动指令先 `ai::cancel` 打断 AI 闭环再落地；`apply_network` 在线换网生效；`ai_goal`→`ai::set_goal`、`goto`→`ai::goto_target`、`ai_chat`→`ai::append_chat`；`log` 统一日志指令走 `blog` 开关；状态位图 `cmd::state_bits()` 已导出，`get_state` 与 `pong` **都**回 `params.bits`（手机在一个保活周期内即可自纠 AI 运行态）。⚠️ `ping`/`pong`/`get_state` 三类**不打** `type=` 刷屏行——排查"指令到了没有"时这三类查不到凭据 |
+| `src/core/board_log.h/.cpp` | 统一日志模块（namespace `blog`）：`logf(cat,...)` 统一串口调试输出（带 `[类]` 前缀），按 `/log` 开关（exec/ai/all）把 `{type:"log",params:{src,text}}` 入队，由转发任务（栈 8192）经 app_httpd 注册的转发器（WS 广播+BLE status）发手机；`forward_text(cat, text)` 发**任意长度**文本（自建 PSRAM 副本 + UTF-8/JSON 转义与非法字节清洗），`logf` 那条 256B 栈缓冲装不下 AI 的 reasoning |
+| `src/ai/ai_client.h/.cpp` | AI 任务**外壳**：worker 任务、代际/槽、对外 API（`init`/`update`/`set_goal`/`goto_target`/`cancel`/`busy`/`append_chat`/`logf`/`set_edited_image`）。worker 起来后调 `round_run_task`。⚠️ 任务主体已拆去 `ai_round.cpp`，而 `update()`/`logf()` 的**实现**在 `ai_result.cpp`——按文件名找会扑空（头文件有注明） |
+| `src/ai/ai_round.h/.cpp` | **AI 任务主体**（原 `ai_client.cpp` 的大头）：`round_run_task()` 一轮闭环（取帧 → 组 body → 发送 → 校验 → 落地 → 记账）；跨轮状态全在文件内 `RoundCtx`，**按值建在 worker 的 16KB PSRAM 栈帧上**；`round_prepare`（取帧 / 放大镜）、`land_carry_image`、`round_land`（按工具表序落地）。任务进度以 `tasks` 列表每轮渲染回喂、前几轮思考按 `AI_HIST_N` 环缓存多轮喂回；默认单帧，仅当上轮 `carry_image` 指定了附图才多带一张；WS 文本出口统一过 `sanitize_ws_utf8` 消毒（云端偶发残缺 UTF-8 原样进 TEXT 帧会让手机端以 `1007` 断链）；发往云端的长字符串按 UTF-8 边界截断（截半个中文字节会被判 400）；服务端持续无有效响应则逐轮退避，超限中止任务并回报手机 |
+| `src/ai/ai_result.h/.cpp` | 结果出口：`ai::update()`（消费 worker 回执、推状态）、`ai::logf()`、`enqueue_result()`、`set_edited_image()` / `edited_snapshot()` |
+| `src/ai/ai_validate.h/.cpp` | 校验入口：剥代码块 → 解 JSON → 拒旧版扁平 `type` → **遍历工具表**逐项规范化；硬钳制宏 `AI_MOVE_MAX_CM`(40) / `AI_SPIN_MAX_DEG`(180)。⚠️ 词表本身**不在这里**，在 `src/ai/tools/` |
+| `src/ai/ai_nav.h/.cpp` | 本地巡航 `navigate_to(gen,tx,ty,stop_cm)`、`settle_wheels` / `settle_arm`（取帧前等车/臂停稳），常量 `NAV_*` |
+| `src/ai/tools/` | **AI 工具表**（一工具一文件 + `registry.cpp` 有序表）：`tool.h` 定义 `ToolSpec{key,doc,group,parse,run,feedback,logfmt}`，`t_observe/t_move/t_zoom/t_arm/t_tasks/t_meta.cpp` 各提供 `parse_*`。**表序 = 落地执行顺序**（承重），机制与「加一个工具」的正确流程见「AI 层要点」 |
+| `src/ai/ai_alloc.h` | ArduinoJson 的内存池走 PSRAM（`PsramAllocator` / `g_js_alloc`，定义在 `ai_client.cpp`） |
+| `src/ai/ai_prompt.h/.cpp` | 系统提示词与请求 body 组装：`PsaBuf`（PSRAM 增长缓冲，`heap_caps_realloc`+`MALLOC_CAP_SPIRAM`）；`build_body(PsaBuf&, const BodyReq&)`——入参已改为**具名字段的结构体**（含三组图的 `ImgRef`），拼「系统提示词（角色+规则+JSON 格式+标定，不含目标）+ 独立 user(目标) 消息」，历史环逐条作为独立消息回喂构成真多轮对话，另喂执行板状态行与"距上次执行"秒数；图预算 ≤2，按 `carry_image` 取舍。⚠️ **提示词文案仍在本文件**，尚未搬进工具表（见「AI 层要点」） |
+| `src/ai/ai_mem.h/.cpp` | 空间记忆 + 车姿态（自 `ai_client` 拆出）：`mem_reset()` 新任务起点（车位置=原点、车头=0°、清物体记忆）；`car_update_pose()` 按定距/定角近似累积位姿（move→平移 / spin→转向）；`mem_observe()`（相对车头角，正=右）与 `mem_observe_xy()`（屏幕归一化像素，经单应解算）入表；`mem_feed()` 生成车头局部系记忆文本喂 AI；`mem_find()` 查目标全局坐标；`mem_tick_stale()` 未观测过期轮数 +1；`mem_have_any()` / `mem_have_lost()`（"有目标" vs "有目标但最近看不到"两种情形，供遮挡类提示判断）。**距离口径集中在头文件顶部**：`AI_NEAR_FWD_CM`(20) 近场线、`AI_ARM_UNDER_CM`(7) 已到爪后/臂下、`AI_GRASP_STALE`(3) 时效轮数、`AI_GRASP_MOVE_TOL_CM`/`AI_GRASP_TURN_TOL_DEG` 坐标容差。车姿态 `s_car_x/y/heading` 与 `navigate_to` 共享 |
+| `src/ai/ai_http.h/.cpp` | AI TLS 发送层（自 `ai_client` 拆出）：`http_post()` 复用连接 POST 并读响应（keep-alive）；`http_last_status()` 供 worker 做 4xx/429 快速失败判定；`http_stop()` 立即中止在途请求/连接（cancel / set_goal / goto 打断用）；`extract_content()` 解 SSE/chunked 响应取正文 |
+| `src/ai/ground_proj.h/.cpp` | 屏幕↔地面坐标换算（namespace `ground`）：实测标定点拟合单应，`screen_to_world(px,py,&x,&y)` 与 `world_to_screen(x,y,&u,&v)`（伴随矩阵解析求逆，标定区外返回 false）；标定点 `kGroundCal` 在 Calibration.h，加测点改那里。⚠️ `init()` 的回验超差**只打日志、不禁用单应** |
+| `src/ai/ai_dump.h/.cpp` | **AI 抓帧留档**（debug，供 PC 侧复盘）：把**实际发往云端的那一帧原始 JPEG**连同该轮标注（动作、被判无效的原因等）留在 PSRAM，6 槽环形；`seq==0` 表示该槽尚未定案、对 HTTP 不可见。每槽缓冲**按需增长**（8KB 步进，只按实际见过的最大帧分配——预留 6×128KB 会白占近 800KB PSRAM）。HTTP 出口：`/ai_dump`（清单，`?after=N` 长轮询）、`/ai_frame?seq=N`（原始字节）。取回与配日志见「PC 侧工具」的 `car_logcat.py` |
+| `src/ai/magnify.h/.cpp` | **放大镜**（namespace `magnify`）：`crop_center_jpg(...)` —— `cam::request_hires` 高清真拍（SVGA）+ 用 TJpgDec **部分解码**只解出中央 `(0.25,0.25)-(0.75,0.75)` 再重编码（workbuf 与输出全走 PSRAM，规避 `fmt2rgb888` 整幅软解卡死）→ 输出 400×300，**同源像素密度**；外加 `last_cost_ms()` 诊断 |
 | `src/net/ping_svc.h/.cpp` | `/ping <目标>` 异步 ICMP echo（esp_ping），结果经 cmd 回复通道回报；无目标仍由 command 就地回 `pong` |
 | `src/net/ble.h/.cpp` | BLE GATT Server：配网 + 兜底控制 + status 通知；广播开关随 `set_transmission`（真在推帧即停）（UUID 见下「协议参考」）|
 | `src/net/ota.h/.cpp` | OTA 升级：ArduinoOTA + HTTP `POST /update`（板子固定在车上、串口够不着，刷固件只能走这里；双 OTA 槽见下 `partitions.csv`） |
-| `src/net/app_httpd.cpp` | HTTP（MJPEG / 拍照 / LED 灯）+ WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（默认关，`/log exec on` 开启后约 400ms 一条；状态缓冲须容下含抓手前端的整行，改状态行时同步核对）。注册 `blog` 日志转发器（WS+BLE）。`ws_stream` 任务栈 8192（推流 + 状态上报共用）。人脸检测/识别已停用（宏置 0） |
-| `Calibration.h/.cpp` | **手动校准数据集中区**（根目录）：舵机限位/机械臂参数（STEER/REACH/GRIP/LIFT、ARM_*）、小车定距/定角移动时长表（MV_*/SPIN_MSDEG_*/SPIN_MIN_SPEED/MV_START_MS/MV_MIN_PULSE_MS/ARM_CNT_PER_CM）与旋转枢轴偏置 `SPIN_PIVOT_BEHIND_CM`、`mvfy` 的开关与阈值档 `MVFY_*`、屏幕→地面单应标定点 `kGroundCal`、机械臂夹心散点 `kArmPts`；`bivar::arm_set()` 实现在 Calibration.cpp |
+| `src/net/app_httpd.cpp` | HTTP + WS（端口 81：文本=指令/状态 JSON）+ UDP 图传帧推送 + `exec_status` 周期上报（默认关，`/log exec on` 后约 400ms 一条、状态文本相同则跳过、**OTA 期间停推**；状态缓冲须容下含抓手前端的整行）。注册 `blog` 日志转发器（WS+BLE）。`ws_stream` 任务栈 8192（推流 + 状态上报共用）。**端点**：`/`(302→/stream) `/status` `/control` `/capture` `/zoomshot` `/stream`(MJPEG) `/bmp` `/xclk` `/reg` `/greg` `/pll` `/resolution` `/ai_dump` `/ai_frame` `/coredump`；`POST /update` 实现在 `ota.cpp`。⚠️ `/zoomshot` **只认 `out_w`/`out_h`/`quality`**，固定裁中央 `(0.25,0.25)-(0.75,0.75)`（与 AI 的 `zoom` 同框） |
+| `Calibration.h/.cpp` | **手动校准数据集中区**（根目录）：舵机限位/机械臂参数（STEER/REACH/GRIP/LIFT、ARM_*）、固定位姿 `ARM_LOW_X/H_CM`(8.0/1.0) 与 `ARM_RAISE_X/H_CM`(9.0/9.0)、`GRASP_LIFT_CM`(7.0)、定距表 `MV_SPEED_X/Y` + `MV_COAST_X/Y`（**4 档**，档位 `{0.15,0.25,0.5,1.0}`）与 `MV_START_MS`/`MV_MIN_PULSE_MS`、定角**查表** `SPIN_TBL_DEG/MS`（10 点插值）、`SPIN_MIN_SPEED`/`SPIN_PIVOT_BEHIND_CM`、屏幕→地面单应标定点 `kGroundCal`、机械臂夹心散点 `kArmPts`；`bivar::arm_set()` 实现在 Calibration.cpp |
 | `partitions.csv` | 分区表（sketch 自带，**覆盖** fqbn 的 `huge_app`）：app0/app1 双 OTA 槽各约 3.8MB + `coredump` ⇒ OTA 可用、panic 可落盘 |
 
 ## 直驱执行层要点（`exec` / `nezha`）
@@ -53,26 +59,32 @@
 - **接线**：哪吒 SCL ← GPIO47，SDA ← GPIO14；I2C 速率 ≤200kHz，软 I2C 开漏实现。
 - **物理映射**：四轮 M1左后 / M2右后 / M3右前 / M4左前（左轮 `a` 正前、右轮 `b` 正前）；舵机 Servo1 转向 / Servo2 移爪 / Servo3 夹爪 / Servo4 抬落。
 - **标定限位**（`Calibration.h`，实测）：转向 150/120/180；移爪中位 200（120..250）；夹爪紧 50 / 松 140；抬落中位 180（115..250）。
-- **连续动作**：`lift_up/down`、`reach_forward/backward` 为持续型——`update_tick()` 每拍按 `ARM_STEP_CM`(0.5cm) 沿目标轴步进并保持另一维（reach 保持高度 h、lift 保持 x），经 `arm_pose` 反解联动双舵机下发；到可达域边界/机械限位（末端无实际移动）自动停，收到 `stop(scope="arm")` 或离散动作时清除；`clip/release` 为离散置端，`fold` 收臂折叠回平台位。
+- **连续动作**：`lift_up/down`、`reach_forward/backward` 为持续型——`update_tick()` 每拍按 `ARM_STEP_CM`(0.5cm) 沿目标轴步进并保持另一维（reach 保持高度 h、lift 保持 x），经 `arm_pose` 反解联动双舵机下发；到边界自动停的判据**只看被步进的那一轴**，收到 `stop(scope="arm")` 或离散动作时清除。离散动作：`clip/release` 置端、`fold` 收臂折叠回平台位、**`low`** 降到标定低姿夹取位、**`grasp`** 合爪+定量抬升（`GRASP_LIFT_CM`，抬升在 `update_tick` 异步完成）、**`raise`** 抬到标定固定高位（与持续 `lift_up` 的区别：单发目标走 S 形缓动，不会在边界 IDW 两解间来回跳导致舵机抽搐）。
+- **状态机 `s_arm_mode`**：六态 `low/raise/clip/grasp/release/fold`；移动臂位（`arm_pose`/持续步进）会把模式清回普通。
 - **二连杆 IK**：`arm_pose(x,h)`（x=轴前方 cm，h=地面以上 cm）反解 α/β 后查标定表联动左右两舵机；L1=L2=7.5cm、肩轴离地 9.5cm、可达半径 4..15cm。
-- **无里程计（电机无编码器）**：定距/定角不做闭环，一律按**实测标定表的时长近似**到点自停——`move` 带 `distance_cm` 时按 `MV_SPEED_X/Y`（油门→cm/s）与 `MV_COAST_X/Y`（起停余量）换算时长（需 `cm>0` 且油门非零）；`spin` 带 `angle_deg` 时按 `SPIN_MSDEG_X/Y` 换算；`arm` 的 `dist_cm` 按每 cm ≈ `ARM_CNT_PER_CM` 拍近似。不带定距/定角即为持续动作，靠 `stop` 收尾；AI 侧对无 `distance_cm` 的持续 move 另设 `AI_MOVE_CAP_MS` 上限兜底。
-- **原地旋转**：`spin` 的 `dir` = `+1` 右转（顺时针，左轮进/右轮退）/ `-1` 左转 / `0` 停（显式写 0 速度）；`dir≠0` 时转速低于 `SPIN_MIN_SPEED` 会被抬高（低于实测拖动线拖不动）。`move` 与 `stop` 都会清掉旋转状态。
-- **状态行**：`read_state()` 合成 `小车:<速度> <动作> | 抓手:前Xcm 高Ycm 爪:<合/开/中><限位提示>`，末端位置由正运动学算出。
+- **无里程计（电机无编码器）**：定距/定角不做闭环，一律按**实测标定表的时长近似**到点自停——`move` 带 `distance_cm` 时按 `MV_SPEED_X/Y`（油门→cm/s）与 `MV_COAST_X/Y`（起停余量）换算时长（需 `cm>0` 且油门非零）；`spin` 带 `angle_deg` 时在 `SPIN_TBL_DEG/MS` 上**查表插值**；`arm` 的 `dist_cm` 按每 cm ≈ `ARM_CNT_PER_CM` 拍近似。不带定距/定角即为持续动作，靠 `stop` 收尾。
+- ⚠️ **定距必须先降档再写电机**：`pick_throttle_for(a, cm)` 取「起停余量 `c` 小于本次距离」的最低已标定档，且**写进电机的油门与算时长的油门是同一个值**。否则 `plerp` 在首档以下整段钳位，`cm ≤ c(a)` 时脉冲会塌成 `MV_MIN_PULSE_MS` 的满油门一冲——AI 以为在做厘米级微调，实际是一脚油门。请求油门低于最低档（AI 偶发 0.1）时抬到最低档，**表外不外推**。
+- ⚠️ **`spin` 的持续旋转没有时限兜底**：`dir≠0` 且不给 `angle_deg`/`ms` 时**什么都不设**，只能靠显式 `stop` / `spin dir=0` 收尾。AI 侧靠 `t_move` 自动补 `AI_SPIN_DEFAULT_DEG`(30°) 兜底，**裸摇杆不加 `angle_deg` 会一直转**。
+- **原地旋转**：`spin` 的 `dir` = `+1` 右转（顺时针，左轮进/右轮退）/ `-1` 左转 / `0` 停（显式写 0 速度）；`dir≠0` 时转速低于 `SPIN_MIN_SPEED` 会被抬高（低于实测拖动线拖不动）。另有 `ms` 口（直接指定通电毫秒，**优先于** `angle_deg`，供标定/调试）。`move` 与 `stop` 都会清掉旋转状态。
+- **状态行**：`read_state()` 合成 `小车状态:<速度> 方向<前/左/右> | 夹爪:前Xcm(码) 高Ycm(码) 爪:<clip/release><模式词>`，`爪` 给的是 **`clip`/`release`**，尾部挂 `low/raise/clip/grasp/release/fold` 模式词，末端位置由正运动学算出。⚠️ 状态串口径变更后，凡按旧串解析的地方（手机端、`tools/`）都要同步。
+- **灯初始状态**：`exec::init()` 主动把三盏灯都写成关并清本地 `s_light_*`——哪吒寄存器会保持灯态，MCU 重启后不同步。
 - **手动指令优先**：`move/stop/arm/drive/spin/servo/motor/arm_pose/reset` 视为手动接管，先 `ai::cancel` 再落地；`arm`/`arm_pose` 只停轮子（`StopMode::Wheels`），其余类型用户指令已覆盖故不补停。手动路径同时清掉上一轮遗留的定距/定角时限，避免旧时限在新指令之后误停。
 
 ## AI 层要点（`ai`）
 
-- **AI 指令词表**（模型能输出的 `type`，与手机端词表是**两套**，勿混）：`move` / `stop` / `arm` / `spin` / `arm_pose` / `wait`（空操作）/ `approach`（按记忆自动靠近到约 10cm）/ `zoom`（放大镜）/ `light`（开/关车灯）。其中 `wait`/`approach`/`zoom` 由 worker **本地处理**、到不了 `exec`，因此也**不经过 `fmt_last`**；`fmt_last` 只为 `move`/`arm`/`arm_pose`/`spin`/`light` 单列了分支，其余（`stop`/`reset`）落到 `else` 一律被写成 `"stop"`。
-- ⚠️ **`validate_cmd` 是"逐个显式拷贝"白名单 params 键**：把某个 type 加进白名单**不够**——下游 worker / `exec` 读的键只要没在那个块里显式拷一遍，拿到的就**永远是默认值，而且不报错**。已踩三次，全是"执行了却没反应"：
-  1. `light` 漏 `kind`/`on` ⇒ `exec::act("light")` 收到空 kind 被拒；
-  2. `zoom` 漏 `px`/`py`/`scale`/`reset` ⇒ **放大镜无论 AI 报哪儿都只裁画面正中心**。这条最阴：提示词里有**四处**让 AI"用 zoom 看目标位置"，而合爪的**唯一判据**是"放大图里方块落在两指之间" ⇒ 整段提示词静默失效，AI 反复 zoom 也永远看不到目标。排查"AI 总夹空 / 反复 zoom 空转"**先查这里**；
-  3. 模型把**顶层字段塞进 `params`**（实测漏过一次 `done`）⇒ 它以为标了"完成"、程序只在顶层读、任务在该结束的轮次继续空跑（`done`/`carry_prev` 已加两处容错）。
-  **改词表的四步**：① 加 type 白名单；② 加 act/kind 类**非法值校验**（让 AI 收到明确拒绝，而不是默默用默认值）；③ 加**透传拷贝**；④ 若该 type 有日志，加 `fmt_last` 分支（否则落进 `else` 被打成 `"stop"`，复盘时把 A 动作误读成"已停车"）。白名单块开头另有一条**兜底告警**：遇到未登记的 params 键会 `logf` 一句，别只靠"现象反推"。
-- **同源不变量**：程序喂回 AI 的措辞、闸门判据、程序给出的补救动作、**日志的措辞**必须互相自洽——AI 能看见的只有这些字，四处说法不一致它就会做出与程序预期相反的动作。
-- **`zoom` 语义**：`px`/`py` 是**归一化画面坐标**（框半宽 = `0.5/scale`，`scale` 是**相对全幅的绝对倍数**、不累乘，上下限 `AI_ZOOM_MIN/MAX`）；程序用"已发出的框"把 AI 此后在放大图里报的 0~1 坐标自动换算回全幅，所以 AI 在放大图里照常填 0~1。同一块画面被重复索要且车臂未动 ⇒ 判复读，超过 `AI_ZOOM_NOOP_MAX` 次强制回全幅。
-- **车灯**：`kind` 分 `front`/`vibe`/`back`——**`back` 是中性白光，唯一适合照亮判色**；`front`/`vibe` 是绿光会把整幅画面染绿，使黄/绿判别直接失效，找方块时不要用。亮环境下开背灯几乎不增亮（只是把色比拉回中性），暗环境才真有增益。⚠️ 测"灯开没开"**别看绝对亮度帧差**（环境光十几秒内就会漂），要看**色比**（`R/G≈0.98` 即背灯签名）。
-- **抓取范式**：现行抓取流程与用户给定的目标范式**尚有多处不符**（含 `zoom` 的使用时机、
-  丢失目标的尝试次序、`y<7` 后退线）——**改抓取相关提示词或闸门文案前，先读「已知问题」第 1 条**。
+- **AI 工具表**（模型输出的**顶层键**，与手机端词表是**两套**，勿混）：唯一定义在 `src/ai/tools/registry.cpp` 的 `kTools[]`，校验 / 落地 / 回执 / 日志四阶段共享同一份。现行 13 项：`observe` / `carry_image` / `move` / `zoom` / `task_note` / `tasks` / `task_done` / `task_goal` / `arm` / `light` / `reason` / `done` / `goal`。纯元数据与观测类（`observe`/`carry_image`/`zoom`/`task_*`/`reason`/`done`/`goal`）由 worker **本地处理**，只有 `move`/`arm`/`light` 最终落到 `exec`。
+  - ⚠️ **表内顺序承重，且指的是"落地执行顺序"**（就是 `round_land` 的实际次序，带时序语义）：`carry_image` 必须在**所有动作之前**取帧，`approach`（自己会挪车）排在其它动作之前。**改表序前先读** `ai_round.cpp` 里 `land_carry_image` / approach 块 / 夹取前特写三处注释。提示词的呈现顺序**不是**这个顺序。
+  - ⚠️ **现状只做到"阶段 1"**：`ToolSpec` 的 `doc`/`group`（给模型读的文案）与 `run`/`feedback`/`logfmt`（落地与回执）**全为 nullptr 是有意的**——文案仍写在 `ai_prompt.cpp`、落地仍手写在 `round_land`。所以**加一个新工具仍要改四处**：① 写 `parse_*`（`t_*.cpp`）；② `tool.h` 加声明；③ `registry.cpp` 按执行序插一行；④ 改 `ai_prompt.cpp` 文案 + `round_land` 落地。`tools_selfcheck()` 只打日志**不 assert**（板子在车里，带病上电也比 panic 好救）。
+  - ⚠️ `feedback`/`logfmt` 拿到的 `cmdD` 是 **const** `JsonDocument` ⇒ 类型检查只能用 `is<JsonObjectConst>()`/`is<JsonArrayConst>()`；写成 `is<JsonObject>()` **恒 false 且照样编译过**（见 memory `arduinojson-const-variant-is-false`）。另：`parse` 返回的指针**不保证**指向 `err`，允许直接返回静态字面量，调用方只许当只读串用。
+- **各通道参数**：`observe`(`name` / `px` / `py` / 可选 `rel_deg` `dist_cm`) · `carry_image`(`"zoom"`|`"full"`|`"image1"~"image3"`) · `move`(`type` = `throttle`（`throttle`/`steering`/`distance_cm`≤`AI_MOVE_MAX_CM`）/ `spin`（`dir`/`speed`/`angle_deg`≤`AI_SPIN_MAX_DEG`）/ `approach`（`target`）) · `zoom`（**单个 bool**）· `arm`(`type` = `low`|`raise`|`fold`|`grasp`|`clip`|`release`|`pose`，`pose` 带 `x`/`h`) · `light`(`kind`/`on`，**`on` 必须显式给 bool，缺省直接拒**——防 AI 漏写把灯误关) · `goal`(`"finish"`|`"abort"`|`"fail"`，非法值**明拒**) · `done`（只认 `true`）· `reason`/`task_note`/`task_goal`（字符串）· `tasks`（数组）· `task_done`（`{index}`，**1-based**）。
+- **`approach` 与合爪不能同轮**：`grasp`/`clip` 与 `approach` 同轮会被拦（提示 AI 先 approach、下轮据画面确定是否对齐再夹）；`arm low/fold/raise`、`light` 可与 `approach` 并行。
+- **`goal:"abort"`**：AI 可主动暂停任务**并等用户输入**（`AI_WAIT_USER_MS`=60s，等待期只轮询插话/代际/超时）。
+- **⚠️ 程序会补默认值 = 改写模型意图**：缺 `distance_cm` 时补 `AI_MOVE_DEFAULT_CM`(8cm)、缺 `angle_deg` 时补 `AI_SPIN_DEFAULT_DEG`(30°)，补写点在 `parse_move`（`t_move.cpp`，`move` 的唯一规范化出口）。而"不写"的原意本是**持续动作**（靠后续指令收尾），故这是已知坏味道。
+- **为什么有这张表**：加一个动作原本要同步改**四处**（提示词文案 `ai_prompt.cpp` / 校验白名单 / 落地分派 `round_land` / 执行 `exec::act`），四处各写一套，**漏一处不报错、只是静默失效**（`light` 的 `kind`/`on` 被收空 kind 拒掉、顶层 `done` 被模型塞进 `params` 都踩过）。有表之后**校验**塌缩成改一个文件，但**文案与落地这两处尚未并入**（阶段 1）。
+- **同源不变量**：程序喂回 AI 的措辞、程序给出的补救动作、**日志的措辞**必须互相自洽——AI 能看见的只有这些字，说法不一致它就会做出与程序预期相反的动作。
+- **`zoom` 语义**：`{"zoom":true}` = 要一张放大图（**单次**，发完自动回全幅）、`false` = 显式回全幅。**框与倍数不由 AI 给**，程序固定发中央框 `(0.25,0.25)-(0.75,0.75)`（`set_zoom_box(0.5,0.5,AI_ZOOM_DEF=2)`），并用"已发出的框"把 AI 在放大图里报的 0~1 坐标**算术换算**回全幅（`to_full_x/y`）——所以 AI 在放大图里照常填 0~1。⚠️ 框**绝对**不累乘（相对当前视图累乘会让倍数失控、夹爪被裁出画面即失去参照）。同一块画面被重复索要且车臂未动 ⇒ 判复读，超过 `AI_ZOOM_NOOP_MAX` 次强制回全幅。
+- **车灯**：`kind` 分 `front`（前灯，**白色**）/ `back`（尾灯，**红色**）/ `vibe`（侧面氛围灯，**深蓝色**）——口径与 `ai_prompt.cpp` 给模型的说明一致。**照亮与判断颜色用 `front`**（唯一白光）。⚠️ 测"灯开没开"**别看绝对亮度帧差**（环境光十几秒内就会漂），要看**色比**；增亮多少取决于环境光，别用绝对亮度判灯态。
+- **抓取范式**：用户给定的目标范式与代码现状的逐条对照写在「已知问题」第 1 条——**改抓取相关提示词前先读那一节**（提示词现行形态是 `[较远]/[接近]/[过近]/[两指之间]` **状态判定式**）。
 - **提示词偏好**：不写死绝对屏幕坐标（定标数值会随摄像头姿态腐烂），优先写方向性 / 差分 / 相对夹爪的判据；词条保持简洁。
 
 ## 构建要点
@@ -111,6 +123,7 @@
 
 **地址解析（两者共用）**：`-H` 指定 → `~/.car_logcat/last_host` 缓存 → 扫本机各 `/24` 网段的 81 端口并用板子指纹（`GET /` 回 `302 /stream`）确认；连上后写回缓存。`--no-scan` = 缓存失效时直接报错而不扫网段。
 ⚠️ 脚本内部已剥离代理环境变量；**手工 `curl` 板端必须加 `--noproxy '*'`**，否则拿回的是代理的错误页（曾据此误判板子死了）。
+⚠️ 但**脚本内部不能把代理一概关掉**：直连与代理两条路**快慢会反过来、且直连会间歇性挂住**（实测直连稳定慢到 10.7s、裸 socket 直连超时，走代理 0.11~0.20s 且内容是板子那份）。故 HTTP 取数**两条路都留**并把选中的记进 `_ROUTE`（首次两条都短试定下来，之后直接用那条，免得每次长轮询都在坏路上白等一个短超时；已定路失败时另一条仍会被试到并改记）。⚠️ **"板子 HTTP 超时"十有八九是客户端选错了路，不是板子抽风**——见 memory `board-http-pc-side-route`。
 
 ### `carctl.py` 子命令
 
@@ -126,12 +139,13 @@
 | `reboot` | 远程重启（链路卡死时的解药） | `--wait SEC`、`--wait-up SEC`（等板子回来） |
 | `doctor` | **分层体检**：在哪层断的就在那层给解药；WS/HTTP 全灭时自动走 **BLE** 重启救活 | `--no-heal`（只诊断）、`--wait-up SEC` |
 | `fw [bin…]` | 读 `.bin` 指纹；不给文件则列出本机编译缓存里的候选 | — |
-| `build` | 用与 IDE 逐字一致的 fqbn 编译（见「构建要点」） | `--clean`（全量重编）、`--flash`（编完直接 OTA + 核对指纹）、`--force`、`--wait-up SEC` |
+| `warns` | 补 `-Wall` 重编本草图，把编译器告警揪出来（**须先 `build` 一次**，靠复用编译缓存） | `-f/--filter SUBSTR`（只查文件名含此子串的编译单元）、`--only-trunc`（只看 `-Wformat-truncation`）、`--limit N` |
+| `build` | 用与 IDE 逐字一致的 fqbn 编译（见「构建要点」） | `--clean`（全量重编）、`--fqbn FQBN`（显式指定，默认自动取 IDE 日志里那串以共用构建缓存）、`--flash`（编完直接 OTA + 核对指纹）、`--force`、`--wait-up SEC` |
 | `ota <bin>` | 推固件 → 等板子回来 → **核对指纹** | `--dry-run`（只报告不上传）、`--force`、`--no-wait`、`--wait-up SEC` |
 | `coredump` | 取 panic 现场并解栈（默认按 coredump 回传的 sha 去归档里自动找 `.elf`） | `--erase`（取完清现场）、`--elf PATH` |
 | `stress` | **abort 风暴**：AI 在途时反复中止，逼出跨任务竞态（改并发 / 修 panic 前后各跑一次对比） | `--rounds N`、`--gap SEC`、`--abort-ms MS`、`--sample SEC`、`--type {ai_oneshot,ai_goal}`、`--goal TEXT`、`--keep-panic` |
 | `frame` | 抓一张（或连拍）画面——手动操作时的眼睛 | `-o/--out PATH`、`-t/--tag TAG`、`-n N`（连拍，看运动用）、`--gap SEC`、`--tries N` |
-| `zoomshot` | 板端 `/zoomshot` 裁块放大一张 —— **手动复核"AI 看到的放大图对不对"**，与 AI 的 `zoom` 同一条链路（板端同一实现） | `--px`/`--py`（归一化框心）、`--scale`（倍率，默认 2）、`-o/--out PATH`、`-t/--tag TAG` |
+| `zoomshot` | 板端 `/zoomshot` 裁出**中央**放大一张 —— **手动复核"AI 看到的放大图对不对"**，与 AI 的 `zoom` 同一条链路（板端同一实现、同一固定框） | `--out-w`/`--out-h`/`--quality`、`-o/--out PATH`、`-t/--tag TAG`。裁框固定中央 `(0.25,0.25)-(0.75,0.75)`，不接受指定区域/倍数 |
 | `step <type> [k=v …]` | **发指令 + 抓帧 + 记状态行三件套**，一起写进 `tools/shots/steps.txt` | `-t/--tag TAG`、`--wait SEC` |
 
 **`step` 是手动复现"夹一次"时最该用的**：一次操作要同时留下「我发了什么 / 板子自报爪子在哪 / 画面实际是什么」，而分开跑三条命令**永远对不上账**（帧比指令晚、状态又是另一时刻的）。合成一条后，帧与状态行取自**同一时刻**、落在**同一个会话文件**里，事后能逐帧对着复盘。它会临时打开 exec 日志转发拿状态行（板端在 WS 断开时自动关掉，不用手动收）。
@@ -145,7 +159,7 @@ uv run tools/carctl.py log -t 30 --cat ai         # 看 AI 的决策
 uv run tools/carctl.py cmd spin dir=1 speed=500   # 发一条词表指令
 uv run tools/carctl.py step arm act=low -t low1   # 手动夹取的一步，留可对照的记录
 uv run tools/carctl.py frame -t after-lift        # 抓一张看结果
-uv run tools/carctl.py zoomshot --scale 3 -t mag3 # 手动放大一块，看 AI 的放大图能不能读
+uv run tools/carctl.py zoomshot -t mag3           # 手动放大中央一块，看 AI 的放大图能不能读
 uv run tools/carctl.py doctor                     # 连不上时的第一条命令
 ```
 
@@ -159,9 +173,13 @@ uv run tools/car_logcat.py --no-frames            # 只记日志，不抓帧
 
 - 日志走 WS（与手机拿到的一模一样，互不干扰——板端是广播给所有 WS 客户端）。
 - **画面留档要两个条件同时满足**，缺一不可：
-  1. 板端固件**有 `ai_dump` 模块** —— 记录仪启动时会先探一次 `/ai_dump`，拿不到（404/超时）就直接判定
-     "本次只记日志"并**全程不抓帧**（`car_logcat.py:1066`），不会途中重试。该探测**与 `/log` 开关无关**，
-     只反映固件版本。
+  1. 板端固件**有 `ai_dump` 模块** —— 记录仪启动时会先探一次 `/ai_dump`，但这一问是**三态**（`has_dump`）：
+     - `True`（回了 `{"slots"…}` 清单）/ `None`（**超时、连不上**）⇒ 都**照起**归档线程；
+     - 只有 `False`（板子**明确**回了非清单应答，典型 404）才判"固件没带这个入口"并**全程不抓帧**（`car_logcat.py:1102`）。
+
+     ⚠️ **`None` 绝不能当"没有"**：一问问不到就锁死会**白白丢掉整场的画面**（实测踩过——刚开 `/log ai on`
+     之后那一问板端还一轮没跑完、HTTP 池也常一时忙），归档线程自己会对失败退避重试，且首次清单从环里
+     **最旧**那帧起回填，晚起步也不会从中间开始丢。该探测**与 `/log` 开关无关**，只反映固件版本。
   2. 板端 **`/log ai on` 已生效** —— 留档只在 blog 的 AI 类别开启时进行，关着时 `dump_push` 一次也不
      memcpy，并在关掉的那一刻把已占的 PSRAM **全部还给堆**（`ai_dump.cpp:62-70`）。
      ⇒ 要用 `--cat ai` 抓帧，**先**确认 `/log ai on` 再生效记录仪，别指望它自己重试。
@@ -186,21 +204,9 @@ uv run python tools/probe_macro.py -i esp_wifi.h -i lwipopts.h # 换探针头文
 
 ## 已知问题
 
-> 均为真机实测 / 源码核对所得。**本节目的是交接——只列仍未解决、或需要留意的**；已修复的不再展开
-> （要考古看 git 历史与 memory）。
+> 均为真机实测 / 源码核对所得。**本节目的是交接——只列仍未解决、或需要留意的**。
 
-**已修复、不再展开**（随提交 `dda6b05` 入库）：
-
-- **放大镜输出坏图** —— 两个独立缺陷：①RGB565 输出级产噪声；②RGB888 路径整体 R/B 互换（黄方块变青）。
-  修法在 `src/ai/magnify.cpp`：解码走 `fmt2rgb888`、放大循环里对调 R/B、编码用 RGB888（3 字节/像素）。
-  两处均**已在真机验证**（以同一次运行内的板出全幅帧做配平对照）。
-  ⚠️ 留一条方法学教训：**彩度模长对 R/B 互换天然免疫**（R↔B 对调让 Cb/Cr 同时取反、模长不变），
-  判颜色正确性必须看**具体像素的通道值**，别只看彩度 / 灰度——当初据此差点漏判。
-  该缺陷曾是夹取一线的主要污染源（同时污染"看不看得见"与"算得准不准"）。
-- **`motion_verify.cpp` 取帧长度口径不一致** —— 已统一改用 `cam::jpeg_len(fb)`（`fb->len` 是**缓冲容量**，
-  会把上一帧残留一起喂进解码器，正是"结构在、颜色毁"坏图的前置条件之一）。
-
-### 1. 抓取流程：范式已定，代码尚有多处不符（**范式由用户给定，代码待按此改**）
+### 1. 抓取流程：范式（用户给定）与代码现状对照
 
 #### 1.1 范式（用户 2026-09-22 给定，作为后续改 AI 流程的基准）
 
@@ -219,42 +225,25 @@ uv run python tools/probe_macro.py -i esp_wifi.h -i lwipopts.h # 换探针头文
    - 局部系 **`y < 7`**（cm）⇒ **后退**（此时物体大致已与夹爪平行、或落在车后）；
    - 目标在夹爪下、**移动时位置不变**（被卡着推走）⇒ **抬臂 + 后退**。
 
-#### 1.2 代码现状（2026-09-22 源码核对）
+#### 1.2 代码现状（`0a3e8e1` 源码核对）
 
-**主线的顺序已经对了**：`src/ai/ai_prompt.cpp:97-103` 就是「I.靠近 → II.降爪(`arm low`) → III.对位
-(小角度 spin + 小步 move 顶进) → VI.夹取 → VII.验证(`wait` 后看是否跟着升起)」，即**低姿先降爪再对准**，
-与范式第 3 条一致。范式第 7 条后半（"被卡着推走 ⇒ 抬臂 + 后退"）也已写进 `:100`（"若后退后目标仍跟随夹爪,
-需要抬起夹爪并后退避免卡住物体"）。**其余各条均有偏差**：
+提示词用 `[较远]/[接近]/[过近]/[两指之间]` 四档说话（`ai_prompt.cpp` 的 `## 夹取[目标物体]时的状态判定`）。
+下表的 ✅ 表示**已与范式一致**：
 
 | 范式 | 代码现状 | 位置 |
 |---|---|---|
-| 2. 近场判据 = 2/3 高 **或** 距离<15 | 只有"画面 2/3 高及以下"；"接近 15cm"只作 **IV 步确认**的辅助判据，不是近场开关 | `ai_prompt.cpp:98` vs `:101` |
-| 3./5. 高度不合适可**略抬爪** | 提示词反向写死「降到这儿以后**高度就不用再管了**, 后面只调角度」；闸门文案同句 | `ai_prompt.cpp:99`、`ai_client.cpp:1087`、`:1540-1541` |
-| 4. `zoom` 只在**末端确认**用 | 对位途中就建议「每走一步停下看画面(**拿不准就 zoom 放大**)」 | `ai_prompt.cpp:100`、词表 `:86` |
-| 6. 丢失次序：原方向 → 动臂查遮挡 → 后退/环视 | 实际是**环视(spin)优先**，后退与 `fold` 收臂并列推荐 | `ai_prompt.cpp:111`、`:113`；`ai_mem.cpp:319-320` 甚至写「看不见多是被两指挡住(正常, **别后退找**)」 |
-| 7. `y < 7` ⇒ 后退 | **全仓库没有任何 y 阈值**；闸门只在 `gfwd < AI_GRASP_FWD_MIN`（= `0`，即已到车后）才拒 | `ai_mem.h:19-20` |
+| 3. 近场**先降爪** | ✅ 一致：`arm low` 是"对准判定"的**前置条件**（`未arm low 或夹爪高度大于2cm` ⇒ 先降爪） | `ai_prompt.cpp` 的对准判定段 |
+| 4. `zoom` 只在**末端**复检 | ✅ 一致：提示词写明"检查[目标物体]是否进入[两指之间]**时才使用**" | `ai_prompt.cpp` 的 zoom 使用时机 |
+| 6. 丢失次序：同方向 → 动臂查遮挡 → 后退/环视 | ✅ 大体一致：「上一步为前进 / arm raise/pose ⇒ 可能被遮挡或过于靠近」（**先动臂**）、「上一步为旋转 ⇒ 可能旋转过头」 | `ai_prompt.cpp` 的丢失提示；`ai_mem.cpp`「看不见先动臂查遮挡, 还看不见才小步后退, 别一丢就退」 |
+| 7. `y < 7` ⇒ 后退 | ◑ 已成为 **`[过近]` 档位**（`AI_ARM_UNDER_CM`=7.0）并驱动措辞，但**不是硬动作**：给的是"位置偏左, 需要稍微后退并左转对准"/"被遮挡…抬臂并后退会比较合适" | `ai_mem.h`（`AI_ARM_UNDER_CM`）、`ai_mem.cpp` 的 `mem_feed`；消费处 `ai_prompt.cpp` |
+| 5. 高度不合适 ⇒ 略抬爪 | ◑ 能力已具备（`arm raise` 固定高位与 `arm pose`），尾部也有"可行方案是抬臂并后退"；但**没有"高度不合适 ⇒ 抬爪"的显式判据** | `ai_prompt.cpp`；`Calibration.h`（`ARM_RAISE_*`） |
+| 2. 近场判据 = 2/3 高 **或** 距离<15 | ◑ 现为 `py>=0.3` **或** 系统提示已`[接近]`，**数字与范式不同**（近场线 20cm；`0.3` 比 2/3 松），且是两条口径并存 | `ai_prompt.cpp`（距离判定）、`ai_round.cpp`（`AI_APPROACH_STOP_CM`=20）、`ai_mem.h`（`AI_NEAR_FWD_CM`=20） |
 
-> ✅ **"略抬爪"在程序上是通的**：闸门对 `arm_pose` 的 `h > AI_GRASP_H_CM`(2.5) **无条件放行**
-> （`ai_client.cpp:135`、`:1508`），`arm lift_up`/`lift_down` 也从不进闸门——**卡住的只是提示词那句话，
-> 不是能力**。改第 3/5 条只需改文案，并把 `arm_pose` 从"一般用不到"（`ai_prompt.cpp:82`）里放出来。
-> 已知的位姿锚点：低姿落点 `ARM_LOW_X_CM`=8.0 / `ARM_LOW_H_CM`=1.0（`Calibration.h:41-42`），
-> 夹取高度闸门 `AI_GRASP_H_CM`=2.5，`arm_pose` 的 `h` 可达约 1~12（`ai_prompt.cpp:82`）；
-> `AI_NEAR_FWD_CM`=14 / `AI_NEAR_BLIND_CM`=12 / `AI_APPROACH_STOP_CM`=10 是近场的一组前距口径。
+位姿锚点：低姿 `ARM_LOW_X/H_CM`=8.0/1.0、固定高位 `ARM_RAISE_X/H_CM`=9.0/9.0、`GRASP_LIFT_CM`=7.0（`Calibration.h`）。
+⚠️ `AI_GRASP_H_CM`=2.5（`ai_round.cpp`）用作 `hide_arm` 判据——判"这个动作会不会把臂挡在镜头前"（只影响提示措辞）。
 
-**⚠️ 同源不变量违规（改代码时要一并清掉）**：
-
-- **残留的旧口径，与范式第 3 条（先降爪）相反**：闸门提醒 `ai_client.cpp:1631`「合爪前用 zoom 确认方块
-  已到两指之间, 还在指尖前方就**回悬停位**小步前顶」、`:1641`「…(**悬停位对准后**)再下探」，以及 `:1638`
-  注释把"悬停位(h=目标高度+3)"当成新范式的可夹带位——都还在把 AI 往**先悬停对准**指。
-  注：`:1534` 的"新范式"指的是"②降爪 在 夹取 之前"，**这条是对的**；错的是上面三处悬停残留。
-- **同一流程两套步号**：`ai_client.cpp:1534` 注释写"②降爪 在 **⑤**夹取 之前"、`:1603` 写低姿横向微调是
-  "新范式的**第③步**"，而提示词 `ai_prompt.cpp:97-103` 的编号是 I~VII（降爪=**II**、对位=**III**、
-  夹取=**VI**）。降爪与对位对得上，夹取差了号——同一件事两处叫不同步号。
-- **度数自相矛盾**：闸门最多说"转约 20°"，程序随后在近场却会把这次 spin 砍到
-  `AI_SPIN_NEAR_MAX_DEG`=6°（或 `AI_SPIN_TRACK_MAX_DEG`=15°）——程序给出自己**执行不了**的度数，
-  量级小、不致跟丢，但会让 AI 困惑。
-
-程序喂给 AI 的字与它自己的判据不自洽，而 **AI 能看见的只有这些字**。
+> 抓取流程里**唯一还在拦的规则**是「`approach` 与合爪不能同轮」（`ai_round.cpp`，防拿过时坐标空夹；
+> 降爪 `arm low` 被**放行**）。它与范式第 3 条的循环语义相容，但改抓取流程时要一并考虑。
 
 ### 2. 推理吃光 token 预算 ⇒ 整轮空跑（中）
 
@@ -262,8 +251,8 @@ uv run python tools/probe_macro.py -i esp_wifi.h -i lwipopts.h # 换探针头文
 模型把预算全烧在 `reasoning` 上，`finish_reason=length`、正文 0 字节，该轮白跑。**这是「AI 空 content」
 之谜的真实诊断**（此前怀疑的"插话打断"不是根因）。
 
-程序侧已有缓解 + 诊断：请求体带 `"reasoning_effort":"low"`（`ai_prompt.cpp:192`）；空 content 时把
-`finish_reason`、用量、content 类型一并打出来区分病因（`ai_client.cpp:700-712`，详见 memory
+程序侧已有缓解 + 诊断：请求体带 `"reasoning_effort":"low"`（`ai_prompt.cpp:222`）；空 content 时把
+`finish_reason`、用量、content 类型一并打出来区分病因（`ai_http.cpp:452`，详见 memory
 `ai-empty-content-diagnosis`）。**根因在模型侧**，仍会偶发；方向是给正文留最小预算 / 缩短推理链 / 换非推理档。
 
 ### 3. 并发写入者：另一个 AI 助手会同时操作同一块板（中）
@@ -301,21 +290,23 @@ uv run python tools/probe_macro.py -i esp_wifi.h -i lwipopts.h # 换探针头文
 | --- | --- | --- |
 | `move` | `throttle`(-1..1) `steering`(-1..1)、可选 `distance_cm` | 四轮 PWM（×1000）/ 转向舵 150±30；带 `distance_cm` 按标定表换算时长到点自停 |
 | `stop` | `scope` = all/wheels/arm | 停轮 或 清连续机械臂动作 |
-| `spin` | `dir` = `+1`右转/`-1`左转/`0`停、`speed`(0..1000)、可选 `angle_deg` | 左右轮反向 PWM（原地旋转）；带 `angle_deg` 到时自停 |
-| `arm` | `act` = lift_up/lift_down/reach_forward/reach_backward/clip/release/**fold**、可选 `dist_cm` | 舵机 2/3/4（fold = 收臂折叠回平台位） |
+| `spin` | `dir` = `+1`右转/`-1`左转/`0`停、`speed`(0..1000)、可选 `angle_deg`、可选 `ms` | 左右轮反向 PWM（原地旋转）；`angle_deg` 查表插值换算时长到点自停；**`ms` 优先于 `angle_deg`**（显式通电毫秒，跳过角度换算与滑行补偿，标定口用）；**两者都不给 = 持续旋转，不自动停**，只能靠后续指令收尾 |
+| `arm` | `act` = lift_up/lift_down/reach_forward/reach_backward/**low**/**clip**/**grasp**/release/**fold**、可选 `dist_cm` | 舵机 2/3/4。`low`=低姿夹取准备位、`grasp`=合爪+定量抬臂一步到位（省一轮往返）、`fold`=收臂折叠回平台位。⚠️ AI 侧另有 `raise`/`pose` 两个 act（`low` 也走这条），**不在这张表里**——它们在 `ai_round.cpp` 直接调 `exec::arm_low/arm_raise/arm_pose`，不经词表 |
 | `light` | `kind` = front/vibe/back，`on` | 哪吒灯命令字节 |
 | `reset` | — | 四舵机回中 + 电机 0 |
 | `servo` / `motor` / `drive` / `arm_pose` | `servo`:`n`(0..3) `pwm`(50..250，不过标定限位)；`motor`:`n`(1..4) `a` `b`；`drive`:`speed`；`arm_pose`:`x`车头前 cm `h`离地 cm | 调试直驱（绕过上层语义） |
 | `stream` | `on`、可选 `udp_port` `src_ip` | 图传开关（UDP 目标由板子据此建立） |
-| `log` | `cat`=exec/ai/all，`on` | 统一日志转发开关（默认全关；exec=执行日志+周期状态推送、ai=AI 调试日志、all=板端串口全部输出转发手机；经 `blog` 统一队列 `{type:"log",params:{src,text}}` 上抛）。替代原 `exec_log`/`ai_log` |
-| `get_state` | — | 回 `{"type":"state","params":{"bits":…}}` 位图（灯光/夹爪/AI busy，与手机 `Main.gd` 逐位 mirror；重连后同步按钮用） |
+| `log` | `cat`=exec/ai/all，`on` | 统一日志转发开关（默认全关；exec=执行日志+周期状态推送、ai=AI 调试日志、all=板端串口全部输出转发手机；经 `blog` 统一队列 `{type:"log",params:{src,text}}` 上抛）|
+| `get_state` | — | 回 `{"type":"state","params":{"bits":…}}` 位图（灯光/夹爪/AI busy，与手机 `Main.gd::_apply_state_bits` 逐位 mirror，改一侧必改另一侧；`cmd::state_bits()` 是唯一出口，重连后同步按钮用） |
 | `nz_read` | — | `nezha::probe` 探测哪吒板 I2C 在线/ACK，结果以 status 文本回 |
-| `pong` | — | 手机 WS 活体探测的应答（板端静默处理） |
+| `pong` | — | 手机 WS 活体探测的应答，**回包带 `bits`**——每次 pong 都是当场现测的板端状态，是"发送按钮没在任务运行时变成中止"那类不同步的兜底来源（手机 `WSCarClient` 把 pong 上抛供 `bits` 同步） |
 | `config` | `ssid` `password` | NVS + 在线换网 |
 | `ping` | 可选 `target` | 无目标回 `pong`；有目标走 `ping_svc` |
 | `ai_goal` / `ai_oneshot` / `ai_cancel` | `message`、可选 `annotation` `use_image` | `ai_client` DIRECT 闭环 |
 | `ai_chat` | `message` | 任务进行中插话补充（`ai::append_chat`，不打断闭环）；当前无 AI 任务则忽略 |
 | `goto` | `x` `y`、可选 `frame`=local(默认)/global | `ai::goto_target`：由板端自行导航到指定坐标 |
+
+⚠️ 保活/纯查询三件套（`ping` / `pong` / `get_state`）**不打「收到…」那行日志**——手机每几秒就一来一回，打出来只是刷屏，而它们的应答本身就是自描述的状态。
 
 BLE UUID / 广播名与手机 `../Mobile-RemoteCtrl/net/ble/BleProfile.gd` **逐字 mirror**：改一侧必须同步另一侧（服务 `0000C0DE-…`，特征 `C0E0`~`C0E6`，广播名 `VisionS3`）。
 

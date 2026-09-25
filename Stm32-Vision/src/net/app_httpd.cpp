@@ -33,7 +33,7 @@
 #include "src/cam/camera_index.h"
 #include "src/net/ota.h"   // HTTP OTA 入口（/update）注册
 #include "src/ai/ai_dump.h"   // AI 抓帧留档清单/取图（/ai_dump, /ai_frame 调试用）
-#include "src/ai/magnify.h"   // /zoomshot：手动对当帧目标区域裁出放大图（等价于 AI 的 zoom）
+#include "src/ai/magnify.h"   // /zoomshot：手动对当帧裁出中央放大图（等价于 AI 的 zoom）
 #include "src/ai/ai_client.h"   // ai::busy()：AI 任务进行中时图传 FPS 降半，让 CPU 与内部 DMA 池给 AI 让路
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
@@ -776,9 +776,9 @@ static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_
     return len;
 }
 
-// /zoomshot: 对当帧按目标区域裁出放大 JPEG —— 手动"凑近看"两指与目标，等价于 AI 的 zoom。
-// 参数(GET query)：px,py=框中心(归一化 0~1，默认 0.5)；scale=倍率(框=全幅 1/scale，默认 2，上限 8)；
-// out_w/out_h=输出尺寸(像素，默认 640×480)；quality=JPEG 质量(默认 80)。
+// /zoomshot: 对当帧裁出中央放大 JPEG —— 手动"凑近看"两指与目标，等价于 AI 的 zoom。
+// 参数(GET query)：out_w/out_h=输出尺寸(像素，默认 640×480)；quality=JPEG 质量(默认 80)。
+// 裁框固定中央 (0.25,0.25)-(0.75,0.75)，与 AI 的 zoom 同框；不接受指定区域/倍数。
 static esp_err_t zoomshot_handler(httpd_req_t *req)
 {
     // request_hires(库正规切换路径)：reconfigure 重开 SVGA 高清 → 抓整幅高清帧 → 回 VGA，全程持锁。

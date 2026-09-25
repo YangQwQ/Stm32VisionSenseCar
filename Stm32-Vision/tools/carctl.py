@@ -1646,10 +1646,7 @@ def parse_args():
     p.set_defaults(func=cmd_frame)
 
     p = sub.add_parser("zoomshot", parents=[common],
-                       help="对目标区域裁出放大 JPEG（板端 /zoomshot）：手动凑近看两指与目标，等价于 AI 的 zoom")
-    p.add_argument("--px", type=float, help="框中心 x（画面归一化 0~1，默认 0.5）")
-    p.add_argument("--py", type=float, help="框中心 y（画面归一化 0~1，默认 0.5）")
-    p.add_argument("--scale", type=float, help="倍率（框=全幅 1/scale，默认 2）")
+                       help="裁出中央放大 JPEG（板端 /zoomshot）：手动凑近看两指与目标，等价于 AI 的 zoom")
     p.add_argument("--out-w", type=int, default=320, help="输出宽度（默认 320）")
     p.add_argument("--out-h", type=int, default=240, help="输出高度（默认 240）")
     p.add_argument("--quality", type=int, default=80, help="JPEG 质量（默认 80）")
@@ -1751,16 +1748,13 @@ def fetch_state(host: str, timeout: float, wait: float = 2.5) -> str | None:
 
 
 def cmd_zoomshot(host: str, args) -> None:
-    """对目标区域裁出放大 JPEG（板端 /zoomshot）：手动"凑近看"两指与目标，等价于 AI 的 zoom。
+    """裁出中央放大 JPEG（板端 /zoomshot）：手动"凑近看"两指与目标，等价于 AI 的 zoom。
 
-    用法：carctl.py zoomshot --px 0.5 --py 0.46 --scale 2.5
-    px/py 是目标在（你上一次拿到的全幅）画面里的归一化中心坐标；scale 是相对全幅的倍率。
-    裁框 = 以 (px,py) 为中心、各边长 = 全幅 1/scale。数据不走 WS、不碰 AI 状态机，纯一次 HTTP。
+    用法：carctl.py zoomshot --out-w 800 --out-h 600
+    裁框固定中央 (0.25,0.25)-(0.75,0.75)（与 AI 的 zoom 同框），只能选输出尺寸与质量。
+    数据不走 WS、不碰 AI 状态机，纯一次 HTTP。
     """
     qargs = []
-    if args.px is not None: qargs.append(f"px={args.px}")
-    if args.py is not None: qargs.append(f"py={args.py}")
-    if args.scale is not None: qargs.append(f"scale={args.scale}")
     if args.out_w: qargs.append(f"out_w={args.out_w}")
     if args.out_h: qargs.append(f"out_h={args.out_h}")
     if args.quality != 80: qargs.append(f"quality={args.quality}")

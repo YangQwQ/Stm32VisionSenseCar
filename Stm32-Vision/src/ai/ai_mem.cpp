@@ -207,7 +207,7 @@ void mem_feed(char* buf, size_t cap) {
                  g_mem[i].name, st, (int)g_mem[i].stale);
       }
     } else {
-      // 久未观测: 不给坐标, 只提醒位置已过时(这种时效下夹取会被拒, 先说清省得白试)。
+      // 久未观测: 不给坐标, 只提醒位置已过时(说清省得白试)。
       ok = add("; %s(已%d轮未见, 位置过时: 不能凭它夹)", g_mem[i].name, (int)g_mem[i].stale);
     }
     if (!ok) {   // 空间不足: 一句话说清后面还有, 而不是把某条切成半句

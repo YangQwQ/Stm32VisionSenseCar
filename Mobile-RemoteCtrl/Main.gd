@@ -613,7 +613,7 @@ func _handle_board_msg(data: Dictionary) -> bool:
 			# get_state 回传：同步直控按钮（灯/夹爪/AI 运行态）。
 			_apply_state(data)
 		"exec_status":
-			_chat_panel.chat("执行板", _exec_status_text(data.get("params")))
+			_chat_panel.chat("状态", _exec_status_text(data.get("params")))
 		"status":
 			# status 回执：展示可读 reason，并按其附带的状态位（bits，若存在）同步直控按钮
 			# （reset / ai_cancel / light 等"会触发动作重置"的回执都自动带上 bits）。
@@ -826,7 +826,7 @@ func _on_joystick_release(_v: Variant = null) -> void:
 	if _spin_mode_btn.button_pressed:
 		DeviceConn.send_command(CP.spin(0))
 	else:
-		DeviceConn.send_command(CP.servo(1, _SERVO_CENTER))
+		DeviceConn.send_command(CP.servo(0, _SERVO_CENTER))
 
 # ============================== 状态 ==============================
 

@@ -9,12 +9,12 @@ static func stop(scope: String = "all") -> Dictionary:
 	# scope: all / wheels / arm
 	return {"type": "stop", "params": {"scope": scope}, "id": _new_id()}
 
-static func arm(act: String, duration_ms: int = 0) -> Dictionary:
-	# act: lift_up / lift_down / clip / release / reach_forward / reach_backward / fold(收臂折叠回平台)
-	#      / low(降到板端标定的贴地夹取准备位，再靠挪车把目标送进两指之间)
+static func arm(act: String, dist_cm: int = 0) -> Dictionary:
+	# act: lift_up / lift_down / clip / release / reach_forward / reach_backward / grasp(合爪+定量抬臂一步到位)
+	#      / fold(收臂折叠回平台) / low(降到板端标定的贴地夹取准备位，再靠挪车把目标送进两指之间)
 	# 持续型只有 lift_up/lift_down/reach_forward/reach_backward；其余为一次性离散动作。
-	# duration_ms == 0 表示持续移动，直到收到 stop(scope="arm")
-	return {"type": "arm", "params": {"act": act, "duration_ms": duration_ms}, "id": _new_id()}
+	# dist_cm == 0 表示持续移动，直到收到 stop(scope="arm")
+	return {"type": "arm", "params": {"act": act, "dist_cm": dist_cm}, "id": _new_id()}
 
 static func stream(on: bool, udp_port: int = 0, src_ip: String = "") -> Dictionary:
 	# udp_port：图传走 UDP 时手机本地接收端口（>0 才带上）；src_ip：手机本机 IP（板子据此建 UDP 会话，

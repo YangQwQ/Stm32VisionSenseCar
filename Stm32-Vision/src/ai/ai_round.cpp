@@ -23,7 +23,6 @@
 #include <stdio.h>
 #include <stdlib.h>  // malloc/free/strtol/atoi
 #include <string.h>
-#include <math.h>    // fabsf
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -37,12 +36,7 @@
 #define AI_WAIT_FB_MIN_MS 10000   // wait 反馈节流: 同一动作少于此间隔只回一条
 #define AI_MAX_NET_FAIL 4         // 连续"无有效输出"轮数上限: 超过即中止任务并回报(防云端持续无响应时无限空转)
 #define AI_HIST_N 20               // 历史环条数(AI 决策 + 插话共用, 满员淘汰最旧)
-// AI 未给 distance_cm 的 move 一律按此段长执行(而非放开成"持续"盲走): 持续 move 位移未知,
-// car_update_pose 不累积 ⇒ 记忆里车位置失同步、之后喂回坐标全偏; 补有限段长后走多远始终已知。
-#define AI_MOVE_DEFAULT_CM 8
-// AI 未给 angle_deg 的 spin 一律按此角度执行(而非放开成"持续旋转"): 持续旋转不累积车向 ⇒
-// 车头朝向估计停滞, 而喂回的物体坐标都由该朝向从全局系换算, 朝向一错左右/前后全反。
-#define AI_SPIN_DEFAULT_DEG 30
+
 #define AI_FRAME_RETRY 4          // 单轮抓帧重试次数(推流并发占缓冲时会偶发取不到)
 
 // ---------------- 放大镜(命令 zoom) ----------------
@@ -750,7 +744,7 @@ static void round_land(RoundCtx& c, JsonDocument& cmdD, const String& content) {
       {
         const char* r = cmdD["reason"] | "";
         PsaBuf ld;
-        ld.put("approach 被拦(与降爪/合爪同轮), 原因: "); ld.put(r);
+        ld.put("approach 被拦(与合爪同轮), 原因: "); ld.put(r);
         utf8_clamp_tail(ld.p);
         if (ld.len) c.hist_add("assistant", ld.p);
       }
@@ -834,18 +828,7 @@ static void round_land(RoundCtx& c, JsonDocument& cmdD, const String& content) {
     // 换视角是有意推进, 但空操作(要一张手上就有的图)不算:
     if (c.zoom_on) { c.stall = 0; c.stall_hint = false; }
   }
-  if (is_mv) {
-    // 未给 distance_cm 时补有限段长: 否则执行层按"持续"处理、无法累积位移, 见原 move 补段长注释。
-    if (!mv["distance_cm"].is<int>() && fabsf(mv["throttle"] | 0.0f) > 0.001f) {
-      cmdD["move"]["distance_cm"] = AI_MOVE_DEFAULT_CM;
-      ai::logf("[ai] move 未给 distance_cm, 补为 %dcm", AI_MOVE_DEFAULT_CM);
-    }
-  }
-  // spin 同理: 未给 angle_deg 时补默认角(持续旋转不累积车向 → 记忆基准失同步)。
-  if (is_sp && !mv["angle_deg"].is<int>() && (mv["dir"] | 0) != 0) {
-    cmdD["move"]["angle_deg"] = AI_SPIN_DEFAULT_DEG;
-    ai::logf("[ai] spin 未给 angle_deg, 补为 %d°", AI_SPIN_DEFAULT_DEG);
-  }
+  // move/spin 的默认段长与默认角由 `parse_move` 在规范化时补写(见 `t_move.cpp`): 本文件不再改写指令。
   // ---------- 任务记账(task_note / tasks / task_done / task_goal): 纯元数据, 不含硬件动作 ----------
   { const char* tn = cmdD["task_note"] | "";
     if (tn[0] && strcmp(tn, c.task_note)) {
