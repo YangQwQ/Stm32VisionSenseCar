@@ -286,12 +286,13 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     // 那次事件）。此前只印谷底，于是"啥也没干也一直弹"这件事在网侧完全看不见（见 heap_watch 注释）。
     // 与上一行的 `块=`（MALLOC_CAP_INTERNAL 口径）对照着看更关键：两者口径不同，`块=11k` 而
     // `DMA块现` 只有几 k 是常见组合，说明吃紧的是 DMA 可达的那个子集，不是内部 RAM 总量。
-    char dma_txt[32];
-    if (hwatch::ready())
-      snprintf(dma_txt, sizeof(dma_txt), "%uk/低%uk", (unsigned)(hwatch::cur_largest_dma() / 1024),
+    char dma_buf[32];
+    const char* dma_txt = "--";
+    if (hwatch::ready()) {
+      snprintf(dma_buf, sizeof(dma_buf), "%uk/低%uk", (unsigned)(hwatch::cur_largest_dma() / 1024),
                (unsigned)(hwatch::min_largest_dma() / 1024));
-    else
-      snprintf(dma_txt, sizeof(dma_txt), "--");
+      dma_txt = dma_buf;
+    }
     char msg[320];  // 命名避开 cfg（本文件另有 cfg:: 命名空间）；加 DMA块后需比原 224 宽
     if (!strcmp(st_before, st_after)) {
       // 幂等重申：只回一行体征当心跳。类别与固件都没变，重复报它们没有信息量；而体征必须照给

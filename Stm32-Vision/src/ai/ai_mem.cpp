@@ -226,9 +226,9 @@ void mem_feed(char* buf, size_t cap) {
       if (wy > 0 && wy <= AI_NEAR_FWD_CM) {
         // 近场(前距 ≤AI_NEAR_FWD_CM, 与 approach 停距同值): 这一带的 cm 是单应高报解算值、近场每轮 ±5cm 抖,
         // 拿它判"进没进两指"就是拿噪声开车 —— 近场**只给远近档位、不给坐标**, 对准按画面两根手指判断。
-        // 措辞用提示词同款的 [接近]: wy≤7 且明显不在两指间是 [过近], 7<wy≤15 是 [接近]。
+        // 措辞用提示词同款的 [接近]: wy≤AI_ARM_UNDER_CM 且明显不在两指间是 [过近], 其上到近场线是 [接近]。
         const char* nstate = (wy <= AI_ARM_UNDER_CM) ? "[过近]" : "[接近]";
-        ok = add("; %s 已%s(近场不报坐标, 是否[对准]凭视觉判断)", g_mem[i].name, nstate);
+        ok = add("; %s 已%s", g_mem[i].name, nstate);
       } else {
         // 最近观测过且不在近场: 给精确坐标(供快速找回当前方位)
         ok = add("; %s(%s%.1fcm,%s%.1fcm)",

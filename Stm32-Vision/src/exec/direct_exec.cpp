@@ -669,14 +669,13 @@ bool exec::light_on(const char* kind) {
 bool exec::read_state(char* buf, size_t cap) {
   const char* car = s_spin != 0 ? (s_spin > 0 ? "原地右转" : "原地左转")
                                 : (s_car_motion == 1 ? "前进" : (s_car_motion == 2 ? "后退" : "停止"));
-  const char* steer = s_steer_dir == 1 ? "左" : (s_steer_dir == 2 ? "右" : "正");
+  const char* steer = s_steer_dir == 1 ? "向左" : (s_steer_dir == 2 ? "向右" : "向前");
   const char* grip = s_grip <= GRIP_CLOSE + 5 ? "clip" : "release";
   // 机械臂到限位提示：告诉 AI 继续同向动作不会再有变化（需反向或调整姿态）。
-  char lim[32] = {0};
-  if (s_reach >= REACH_HI - 2) snprintf(lim, sizeof(lim), " 移爪到顶");
-  else if (s_reach <= REACH_LO + 2) snprintf(lim, sizeof(lim), " 移爪缩到底");
-  if (s_lift >= LIFT_HI - 2) snprintf(lim + strlen(lim), sizeof(lim) - strlen(lim), " 抬落最低");
-  else if (s_lift <= LIFT_LO + 2) snprintf(lim + strlen(lim), sizeof(lim) - strlen(lim), " 抬到顶");
+  const char* reach_lim = s_reach >= REACH_HI - 2 ? " 移爪到顶"
+                        : (s_reach <= REACH_LO + 2 ? " 移爪缩到底" : "");
+  const char* lift_lim  = s_lift >= LIFT_HI - 2 ? " 抬落最低"
+                        : (s_lift <= LIFT_LO + 2 ? " 抬到顶" : "");
   // 末端前端坐标（前向运动学）：让 AI 知道夹爪现在伸到多前、多高，判断还能往哪移/当前高度。
   // 括号内为左右舵机 PWM（Servo2=移爪 s_reach / Servo4=抬落 s_lift），供 exec_log 校准机械臂坐标。
   float fk_x = 0, fk_h = 0;
@@ -694,8 +693,8 @@ bool exec::read_state(char* buf, size_t cap) {
     case ARM_FOLD:    arm_stat = " fold"; break;
     default: break;
   }
-  snprintf(buf, cap, "小车:%s %s | 抓手:前%.0fcm(%d) 高%.0fcm(%d) 爪:%s%s%s",
-    car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, lim, arm_stat);
+  snprintf(buf, cap, "小车状态:%s 方向%s | 夹爪:前%.0fcm(%d) 高%.0fcm(%d) 爪:%s%s%s%s",
+    car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, reach_lim, lift_lim, arm_stat);
   // 撞边界/不可达诊断：反馈"想去哪、实际落到哪/反解成多少"，帮用户/AI 判断机械臂边界
   // （exec_log 推给手机）。reason=1 表示撞边界但已夹到最近合法点继续移动，非错误。
   // 只在诊断新鲜时挂（见 ARM_DIAG_FRESH_MS）：它是"刚下的那条指令的结果"，过期的别重复报。

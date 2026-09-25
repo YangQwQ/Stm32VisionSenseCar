@@ -27,8 +27,9 @@ const float AI_GRASP_LAT_MAX = 1.5f;
 // 近场与"已到车头/爪后"的距离口径(车头系 前 cm)。**放这里是为了只有一份**: 闸门(ai_client)与
 // 记忆行里那句"看不见该怎么办"(ai_mem 的 mem_feed)必须说同一个数 —— 否则 AI 读到的处方和程序
 // 拦它的线对不上, 它会照着一个程序不认的距离去动作(同源不变量, 见 CLAUDE.md)。
-// 近场线: 与 approach 的停距同值同口径(见 ai_client 的 AI_NEAR_FWD_CM 注释)。
-const float AI_NEAR_FWD_CM = 15.0f;
+// 近场线: 与 approach 的停距、提示词里[较远]那条线同值同口径。这一带的 cm 是单应高报解算值、
+// 每轮还抖, 拿它判"进没进两指"就是拿噪声开车 ⇒ 记忆行只给远近档位、不报坐标。
+const float AI_NEAR_FWD_CM = 20.0f;
 // 已到车头/爪后: 报告的 7cm 折算成真距约 5cm, 已越过低姿爪口(ARM_LOW_X_CM=8) ⇒ 方块在臂下。
 const float AI_ARM_UNDER_CM = 7.0f;
 // 上面那条的**迟滞出门线**(施密特): 进门 ≤7cm, 要退到 10cm 以外才算真出去, 中间维持上一轮判定。

@@ -32,6 +32,10 @@
 // 决策频率 / 步数上限
 #define AI_INTERVAL_MS 1500
 #define AI_MAX_STEPS_PER_GOAL 120
+// goal=abort = AI 请求中止并等待用户输入。等待期间**不取帧、不发云端请求**(不耗额度、不烧步数), 只轮询
+// 用户插话(→继续执行)与超时; 超时后给 AI 一句"用户未回复"再继续, 免得它无限等下去。
+#define AI_WAIT_USER_MS 60000
+#define AI_WAIT_USER_POLL_MS 200   // 等待期的轮询步长(只查插话/代际/超时)
 #define AI_EDITED_IMG_MAX (128 * 1024)
 #define AI_EDITED_IMG_TTL_MS 60000
 #define AI_WAIT_FB_MIN_MS 10000   // wait 反馈节流: 同一动作少于此间隔只回一条
@@ -156,9 +160,9 @@
 // (无里程计, 靠姿态累积 + 定距时长近似), 目标全局坐标又来自单应(约高报 30%——报15cm真距仅约11cm),
 // 停到"报15cm"时真距已经压到爪口(8cm)附近, 高报波动下一不小心就**越过爪口把方块压到车底/机械臂下**
 // (实测日志: approach 一停目标即[过近]、爪下降直接压住方块)。留 5cm 余量停在更远的报20cm处, 宁可
-// 让 AI 再多走一两步视觉微调, 也别让开环死航一次冲过头。⚠️ 这打破原"approach 停距=近场钳制线"的
-// 同源绑定: 停 20 后目标不在近场档(≤15)内, AI 若一下给默认 8cm 的大步仍可能顶进盲区 —— 靠近场步长
-// 钳制(mem_grasp_evidence 的实时读数)兜住, 而非靠 approach 停得近。
+// 让 AI 再多走一两步视觉微调, 也别让开环死航一次冲过头。⚠️ 停到停距时目标正好落在近场线
+// (AI_NEAR_FWD_CM)上: 记忆行从这一刻起只给远近档位、不报坐标, 之后全靠看画面 —— 而 AI 若一下给
+// 默认 8cm 的大步仍可能顶进盲区, 故步长按 mem_grasp_evidence 的实时读数钳制, 而非靠 approach 停得近。
 #define AI_APPROACH_STOP_CM 20
 // "已在爪口之后"的前距线(cm, 与 AI_NEAR_SCALE 的估算口径一致 = mem_grasp_evidence 报的原始值):
 // 报 7cm 时真距约 5cm, 已经**越过**低姿爪口(ARM_LOW_X_CM=8) ⇒ 方块在夹爪与车头之间的臂下。这个
@@ -635,10 +639,8 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
       snprintf(err_buf, err_cap, "AI light 非法 kind=%s", kind);
       return err_buf;
     }
-    if (!src["on"].is<bool>()) {
-      snprintf(err_buf, err_cap, "AI light 缺 on(bool): 必须显式给 on:true/false(缺省会把灯误关)");
-      return err_buf;
-    }
+    if (!src["on"].is<bool>())
+      return "AI light 缺 on(bool): 必须显式给 on:true/false(缺省会把灯误关)";
     out["light"]["kind"] = kind;
     out["light"]["on"] = src["on"].as<bool>();
   }
@@ -652,7 +654,17 @@ static const char* validate_cmd(const char* content, JsonDocument& out, char* er
   if (reason[0]) out["reason"] = reason;
   const char* tg = doc["task_goal"] | "";
   if (tg[0]) out["task_goal"] = tg;   // 把插话/新意图提升为当前任务目标(AI 显式标记)
-  if (doc["done"].is<bool>() && doc["done"].as<bool>()) out["done"] = true;  // 任务完结标记
+  if (doc["done"].is<bool>() && doc["done"].as<bool>()) out["done"] = true;  // 任务完结标记(旧写法, 等同 finish)
+  // goal: 任务终态(finish=完成 / abort=请求中止并等用户输入 / fail=执行失败)。非法值明拒 —— 免得它
+  // 以为"说了就算"而实际被当默认值放过(改词表的第 2 步: 非法值要给 AI 明确回执)。
+  const char* goal = doc["goal"] | "";
+  if (goal[0]) {
+    if (strcmp(goal, "finish") && strcmp(goal, "abort") && strcmp(goal, "fail")) {
+      snprintf(err_buf, err_cap, "AI 非法 goal=%s(可用 finish/abort/fail)", goal);
+      return err_buf;
+    }
+    out["goal"] = goal;
+  }
   // 带图请求回显: carry_image:"zoom|full" = 下轮额外带上一张图(放大帧/全幅帧)作对比。
   const char* cimg = doc["carry_image"] | "";
   if (cimg[0]) out["carry_image"] = cimg;
@@ -932,6 +944,10 @@ static void ai_worker(void*) {
     const char* hist_role[AI_HIST_N] = {nullptr};   // "assistant" / "user"
     int hist_n = 0;
     char task_remind[160] = {0};  // 插话即将被冲掉前的提醒(提示补 task_goal 更新目标), 一次性消费
+    // goal=abort 的等待态: 暂停本任务等下一条用户输入(轮询见循环头部)。
+    bool wait_user = false;
+    uint64_t wait_until = 0;      // 等待截止(ms, esp_timer)
+    char wait_note[160] = {0};    // 等待超时的一次性告知(下一轮在"注意:"里说给 AI)
     // 观测未记成的回告(一次轮消费): observe 被丢弃时 AI 无从得知, 会以为已记住该物体,
     // 于是反复 observe 或凭猜导航。明确回告让它改用画面重新定位。
     char obs_warn[160] = {0};
@@ -1012,8 +1028,28 @@ static void ai_worker(void*) {
       fail = nullptr;  // 每轮重置, 避免沿用上轮错误文本误导日志/回报
       // 中止检查(代际号变化即本任务作废); 兜底停统一在任务出口解析。
       if (t.generation != m_generation) { blog::logf(blog::AI, "被新目标/手动中断"); interrupted = true; break; }
-      if (!net::is_connected()) { snprintf(err_buf, sizeof(err_buf), "WiFi 掉线"); fail = err_buf; break; }
-      if (cfg::ai_key().isEmpty()) { snprintf(err_buf, sizeof(err_buf), "未配置 AI Key"); fail = err_buf; break; }
+      if (!net::is_connected()) { fail = "WiFi 掉线"; break; }
+      if (cfg::ai_key().isEmpty()) { fail = "未配置 AI Key"; break; }
+
+      // goal=abort 的等待态: 不取帧、不发云端请求, 只等用户插话(→继续执行)或超时(→告知"未回复"再继续)。
+      // 用户改发新目标 / 手动接管 / ai_cancel 都会换代际号, 由上面的中断检查与本块内的检查兜住。
+      while (wait_user) {
+        if (t.generation != m_generation) { interrupted = true; break; }
+        bool replied = false;
+        xSemaphoreTake(g_mtx, portMAX_DELAY);
+        replied = g_chat_has;   // 只看不动: 插话留给正常流程消费成 user 消息
+        xSemaphoreGive(g_mtx);
+        if (replied) { wait_user = false; break; }
+        if ((uint64_t)(esp_timer_get_time() / 1000) >= wait_until) {
+          snprintf(wait_note, sizeof(wait_note),
+                   "你上轮请求中止并等待用户输入, 已超时(用户未回复); 请继续执行原任务");
+          blog::logf(blog::AI, "等待用户输入超时(用户未回复), 告知 AI 继续执行");
+          wait_user = false;
+          break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(AI_WAIT_USER_POLL_MS));
+      }
+      if (interrupted) { blog::logf(blog::AI, "等待用户输入期间被新目标/手动中断"); break; }
 
       // 取当前帧: 先等停稳(画面清晰) → 失败重试; 无摄像头则跳过, 走无画面降级
       bool frame_moving = false;
@@ -1030,8 +1066,7 @@ static void ai_worker(void*) {
         // 与"云端无响应"共用同一条连续失败上限, 退避后重试; 连续多轮取不到才收尾。
         if (!fb) {
           if (++net_fail >= AI_MAX_NET_FAIL) {
-            snprintf(err_buf, sizeof(err_buf), "持续取帧失败(摄像头/缓冲异常)");
-            fail = err_buf;
+            fail = "持续取帧失败(摄像头/缓冲异常)";
             break;
           }
           ai::logf("[ai] 取帧失败(第%d次), 稍后重试", net_fail);
@@ -1136,7 +1171,10 @@ static void ai_worker(void*) {
         xSemaphoreTake(g_mtx, portMAX_DELAY);
         if (g_chat_has) { strncpy(chat_now, g_chat, sizeof(chat_now) - 1); utf8_clamp_tail(chat_now); g_chat_has = false; }
         xSemaphoreGive(g_mtx);
-        if (chat_now[0]) { hist_add("user", chat_now); chat_unacked = true; }   // 插话进入共享历史(用户话语), 落实前一直点名
+        if (chat_now[0]) {   // 插话进入共享历史(用户话语), 落实前一直点名
+          hist_add("user", chat_now); chat_unacked = true;
+          ai::logf("[ai] 插话已喂给 AI: %.96s", chat_now);   // 落一条账: "AI 以为用户说了什么"必须可回溯
+        }
         // 上一帧是否带上: 由 AI 上轮 carry_image 决定 —— "full"=带全幅(锁定/追踪/运动对比),
         // "zoom"=带放大帧, grasp 后自动带"合爪前放大特写"(见声明)。zoom 与先前帧不冲突: 参照系由
         // 滚动缓存按来源(放大帧/全幅)分别存, 带出时与下轮帧一致即可。
@@ -1227,6 +1265,7 @@ static void ai_worker(void*) {
         // 下探到位后反复提示(直到它据落位后的画面 observe 一次, 或改变位姿/位置为止):
         // "夹爪放下后不重新对准就夹"是这条链路最贵的错误 —— 空夹一轮 = 一整次云端往返 + 一次
         if (task_remind[0]) { hpush(task_remind); task_remind[0] = 0; }
+        if (wait_note[0]) { hpush(wait_note); wait_note[0] = 0; }   // abort 等待超时(一次性)
         if (hint && hint[0]) hpush(hint);
         // 历史环逐条喂给 build_body(assistant=AI决策 / user=插话, 真多轮对话)
         build_body(body, goal_now, t.ann, hint_cb,
@@ -1532,13 +1571,15 @@ static void ai_worker(void*) {
             } }
           if (cmdD["tasks"].is<JsonArray>()) {
             JsonArrayConst ta = cmdD["tasks"].as<JsonArrayConst>();
+            // tasks = "重写整个任务列表", 提示词只给名字 ⇒ done 不从 JSON 读: 重写即从"全部未完成"重来,
+            // 进度一律由 task_done 标记(渲染时才看得出来谁完成)。
             int n = 0;
             for (JsonObjectConst it : ta) {
               if (n >= 8) break;
               const char* nm = it["name"] | "";
               if (!nm[0]) continue;
               strncpy(s_tasks[n].name, nm, 47); s_tasks[n].name[47] = 0;
-              s_tasks[n].done = it["done"] | false;
+              s_tasks[n].done = false;
               n++;
             }
             if (n > 0 || s_task_n > 0) { s_task_n = n; ai::logf("[ai] 任务列表更新(%d项)", s_task_n); }
@@ -1649,7 +1690,9 @@ static void ai_worker(void*) {
             // 空动作轮(只带 reason/observe/task_* 等元数据): wait 语义自理。
             stall = 0; stall_hint = false;
             uint64_t now = (uint64_t)(esp_timer_get_time() / 1000);
-            if (now - g_last_wait_fb_ms >= AI_WAIT_FB_MIN_MS) {
+            // goal=abort 是本轮的状态变化(开始等用户), 不能等节流窗口 —— 用户不知道 AI 在等他回复,
+            // 这功能就等于没开。其余空动作轮仍按 AI_WAIT_FB_MIN_MS 节流防刷屏。
+            if (!strcmp(cmdD["goal"] | "", "abort") || now - g_last_wait_fb_ms >= AI_WAIT_FB_MIN_MS) {
               g_last_wait_fb_ms = now;
               String fb = build_feedback(t.id, cmdD);
               enqueue_result(fb.c_str(), t.fn, t.ctx);
@@ -1681,9 +1724,12 @@ static void ai_worker(void*) {
           // 历史回喂: 合并串(或 approach/等待说明) + 完整 reason
           {
             const char* r = cmdD["reason"] | "";
+            const char* goal_v = cmdD["goal"] | "";
+            const char* what = merge_str[0] ? merge_str
+                               : (nav_done ? (nav_why ? nav_why : "approach") : "wait");
+            if (!strcmp(goal_v, "abort")) what = "中止并等待用户输入";   // 别让历史里只写个 wait
             PsaBuf ld;
-            ld.put(merge_str[0] ? merge_str
-                                : (nav_done ? (nav_why ? nav_why : "approach") : "wait"));
+            ld.put(what);
             ld.put(", 原因: "); if (r) ld.put(r);
             utf8_clamp_tail(ld.p);
             if (ld.len) hist_add("assistant", ld.p);
@@ -1708,6 +1754,8 @@ static void ai_worker(void*) {
             if (cmdD["light"].is<JsonObject>()) safe_append(tob, sizeof(tob), &first, "light");
             if (cmdD["done"].is<bool>() && cmdD["done"].as<bool>())
               safe_append(tob, sizeof(tob), &first, "done");
+            { const char* gs = cmdD["goal"] | "";
+              if (gs[0]) { char gb[16]; snprintf(gb, sizeof(gb), "goal=%s", gs); safe_append(tob, sizeof(tob), &first, gb); } }
             ai::logf("[ai工具] 本轮: %s", tob[0] ? tob : "(纯 wait/reason)");
             blog::forward_text(blog::AI, content.c_str());   // 完整 JSON(任意长), 供复盘
           }
@@ -1719,6 +1767,29 @@ static void ai_worker(void*) {
             blog::logf(blog::AI, "AI 判定任务完成(done)");
             JsonDocument st(&g_js_alloc); st["scope"] = "all";
             exec::act("stop", st.as<JsonObjectConst>());   // 停机收尾
+          }
+
+          // ---------- goal 门: finish=完成收尾 / fail=失败收尾 / abort=中止并等用户输入(任务不结束) ----------
+          {
+            const char* goal_v = cmdD["goal"] | "";
+            if (goal_v[0]) {
+              JsonDocument st(&g_js_alloc); st["scope"] = "all";
+              exec::act("stop", st.as<JsonObjectConst>());   // 终态前先急停, 不留残留动作
+              if (!strcmp(goal_v, "abort")) {
+                wait_user = true;   // 下一轮起进入等待态(不取帧/不发请求), 见循环头部
+                wait_until = (uint64_t)(esp_timer_get_time() / 1000) + AI_WAIT_USER_MS;
+                blog::logf(blog::AI, "AI 请求中止, 等待用户输入(最多%us)",
+                           (unsigned)(AI_WAIT_USER_MS / 1000));
+              } else if (!strcmp(goal_v, "fail")) {
+                fail = "AI 判定执行失败";
+                done = true;
+                blog::logf(blog::AI, "AI 判定执行失败(goal=fail)");
+              } else {   // finish
+                done = true;
+                sent_done = true;   // 已向手机确报终态, 任务出口不再补发
+                blog::logf(blog::AI, "AI 判定任务完成(goal=finish)");
+              }
+            }
           }
           got = true;
           break;
