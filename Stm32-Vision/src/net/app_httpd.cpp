@@ -25,9 +25,6 @@
 // lwip 的 inet.h（经上行 sockets.h:53 引入）把 INADDR_NONE/IPADDR_NONE 定义成宏，而 Arduino
 // core 的 IPAddress.h 声明同名全局对象（extern const IPAddress INADDR_NONE），宏会在声明处
 // 展开破坏语法；lwip 为预编译库，此处撤销宏不影响其编译期使用。
-// ⚠️ 这两行必须紧跟 lwip/sockets.h。IPAddress.h 由 Arduino.h:198 引入，因此任何直接或间接
-//    拉进 Arduino.h 的头都只能排在其后，否则报 "expected ')' before numeric constant"
-//    （踩过的实例：BLEDevice.h → BLEServer.h:45 → Arduino.h → IPAddress.h）。
 #undef INADDR_NONE
 #undef IPADDR_NONE
 #include "esp_heap_caps.h"
@@ -41,41 +38,6 @@
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
-#endif
-
-// 板载人脸检测/识别已关闭：其依赖 Espressif esp-face 的模型头文件，
-// 且本项目视觉识别交由云端多模态大模型完成，板载人脸检测非必需。
-// 若日后需要启用：引入 espressif/esp-face 模型头文件后，将下面两宏置 1 即可。
-#define CONFIG_ESP_FACE_DETECT_ENABLED 0
-#define CONFIG_ESP_FACE_RECOGNITION_ENABLED 0
-
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-
-#include <vector>
-#include "human_face_detect_msr01.hpp"
-#include "human_face_detect_mnp01.hpp"
-
-#define TWO_STAGE 1 /*<! 1: detect by two-stage which is more accurate but slower(with keypoints). */
-                    /*<! 0: detect by one-stage which is less accurate but faster(without keypoints). */
-
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-#include "face_recognition_tool.hpp"
-#include "face_recognition_112_v1_s16.hpp"
-#include "face_recognition_112_v1_s8.hpp"
-
-#define QUANT_TYPE 0 //if set to 1 => very large firmware, very slow, reboots when streaming...
-
-#define FACE_ID_SAVE_NUMBER 7
-#endif
-
-#define FACE_COLOR_WHITE 0x00FFFFFF
-#define FACE_COLOR_BLACK 0x00000000
-#define FACE_COLOR_RED 0x000000FF
-#define FACE_COLOR_GREEN 0x0000FF00
-#define FACE_COLOR_BLUE 0x00FF0000
-#define FACE_COLOR_YELLOW (FACE_COLOR_RED | FACE_COLOR_GREEN)
-#define FACE_COLOR_CYAN (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
-#define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 #endif
 
 // Enable LED FLASH setting
@@ -577,7 +539,7 @@ static void ws_stream_task(void *arg)
                     // 必须打印命中的是哪条判据：超时弃帧时"无进展"往往远小于其阈值(400ms)，
                     // 只印它会把排查方向带偏（曾据此误判链路无进展）。
                     blog::logf(blog::WS, "[udp] 弃帧 fid=%u seq=%u/%u len=%u 判据=%s 无进展=%dms 在途=%dms errno=%d 失败=%u",
-                               s_out_fid, s_out_seq_next, s_out_count, (unsigned)s_out_len,
+                               (unsigned)s_out_fid, (unsigned)s_out_seq_next, (unsigned)s_out_count, (unsigned)s_out_len,
                                stall ? "无进展" : "在途超时",
                                (int)((now_us - s_out_last_ok) / 1000),
                                (int)((now_us - s_out_start) / 1000),
@@ -696,32 +658,6 @@ static void ws_stream_task(void *arg)
 }
 #endif // CONFIG_HTTPD_WS_SUPPORT
 
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-
-static int8_t detection_enabled = 0;
-
-// #if TWO_STAGE
-// static HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
-// static HumanFaceDetectMNP01 s2(0.5F, 0.3F, 5);
-// #else
-// static HumanFaceDetectMSR01 s1(0.3F, 0.5F, 10, 0.2F);
-// #endif
-
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-static int8_t recognition_enabled = 0;
-static int8_t is_enrolling = 0;
-
-#if QUANT_TYPE
-    // S16 model
-    FaceRecognition112V1S16 recognizer;
-#else
-    // S8 model
-    FaceRecognition112V1S8 recognizer;
-#endif
-#endif
-
-#endif
-
 typedef struct
 {
     size_t size;  //number of values used for filtering
@@ -766,116 +702,6 @@ static int ra_filter_run(ra_filter_t *filter, int value)
     }
     return filter->sum / filter->count;
 }
-#endif
-
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-static void rgb_print(fb_data_t *fb, uint32_t color, const char *str)
-{
-    fb_gfx_print(fb, (fb->width - (strlen(str) * 14)) / 2, 10, color, str);
-}
-
-static int rgb_printf(fb_data_t *fb, uint32_t color, const char *format, ...)
-{
-    char loc_buf[64];
-    char *temp = loc_buf;
-    int len;
-    va_list arg;
-    va_list copy;
-    va_start(arg, format);
-    va_copy(copy, arg);
-    len = vsnprintf(loc_buf, sizeof(loc_buf), format, arg);
-    va_end(copy);
-    if (len >= sizeof(loc_buf))
-    {
-        temp = (char *)malloc(len + 1);
-        if (temp == NULL)
-        {
-            return 0;
-        }
-    }
-    vsnprintf(temp, len + 1, format, arg);
-    va_end(arg);
-    rgb_print(fb, color, temp);
-    if (len > 64)
-    {
-        free(temp);
-    }
-    return len;
-}
-#endif
-static void draw_face_boxes(fb_data_t *fb, std::list<dl::detect::result_t> *results, int face_id)
-{
-    int x, y, w, h;
-    uint32_t color = FACE_COLOR_YELLOW;
-    if (face_id < 0)
-    {
-        color = FACE_COLOR_RED;
-    }
-    else if (face_id > 0)
-    {
-        color = FACE_COLOR_GREEN;
-    }
-    if(fb->bytes_per_pixel == 2){
-        //color = ((color >> 8) & 0xF800) | ((color >> 3) & 0x07E0) | (color & 0x001F);
-        color = ((color >> 16) & 0x001F) | ((color >> 3) & 0x07E0) | ((color << 8) & 0xF800);
-    }
-    int i = 0;
-    for (std::list<dl::detect::result_t>::iterator prediction = results->begin(); prediction != results->end(); prediction++, i++)
-    {
-        // rectangle box
-        x = (int)prediction->box[0];
-        y = (int)prediction->box[1];
-        w = (int)prediction->box[2] - x + 1;
-        h = (int)prediction->box[3] - y + 1;
-        if((x + w) > fb->width){
-            w = fb->width - x;
-        }
-        if((y + h) > fb->height){
-            h = fb->height - y;
-        }
-        fb_gfx_drawFastHLine(fb, x, y, w, color);
-        fb_gfx_drawFastHLine(fb, x, y + h - 1, w, color);
-        fb_gfx_drawFastVLine(fb, x, y, h, color);
-        fb_gfx_drawFastVLine(fb, x + w - 1, y, h, color);
-#if TWO_STAGE
-        // landmarks (left eye, mouth left, nose, right eye, mouth right)
-        int x0, y0, j;
-        for (j = 0; j < 10; j+=2) {
-            x0 = (int)prediction->keypoint[j];
-            y0 = (int)prediction->keypoint[j+1];
-            fb_gfx_fillRect(fb, x0, y0, 3, 3, color);
-        }
-#endif
-    }
-}
-
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-static int run_face_recognition(fb_data_t *fb, std::list<dl::detect::result_t> *results)
-{
-    std::vector<int> landmarks = results->front().keypoint;
-    int id = -1;
-
-    Tensor<uint8_t> tensor;
-    tensor.set_element((uint8_t *)fb->data).set_shape({fb->height, fb->width, 3}).set_auto_free(false);
-
-    int enrolled_count = recognizer.get_enrolled_id_num();
-
-    if (enrolled_count < FACE_ID_SAVE_NUMBER && is_enrolling){
-        id = recognizer.enroll_id(tensor, landmarks, "", true);
-        log_i("Enrolled ID: %d", id);
-        rgb_printf(fb, FACE_COLOR_CYAN, "ID[%u]", id);
-    }
-
-    face_info_t recognize = recognizer.recognize(tensor, landmarks);
-    if(recognize.id >= 0){
-        rgb_printf(fb, FACE_COLOR_GREEN, "ID[%u]: %.2f", recognize.id, recognize.similarity);
-    } else {
-        rgb_print(fb, FACE_COLOR_RED, "Intruder Alert!");
-    }
-    return recognize.id;
-}
-#endif
 #endif
 
 #if CONFIG_LED_ILLUMINATOR_ENABLED
@@ -1028,17 +854,6 @@ static esp_err_t capture_handler(httpd_req_t *req)
     snprintf(raw, sizeof(raw), "%u", (unsigned)fb->len);
     httpd_resp_set_hdr(req, "X-Raw-Len", (const char *)raw);
 
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    size_t out_len, out_width, out_height;
-    uint8_t *out_buf;
-    bool s;
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-    bool detected = false;
-#endif
-    int face_id = 0;
-    if (!detection_enabled || fb->width > 400)
-    {
-#endif
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
         size_t fb_len = 0;
 #endif
@@ -1066,103 +881,6 @@ static esp_err_t capture_handler(httpd_req_t *req)
 #endif
         log_i("JPG: %uB %ums", (uint32_t)(fb_len), (uint32_t)((fr_end - fr_start) / 1000));
         return res;
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    }
-
-    jpg_chunking_t jchunk = {req, 0};
-
-    if (fb->format == PIXFORMAT_RGB565
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-     && !recognition_enabled
-#endif
-     ){
-#if TWO_STAGE
-        HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
-        HumanFaceDetectMNP01 s2(0.5F, 0.3F, 5);
-        std::list<dl::detect::result_t> &candidates = s1.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3});
-        std::list<dl::detect::result_t> &results = s2.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3}, candidates);
-#else
-        HumanFaceDetectMSR01 s1(0.3F, 0.5F, 10, 0.2F);
-        std::list<dl::detect::result_t> &results = s1.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3});
-#endif
-        if (results.size() > 0) {
-            fb_data_t rfb;
-            rfb.width = fb->width;
-            rfb.height = fb->height;
-            rfb.data = fb->buf;
-            rfb.bytes_per_pixel = 2;
-            rfb.format = FB_RGB565;
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            detected = true;
-#endif
-            draw_face_boxes(&rfb, &results, face_id);
-        }
-        s = fmt2jpg_cb(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 90, jpg_encode_stream, &jchunk);
-        esp_camera_fb_return(fb);
-    } else
-    {
-        out_len = fb->width * fb->height * 3;
-        out_width = fb->width;
-        out_height = fb->height;
-        out_buf = (uint8_t*)malloc(out_len);
-        if (!out_buf) {
-            log_e("out_buf malloc failed");
-            httpd_resp_send_500(req);
-            return ESP_FAIL;
-        }
-        s = fmt2rgb888(fb->buf, fb->len, fb->format, out_buf);
-        esp_camera_fb_return(fb);
-        if (!s) {
-            free(out_buf);
-            log_e("To rgb888 failed");
-            httpd_resp_send_500(req);
-            return ESP_FAIL;
-        }
-
-        fb_data_t rfb;
-        rfb.width = out_width;
-        rfb.height = out_height;
-        rfb.data = out_buf;
-        rfb.bytes_per_pixel = 3;
-        rfb.format = FB_BGR888;
-
-#if TWO_STAGE
-        HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
-        HumanFaceDetectMNP01 s2(0.5F, 0.3F, 5);
-        std::list<dl::detect::result_t> &candidates = s1.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3});
-        std::list<dl::detect::result_t> &results = s2.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3}, candidates);
-#else
-        HumanFaceDetectMSR01 s1(0.3F, 0.5F, 10, 0.2F);
-        std::list<dl::detect::result_t> &results = s1.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3});
-#endif
-
-        if (results.size() > 0) {
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            detected = true;
-#endif
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-            if (recognition_enabled) {
-                face_id = run_face_recognition(&rfb, &results);
-            }
-#endif
-            draw_face_boxes(&rfb, &results, face_id);
-        }
-
-        s = fmt2jpg_cb(out_buf, out_len, out_width, out_height, PIXFORMAT_RGB888, 90, jpg_encode_stream, &jchunk);
-        free(out_buf);
-    }
-
-    if (!s) {
-        log_e("JPEG compression failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-    int64_t fr_end = esp_timer_get_time();
-#endif
-    log_i("FACE: %uB %ums %s%d", (uint32_t)(jchunk.len), (uint32_t)((fr_end - fr_start) / 1000), detected ? "DETECTED " : "", face_id);
-    return res;
-#endif
 }
 
 static esp_err_t stream_handler(httpd_req_t *req)
@@ -1178,26 +896,6 @@ static esp_err_t stream_handler(httpd_req_t *req)
     size_t _jpg_buf_len = 0;
     uint8_t *_jpg_buf = NULL;
     char *part_buf[128];
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        bool detected = false;
-        int64_t fr_ready = 0;
-        int64_t fr_recognize = 0;
-        int64_t fr_encode = 0;
-        int64_t fr_face = 0;
-        int64_t fr_start = 0;
-    #endif
-    int face_id = 0;
-    size_t out_len = 0, out_width = 0, out_height = 0;
-    uint8_t *out_buf = NULL;
-    bool s = false;
-#if TWO_STAGE
-    HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
-    HumanFaceDetectMNP01 s2(0.5F, 0.3F, 5);
-#else
-    HumanFaceDetectMSR01 s1(0.3F, 0.5F, 10, 0.2F);
-#endif
-#endif
 
     static int64_t last_frame = 0;
     if (!last_frame)
@@ -1227,14 +925,8 @@ static esp_err_t stream_handler(httpd_req_t *req)
         // 有 OTA 会话在写固件：本次 MJPEG 推流就地结束，把射频与 CPU 让给固件传输
         // （流退出时下方 isStreaming=false 会复位，OTA 结束后客户端重连即可恢复）
         if (ota::active()) break;
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        detected = false;
-    #endif
-        face_id = 0;
-#endif
 
-        fb = cam::grab();
+		fb = cam::grab();
         if (!fb)
         {
             log_e("Camera capture failed");
@@ -1244,146 +936,22 @@ static esp_err_t stream_handler(httpd_req_t *req)
         {
             _timestamp.tv_sec = fb->timestamp.tv_sec;
             _timestamp.tv_usec = fb->timestamp.tv_usec;
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            fr_start = esp_timer_get_time();
-            fr_ready = fr_start;
-            fr_encode = fr_start;
-            fr_recognize = fr_start;
-            fr_face = fr_start;
-    #endif
-            if (!detection_enabled || fb->width > 400)
-            {
-#endif
-                if (fb->format != PIXFORMAT_JPEG)
-                {
-                    bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-                    esp_camera_fb_return(fb);
-                    fb = NULL;
-                    if (!jpeg_converted)
-                    {
-                        log_e("JPEG compression failed");
-                        res = ESP_FAIL;
-                    }
-                }
-                else
-                {
-                    _jpg_buf_len = cam::jpeg_len(fb);   // 勿用 fb->len：虚高会让一个 part 里塞进多帧
-                    _jpg_buf = fb->buf;
-                }
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-            }
-            else
-            {
-                if (fb->format == PIXFORMAT_RGB565
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-                    && !recognition_enabled
-#endif
-                ){
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                    fr_ready = esp_timer_get_time();
-#endif
-#if TWO_STAGE
-                    std::list<dl::detect::result_t> &candidates = s1.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3});
-                    std::list<dl::detect::result_t> &results = s2.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3}, candidates);
-#else
-                    std::list<dl::detect::result_t> &results = s1.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3});
-#endif
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                    fr_face = esp_timer_get_time();
-                    fr_recognize = fr_face;
-#endif
-                    if (results.size() > 0) {
-                        fb_data_t rfb;
-                        rfb.width = fb->width;
-                        rfb.height = fb->height;
-                        rfb.data = fb->buf;
-                        rfb.bytes_per_pixel = 2;
-                        rfb.format = FB_RGB565;
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                        detected = true;
-#endif
-                        draw_face_boxes(&rfb, &results, face_id);
-                    }
-                    s = fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 80, &_jpg_buf, &_jpg_buf_len);
-                    esp_camera_fb_return(fb);
-                    fb = NULL;
-                    if (!s) {
-                        log_e("fmt2jpg failed");
-                        res = ESP_FAIL;
-                    }
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                    fr_encode = esp_timer_get_time();
-#endif
-                } else
-                {
-                    out_len = fb->width * fb->height * 3;
-                    out_width = fb->width;
-                    out_height = fb->height;
-                    out_buf = (uint8_t*)malloc(out_len);
-                    if (!out_buf) {
-                        log_e("out_buf malloc failed");
-                        res = ESP_FAIL;
-                    } else {
-                        s = fmt2rgb888(fb->buf, fb->len, fb->format, out_buf);
-                        esp_camera_fb_return(fb);
-                        fb = NULL;
-                        if (!s) {
-                            free(out_buf);
-                            log_e("To rgb888 failed");
-                            res = ESP_FAIL;
-                        } else {
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                            fr_ready = esp_timer_get_time();
-#endif
-
-                            fb_data_t rfb;
-                            rfb.width = out_width;
-                            rfb.height = out_height;
-                            rfb.data = out_buf;
-                            rfb.bytes_per_pixel = 3;
-                            rfb.format = FB_BGR888;
-
-#if TWO_STAGE
-                            std::list<dl::detect::result_t> &candidates = s1.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3});
-                            std::list<dl::detect::result_t> &results = s2.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3}, candidates);
-#else
-                            std::list<dl::detect::result_t> &results = s1.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3});
-#endif
-
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                            fr_face = esp_timer_get_time();
-                            fr_recognize = fr_face;
-#endif
-
-                            if (results.size() > 0) {
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                                detected = true;
-#endif
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-                                if (recognition_enabled) {
-                                    face_id = run_face_recognition(&rfb, &results);
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                                    fr_recognize = esp_timer_get_time();
-    #endif
-                                }
-#endif
-                                draw_face_boxes(&rfb, &results, face_id);
-                            }
-                            s = fmt2jpg(out_buf, out_len, out_width, out_height, PIXFORMAT_RGB888, 90, &_jpg_buf, &_jpg_buf_len);
-                            free(out_buf);
-                            if (!s) {
-                                log_e("fmt2jpg failed");
-                                res = ESP_FAIL;
-                            }
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                            fr_encode = esp_timer_get_time();
-#endif
-                        }
-                    }
-                }
-            }
-#endif
+			if (fb->format != PIXFORMAT_JPEG)
+			{
+				bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+				esp_camera_fb_return(fb);
+				fb = NULL;
+				if (!jpeg_converted)
+				{
+					log_e("JPEG compression failed");
+					res = ESP_FAIL;
+				}
+			}
+			else
+			{
+				_jpg_buf_len = cam::jpeg_len(fb);   // 勿用 fb->len：虚高会让一个 part 里塞进多帧
+				_jpg_buf = fb->buf;
+			}
         }
         if (res == ESP_OK)
         {
@@ -1416,34 +984,16 @@ static esp_err_t stream_handler(httpd_req_t *req)
         }
         int64_t fr_end = esp_timer_get_time();
 
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        int64_t ready_time = (fr_ready - fr_start) / 1000;
-        int64_t face_time = (fr_face - fr_ready) / 1000;
-        int64_t recognize_time = (fr_recognize - fr_face) / 1000;
-        int64_t encode_time = (fr_encode - fr_recognize) / 1000;
-        int64_t process_time = (fr_encode - fr_start) / 1000;
-#endif
-
         int64_t frame_time = fr_end - last_frame;
         frame_time /= 1000;
         last_frame = fr_end;  // 修复：原未更新，fps 恒为 0.0
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
         uint32_t avg_frame_time = ra_filter_run(&ra_filter, frame_time);
 #endif
-        log_i("MJPG: %uB %ums (%.1ffps), AVG: %ums (%.1ffps)"
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-                      ", %u+%u+%u+%u=%u %s%d"
-#endif
-                 ,
-                 (uint32_t)(_jpg_buf_len),
-                 (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time,
-                 avg_frame_time, 1000.0 / avg_frame_time
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-                 ,
-                 (uint32_t)ready_time, (uint32_t)face_time, (uint32_t)recognize_time, (uint32_t)encode_time, (uint32_t)process_time,
-                 (detected) ? "DETECTED " : "", face_id
-#endif
-        );
+        log_i("MJPG: %uB %ums (%.1ffps), AVG: %ums (%.1ffps)",
+		(uint32_t)(_jpg_buf_len),
+		(uint32_t)frame_time, 1000.0 / (uint32_t)frame_time,
+		avg_frame_time, 1000.0 / avg_frame_time);
     }
 
 #if CONFIG_LED_ILLUMINATOR_ENABLED
@@ -1724,32 +1274,8 @@ static esp_err_t cmd_handler(httpd_req_t *req)
 #if CONFIG_LED_ILLUMINATOR_ENABLED
     else if (!strcmp(variable, "led_intensity")) {
         led_duty = val;
-        if (isStreaming)
-            enable_led(true);
+        if (isStreaming) enable_led(true);
     }
-#endif
-
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    else if (!strcmp(variable, "face_detect")) {
-        detection_enabled = val;
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-        if (!detection_enabled) {
-            recognition_enabled = 0;
-        }
-#endif
-    }
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-    else if (!strcmp(variable, "face_enroll")){
-        is_enrolling = !is_enrolling;
-        log_i("Enrolling: %s", is_enrolling?"true":"false");
-    }
-    else if (!strcmp(variable, "face_recognize")) {
-        recognition_enabled = val;
-        if (recognition_enabled) {
-            detection_enabled = val;
-        }
-    }
-#endif
 #endif
     else {
         log_i("Unknown command: %s", variable);
@@ -1835,13 +1361,6 @@ static esp_err_t status_handler(httpd_req_t *req)
     p += sprintf(p, ",\"led_intensity\":%u", led_duty);
 #else
     p += sprintf(p, ",\"led_intensity\":%d", -1);
-#endif
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    p += sprintf(p, ",\"face_detect\":%u", detection_enabled);
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-    p += sprintf(p, ",\"face_enroll\":%u,", is_enrolling);
-    p += sprintf(p, "\"face_recognize\":%u", recognition_enabled);
-#endif
 #endif
     *p++ = '}';
     *p++ = 0;
@@ -2044,18 +1563,7 @@ void startCameraServer()
     // （实测收到 spin 时 httpd 栈溢出），调大与 ws_stream 同级避免 WS 指令线程爆栈。
     config.stack_size = 8192;
     // 会话槽占满时仍要能把新连接接进来：满则踢掉最久未用的那条会话。
-    // ⚠️ 否则只要有几个客户端把 max_open_sockets（默认 7）占满——典型是 /stream 的 MJPEG 长连接——
-    // **整个 80 端口**（含 /update 与 /ai_dump）就再也应答不了：板子活着、ping 通、81 端口 WS 照常，
-    // 唯独 HTTP 面锁死。而这块板**只能靠网络刷固件**，等于把自己锁在门外。
-    // 实测签名（2026-09-22）：重启后头几秒 `GET /update` 返回 200，客户端一重连就又全部超时；
-    // 期间 ping 3/3 通、套接字余 3~4、堆与 DMA 块健康、运行时长只增不减（没有重启 ⇒ httpd 没崩，
-    // 是**新连接进不来**）。长轮询本身有 15s 上限、不是元凶；占槽的是长连接会话。
-    // 代价是被踢的那条会话会断——调试板上用这点代价换"永远还刷得进去"，值。
     config.lru_purge_enable = true;
-    // 80 假死的第二道闸：max_open_sockets 默认 7 @@ 太小。80 上的 /zoomshot、/capture、
-    // /runai_dump 这些重 handler 若并发堆积，或手机/多个客户端同时连，很快占满槽 → /update 进不去 → OTA 假死。
-    // 调大余量，并让 /stream 这类长连接不占满 80（/stream 本就在 81 的独立 server）。调大后每槽内存有增，
-    // 但相对内部堆余量可控。⚠️ 别超 16：每槽约 1KB 内部堆，应与 heap 预算一起看。
     config.max_open_sockets = 10;
 
     httpd_uri_t index_uri = {
@@ -2259,12 +1767,6 @@ void startCameraServer()
     // 否则那几路发送会在无锁状态下并发写 socket（见 s_ws_tx_mtx 注释）。
     if (!s_ws_tx_mtx) s_ws_tx_mtx = xSemaphoreCreateMutex();
 
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-    recognizer.set_partition(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fr");
-
-    // load ids from flash partition
-    recognizer.set_ids_from_flash();
-#endif
     log_i("Starting web server on port: '%d'", config.server_port);
     if (httpd_start(&camera_httpd, &config) == ESP_OK)
     {

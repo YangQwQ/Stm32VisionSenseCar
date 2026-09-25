@@ -4,22 +4,12 @@
 #include "src/net/wifi_net.h"
 #include "src/cam/camera.h"
 #include "src/exec/direct_exec.h"
-#include "src/exec/motion_verify.h"
 #include "src/core/command.h"
 #include "src/net/ble.h"
 #include "src/net/ota.h"
 #include "src/ai/ai_client.h"
 #include "src/core/board_log.h"
 #include "src/core/heap_watch.h"
-
-//
-// WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
-//            Ensure ESP32 Wrover Module or other board with PSRAM is selected
-//            Partial images will be transmitted if image exceeds buffer size
-//
-//            You must select partition scheme from the board menu that has at least 3MB APP space.
-//            Face Recognition is DISABLED for ESP32 and ESP32-S2, because it takes up from 15 
-//            seconds to process single frame. Face Detection is ENABLED if PSRAM is enabled as well
 
 // 摄像头型号（CAMERA_MODEL_*）与引脚（camera_pins.h）的配置点已上移到 camera.h——
 // 各编译单元都经 camera.h 取得宏与引脚，此处是唯一配置点，不再在 .ino 重复定义。
@@ -63,7 +53,6 @@ void setup() {
   ota::init();  // 固件升级入口（ArduinoOTA 网络端口 + HTTP /update）；联网后由 update() 自动就绪
 
   ai::init();  // AI worker 任务（DIRECT 链路；依赖 WiFi 与摄像头）
-  mvfy::init();  // 运动到位验证任务（软解放核心0，避免阻塞 loop/WS；依赖摄像头）
 
   blog::logf(blog::SYS, "Ready!");
 }

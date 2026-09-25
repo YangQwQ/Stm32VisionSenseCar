@@ -20,11 +20,11 @@
 
 namespace ping {
 
-// 任务栈从 PSRAM 分配（与 mvfy 同一套路，见 exec/motion_verify.cpp）。内部堆在 AI/TLS/网络起来后
+// 任务栈从 PSRAM 分配（与 AI worker 同一套路）。内部堆在 AI/TLS/网络起来后
 // 常年只剩 4~7KB 最大块，16384 字节的**连续内部**栈走 xTaskCreate 必然失败——而那是静默失败：
 // 用户只看到"正在 ping…"之后再无下文，与"网络不通"完全分不开（真机上已踩过，白排查一轮）。
 // PSRAM 还有 6MB+ 空闲，ping 任务不做 TLS、无实时性要求，放外存安全。
-// 同 mvfy 的硬约束：TCB 必须在内部 RAM（port 的 xPortCheckValidTCBMem 断言会拦），故 TCB 用内部
+// 硬约束：TCB 必须在内部 RAM（port 的 xPortCheckValidTCBMem 断言会拦），故 TCB 用内部
 // 静态变量、栈手动分配。静态栈只有一份 ⇒ s_busy 串行化：同时只允许一个 ping 会话。
 static StackType_t* s_task_stack = nullptr;
 static StaticTask_t s_task_tcb;   // 内部 RAM（.bss）

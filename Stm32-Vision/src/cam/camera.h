@@ -52,10 +52,10 @@ void return_frame(camera_fb_t* fb);
 // 不要直接用 fb->len。返回 0 = 帧不可用。
 size_t jpeg_len(const camera_fb_t* fb);
 
-// JPEG 软解码互斥（Tjpgd 非线程安全）：jpeg 软解在 mvfy 任务（core0 常驻采样）与 AI worker
-// （放大镜裁图）两个任务上并发调用，库内部用全局静态上下文传参，互相踩会解出"Y 结构在、
-// Cb/Cr 错乱 + 8×8 块状"的坏图或解码失败。所有 jpg2rgb565 / fmt2jpg_cb（jpge 编码同为静态
-// 上下文）调用点都必须先取锁，用完即放。持锁期是库调用粒度，软的 ms 级，不影响实时性。
+// JPEG 软解码互斥（Tjpgd 非线程安全）：jpeg 软解可能在 AI worker（放大镜裁图）与其它调用方
+// 上并发发生，库内部用全局静态上下文传参，互相踩会解出"Y 结构在、Cb/Cr 错乱 + 8×8 块状"的
+// 坏图或解码失败。所有 jpg2rgb565 / fmt2jpg_cb（jpge 编码同为静态上下文）调用点都必须先
+// 取锁，用完即放。持锁期是库调用粒度，软的 ms 级，不影响实时性。
 void lock_jpeg_dec();
 void unlock_jpeg_dec();
 

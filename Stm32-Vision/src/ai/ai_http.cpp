@@ -1,6 +1,8 @@
 #include "src/ai/ai_http.h"
 #include "src/ai/ai_client.h"      // ai::logf(AI 调试日志)
+#include "src/ai/ai_alloc.h"       // g_js_alloc(响应解析的 PSRAM JSON 池)
 #include "src/core/board_log.h"    // blog::logf
+#include "src/core/lock_guard.h"   // ScopedLock(s_tls_mtx 的取放)
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -13,26 +15,14 @@
 
 #define AI_CONNECT_TIMEOUT_MS 10000   // TCP 建连 + TLS 握手上限
 #define AI_HTTP_TIMEOUT_MS 30000      // HTTPClient 自身超时(建连/发请求/读状态行与响应头)
-// 正文读取的三道闸。旧实现只有"整段 30s 一票否决", 于是慢但一直在进数据的响应会被判死并
-// 白重发一次整包(日志: ~32915ms 已收489B 之后紧跟着一次重发)。现在改为按"有无进展"判定:
-//   FIRST: 等正文首字节。非流式响应下这一段 = 服务端把整段回答生成完的时间(思考), 是整轮的
-//          主项 —— 实测正常请求就能到 29.4s, 所以最初照搬 HTTPClient 的 30s 会误杀(日志:
-//          "响应体读取失败 ~32063ms 正文0B 停顿0次/最长0ms" = 一个字节都没来就被判死),
-//          误杀代价是白传一次整包再赔一整轮。给到 60s。
-//   IDLE : 正文已开始后, 连续这么多 ms 没新字节 = 卡死 → 放弃(实测分片间隙约 0.3~0.4s, 8s 有 20 倍余量)
-//   MAX  : 正文阶段(自首字节起算)的整体上限, 只要还有数据在进来就允许读完
+// 正文读取三道闸(按"有无进展"判定, 而非整段一票否决):
+// FIRST=等正文首字节(非流式下=服务端思考耗时, 主项); IDLE=已开始后无新字节即卡死; MAX=正文阶段整体上限。
 #define AI_FIRST_BYTE_MS 60000
 #define AI_BODY_IDLE_MS 8000
 #define AI_BODY_MAX_MS 60000
 
 // ---------------- 传输诊断(只加计数器/日志, 不改发送行为) ----------------
-// 两类失败都表现为"HTTPClient 的某个超时到了", 必须靠计数器区分是**云端慢**还是**链路卡**:
-//   -3 SEND_PAYLOAD_FAILED: 发 body 时写不动 → 看"发X空Y": 发出去的字节数(请求头约 200B)+0 字节写次数
-//   -11 READ_TIMEOUT:      请求发出后收不到响应 → 看"首收@"(首字节迟到多少 ms)
-// 关键字段: 写@=首次写入距本轮发起多少 ms(≈TCP+TLS 握手耗时, 复用连接时≈0);
-//           发完@=最后一次写入完成的时刻(≈body 传完); 发=已写入明文字节; 空=write() 一次都没写进去的次数;
-//           首收=首个响应字节时刻。成功路径把它们一起打出来, 就能把一轮拆成
-//           连接/上传/等首包/收正文 四段(见 http_post 末尾日志)。
+// 用计数器区分"云端慢"还是"链路卡": 写@=首次写入(≈握手耗时)、发完@、发=已写字节、空=写不进次数、首收=首个响应字节。
 static unsigned long s_req_t0 = 0;   // 本轮请求发起时刻(DiagClient 换算相对时间用)
 
 class DiagClient : public WiFiClientSecure {
@@ -66,33 +56,12 @@ public:
 // TLS 客户端(worker 唯一实例): cancel/set_goal 可从其他任务 http_stop() 中止在途请求。
 static DiagClient g_client;
 
-// g_client 的独占锁。HTTPClient / NetworkClientSecure / mbedTLS **没有一处是线程安全的**，
-// 所以"谁碰 g_client 谁持锁"。
-//
-// 为什么必须有它（一次真实的 panic，不是理论担忧）：旧 http_stop() 直接 g_client.stop()
-// ⇒ stop_ssl_socket() ⇒ mbedtls_ssl_free(&ssl_ctx)。若此时 worker 恰在 s_http->POST() 里做
-// 全新握手（NetworkClientSecure::connect → start_ssl_client → ssl_starttls_handshake →
-// mbedtls_ssl_handshake），上下文就被从脚下抽掉，在途握手解引用 ssl->conf（结构里偏移 8）
-// 得到地址 0x8 ⇒ LoadProhibited ⇒ `复位=崩溃`。
-// 现场证据（由 /coredump 取回 + addr2line 解开，见 tools/carctl.py coredump）：
-//   任务 ai_worker  cause=28(LoadProhibited)  vaddr=0x8  回溯落在
-//   mbedtls ssl_tls.c:4594/4626 + Arduino NetworkClientSecure/ssl_client.cpp:340(握手那一行)
-//   ← HTTPClient::connect ← src/ai/ai_http.cpp:294 的 s_http->POST。
-// 触发条件普通得可怕：**上一轮请求还在途时又来一个 ai_oneshot / 手动指令**即可 ——
-// 连跑多轮 AI 任务时每轮都在掷这个骰子。
+// g_client 的独占锁。HTTPClient / NetworkClientSecure / mbedTLS 均非线程安全, 故"谁碰 g_client 谁持锁"。
+// http_stop() 直接 stop() 会把在途握手上下文从脚下抽掉而整板 panic, 必须靠它串行化。
 static SemaphoreHandle_t s_tls_mtx = nullptr;
 
-// RAII 取锁：http_post 里 return 路径多，手动 give 必漏一处。
-struct TlsLock {
-  bool held = false;
-  TlsLock() { if (s_tls_mtx) held = (xSemaphoreTake(s_tls_mtx, portMAX_DELAY) == pdTRUE); }
-  ~TlsLock() { if (held) xSemaphoreGive(s_tls_mtx); }
-};
-
-// WiFi 断线事件: 记录断线原因码(比 RSSI 有用得多: 200=BEACON_TIMEOUT 信号丢 / 15=四次握手超时 等)。
-// 请求超时若恰好伴随断线, 根因就在链路而非云端; 之前全仓库无任何断线日志, 断线只能靠猜。
-// 注: 回调在 arduino_events 任务(栈 4096)里、且持有 NetworkEvents 锁, 故只调纯函数(原因码→名字),
-// 不碰会回调进 NetworkEvents 的接口(所以这里不取 IP, IP 由 net::update 连上时打)。
+// WiFi 断线事件: 记录断线原因码(如 200=BEACON_TIMEOUT / 15=四次握手超时), 便于判根因在链路还是云端。
+// ⚠️ 回调在 arduino_events 任务里且持有 NetworkEvents 锁, 只能调纯函数, 不碰会回调进该锁的接口。
 static void on_wifi_event(WiFiEvent_t ev, WiFiEventInfo_t info) {
   if (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     uint8_t r = info.wifi_sta_disconnected.reason;
@@ -105,25 +74,11 @@ static void on_wifi_event(WiFiEvent_t ev, WiFiEventInfo_t info) {
 
 // 最近一次响应的 HTTP 状态码(HTTPClient 写入, 供上层 4xx 快速失败判定; 0=未知)。
 static int g_last_status = 0;
-// http_stop()(手动指令打断/换目标)置位: 本轮是被主动中止的, 不该再走 pass1 重发。
-// 光靠 g_client.stop() 只是让这一轮失败, 旧代码接着 `if (pass == 0) continue;` 会把 26~87KB
-// 的 body 原样再传一遍 —— 打断反而多花一次上传时间。
+// http_stop() 置位: 本轮被主动中止, 不该再走 pass1 重发(否则白传一遍整包)。
 static volatile bool s_abort = false;
 
-// ---------------- 常驻 HTTPClient: 让 keep-alive 真正生效 ----------------
-// 旧写法是在 pass 循环里 `HTTPClient http;` —— 它在函数返回前析构, 而
-// HTTPClient::~HTTPClient() 无条件 _client->stop()(HTTPClient.cpp:89), 于是 setReuse(true)
-// 和 end() 里刚保住的 TLS 会话每轮都被拆掉: 每轮都白付一次 TCP+TLS 握手。日志里的 "复用0"
-// 就是它。begin() 也不能重调 —— _client 非空时它会先 _canReuse=false; end()(HTTPClient.cpp:118)。
-// 所以: 实例常驻, 只在 url/key 变化时 begin() 一次, 之后反复 POST。
-// 复用安全性: 响应读尽后 available()==0, connect() 里的 connected() 判定走 _connected 分支
-// (socket 在 ssl_client.cpp:100 被置为 O_NONBLOCK, 而 lwip 对非阻塞 socket 立即返回
-//  ERR_WOULDBLOCK、不看 recv_timeout, 所以 available() 不会卡住) → 直接复用; 若服务端已关连接,
-// data_to_read 会收到 PEER_CLOSE_NOTIFY/CONN_EOF 并 stop(), connected() 转 false → 自动回落到
-// 新握手, 不需要额外探测。
-// ⚠️ end() 内部调 clear(), 而 clear() 会把请求头串 _headers 清空(HTTPClient.cpp:104), 所以每轮
-// POST 前都要重加头 —— 否则第二轮起请求里就没有 Authorization 了(addHeader 默认 replace, 幂等)。
-// 注: 这个 new 是故意的常驻单例(不做 delete), 一次性分配, 不随请求增长。
+// 常驻 HTTPClient(让 keep-alive 生效): 响应读尽后直接复用, 服务端已关则自动回落新握手。
+// ⚠️ end() 会清空请求头(_headers), 每轮 POST 前必须重加 Authorization; 该实例为常驻单例, 不 delete。
 static HTTPClient* s_http = nullptr;
 static String s_http_url, s_http_key;
 
@@ -132,9 +87,7 @@ static bool http_ready(const char* url, const char* key) {
   if (!s_http) s_http = new HTTPClient();
   s_http_url = url;
   s_http_key = key;
-  // begin() 会把超时设回 HTTPClient 默认值, 故三项配置必须跟在它后面:
-  // ⚠️ connect() 内部还会用 _tcpTimeout 覆盖客户端的 socket 超时, 所以 HTTPClient 上这份
-  // setTimeout 才是真正生效的那份(g_client.setTimeout 会被它盖掉)。
+  // ⚠️ begin() 会重置超时, 故配置须跟在它后面; HTTPClient 上的 setTimeout 才真正生效(会盖掉 g_client 的)。
   if (!s_http->begin(g_client, url)) {
     blog::logf(blog::AI, "HTTPClient begin 失败");
     return false;
@@ -151,14 +104,8 @@ static void http_headers() {
   s_http->addHeader("Authorization", String("Bearer ") + s_http_key);
 }
 
-// ---------------- 正文读取 ----------------
-// HTTPClient 自带的 chunked 解码在 TLS 明文空窗期(响应跨多个 TCP 段、段间隙数据未到)会因
-// readBytes 遇 read()==-1 立即判死 → READ_TIMEOUT → 断连, 实测正文只剩一个 TCP 段被截断。
-// 这里自读正文: 读不到就短延时重试, 只在"持续无进展"或整体超时才放弃。
-// 非阻塞 socket 保证 c.read() 无数据时立即返回 -1(不会卡在 socket 上), 而一旦某个 TLS 记录
-// 落地, 整条记录会一次性可读 —— 所以按 512B 批量取, 不再逐字节(旧实现每字节要过 3 次
-// mbedtls 入口, 且每个字节都往 String 上追加一次; String 的 changeBuffer 每次只长
-// (len+16)&~0xf, 22KB 正文 ≈ 1400 次 realloc + 反复整段 memcpy)。
+// 正文读取: HTTPClient 自带 chunked 解码会在 TLS 明文空窗期(read()==-1)误判断连, 故自读正文。
+// 非阻塞 socket 读空即返 -1; TLS 记录整条落地, 故按 512B 批量取, 逐字节会引发大量 String 重分配。
 static uint8_t s_rxbuf[512];   // 静态: worker 任务栈只有 16KB, 别在栈上再吃 512B
 
 struct RxStat {
@@ -196,8 +143,7 @@ static bool rx_read(WiFiClientSecure& c, uint8_t* buf, size_t want, size_t& got,
     }
     if (!c.connected()) { st.why = "断流"; return false; }  // 链路断了(服务端关连接/被 http_stop 中止)
     unsigned long now = millis();
-    // 预算从 st.rx_t0(开始读正文)算, 不从本轮发起算: 否则上传慢时会把服务端思考的额度挤掉
-    // (旧实现就是各读各的 t0, 这是它唯一没出错的地方, 别改坏)。
+    // 预算从开始读正文(rx_t0)算, 不从本轮发起算: 否则上传慢会挤掉服务端思考的额度。
     if (st.any) {
       if (now - st.last_ok_ms >= AI_BODY_IDLE_MS) { st.why = "停顿超时"; return false; }  // 已开始但卡住
       if (now - st.first_abs >= AI_BODY_MAX_MS) { st.why = "正文超时"; return false; }    // 正文阶段上限
@@ -248,9 +194,7 @@ static bool rx_body(WiFiClientSecure& c, String& body, long clen, RxStat& st) {
     long sz = strtol(hdr.c_str(), &end, 16);
     if (end == hdr.c_str()) return false;    // 帧头不是十六进制数: 流已错位, 交上层(重发)处理
     if (sz <= 0) {
-      // 末块(0\r\n)。后面还可能有 trailer("名: 值\r\n" 若干), 必须一直吞到空行为止 ——
-      // 旧实现这里直接 return true, 把终止块的 \r\n 留在流里: 今天因为连接每轮都被拆掉所以
-      // 没暴露, 一旦连接真复用, 残留会被下一轮当成状态行读, 整条流水线就错位了。
+      // 末块后可能有 trailer, 必须吞到空行为止; 残留的 \r\n 会被下一轮当成状态行读, 导致流水线错位。
       for (;;) {
         String line;
         for (;;) {
@@ -267,23 +211,17 @@ static bool rx_body(WiFiClientSecure& c, String& body, long clen, RxStat& st) {
   }
 }
 
-// mbedTLS 内存搬到 PSRAM 的预留实现: 把 mbedTLS 内部所有分配改为优先 PSRAM(8MB 充足),
-// 内部堆只留少量连续块即可握手。当前全仓库无 mbedtls_platform_set_calloc_free 调用点,
-// 二者不会被 mbedTLS 使用, 属预留。
-static void* ai_tls_calloc(size_t n, size_t s) {
+// mbedTLS 内存优先走 PSRAM 的预留实现: 内部堆只留少量连续块即可握手。
+// 现无 mbedtls_platform_set_calloc_free 调用点(故标 unused), 属预留, 别删。
+__attribute__((unused)) static void* ai_tls_calloc(size_t n, size_t s) {
   void* p = heap_caps_calloc(n, s, MALLOC_CAP_SPIRAM);
   if (!p) p = heap_caps_calloc(n, s, MALLOC_CAP_INTERNAL);
   return p;
 }
-static void ai_tls_free(void* p) { heap_caps_free(p); }
+__attribute__((unused)) static void ai_tls_free(void* p) { heap_caps_free(p); }
 
-// ---------------- 早拒探针 ----------------
-// 为什么需要它: body 一个字节都发不出去(典型 code=-3)时, 服务端其实**早就回了一个拒绝**
-// (401 / 429 / 418 / 400 ...), 只是它不读请求体: 板子几十 KB 的 body 灌过去把 TCP 窗口写满,
-// mbedtls_ssl_write 就卡到 socket 超时为止 —— 任务从没走到"读响应"那一步, 那个状态码于是永远
-// 看不见, 现场只剩一句"发不出去", 谁也判不出到底是 key、限流、还是被 CDN 挡了。
-// 探针用同一个 URL/key、**2 字节**的 body 再问一次: 请求小到不会被排空问题卡住, 服务端说什么
-// 就读得到什么。同一端点、同一凭据, 不外发任何画面/记忆数据。
+// 早拒探针: body 发不出去(code=-3)时服务端其实早已回拒, 只是状态码读不到(请求体把 TCP 窗口写满)。
+// 用同一 URL/key、2 字节 body 再问一次即可拿到真实状态码(不外发任何画面/记忆数据)。
 static bool split_url(const char* url, String& host, int& port, String& path) {
   String u(url);
   int p = u.indexOf("://");
@@ -340,13 +278,11 @@ namespace ai {
 bool http_post(const char* url, const char* key, const char* body, String& resp,
                unsigned long gen) {
   (void)gen;  // 代际/中断判断由调用方(worker 循环)负责; cancel 走 http_stop()
-  // 从入口就持锁，直到本轮(含正文自读)结束：POST 与后续 rx_read 都在用 g_client，
-  // 中途松开就等于把窗口留给 http_stop()。锁只被 http_stop() 以 0 超时试取(见那里)，不会反锁死。
+  // 从入口持锁到本轮结束(POST 与 rx_read 都在用 g_client); http_stop() 只以 0 超时试取, 不会死锁。
   if (!s_tls_mtx) s_tls_mtx = xSemaphoreCreateMutex();   // 只有 worker 调用本函数 ⇒ 无建锁竞态
-  TlsLock tls_lk;
+  ScopedLock tls_lk(s_tls_mtx);
   g_last_status = 0;  // 入口重置, 避免沿用上一轮 4xx/429 误判
   s_abort = false;    // 本轮开始: 清掉上一次打断的标记(跨轮的取消由 worker 自己判 gen)
-  unsigned long t0 = millis();
   const size_t body_len = strlen(body);
   static bool s_tls_cfg = false;
   if (!s_tls_cfg) {
@@ -360,11 +296,8 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
              (unsigned)(ESP.getFreePsram() / 1024));
   }
   if (!http_ready(url, key)) return false;
-  // 连接策略: 尽量复用同一条 TLS 连接(省掉每轮 ~TCP+TLS 握手)。复用的风险是上一次响应在
-  // ssl_ctx 里留下未读尽的残留, 或连接在决策间隙被服务端/半开关掉, 导致下一次
-  // mbedtls_ssl_write 报错(→-3)。处理: pass0 直接复用当前 g_client; 一旦这一轮失败立刻 stop
-  // 掉, pass1 用全新握手重发同一 body(只多这一轮), 把多轮 -3 阵发收敛成"一次复用失败 +
-  // 一次新握手成功"。success 时保留连接供下轮复用。
+  // 连接策略: 尽量复用同一条 TLS 连接(省握手); 复用可能因残留/半关连接导致写失败(-3),
+  // 故 pass0 复用、失败即 pass1 全新握手重发同一 body; 成功后保留连接供下轮。
   for (int pass = 0; pass < 2; pass++) {
     resp = "";                                              // 清残留: 失败重试时防上次部分字节叠加
     unsigned long tp = millis();                            // 本轮(pass)计时, 与整次 t0 区分
@@ -375,14 +308,11 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
     bool reused = g_client.connected();                     // pass0: 上次留下的连接是否还在(复用)
     if (pass == 1 && reused) { g_client.stop(); reused = false; }   // 复用失败: 断开, 全新握手
     http_headers();                          // end() 每轮会清掉请求头, 这里重新加上
-    // 直接把 PSRAM 里的 body 指针交给 HTTPClient: POST(String) 会把整包(26~87KB)先拷成一份
-    // 临时 String(内部堆只有几十 KB, 只能落 PSRAM)再发, 白费一次分配+拷贝。
+    // 直接把 body 指针交给 HTTPClient: POST(String) 会先把整包拷成临时 String, 白费一次分配+拷贝。
     int code = s_http->POST((uint8_t*)body, body_len);
     g_last_status = code;
     if (code <= 0) {
-      // 字段: 写@=首次写入距今(≈TCP+TLS 握手耗时, 复用≈0; 发=0 时表示整轮一个字节都没写出去)
-      //       发=已写字节(只发出请求头约 200B = body 没发出去) 空=整块写不进去的次数
-      //       收=已读字节 首收=首个响应字节距今(0=没收到任何响应)
+      // 字段: 写@≈握手耗时(复用≈0); 发=0/只约 200B 说明 body 没发出去; 空=整块写不进次数; 收/首收=已读字节/首字节。
       ai::logf("[ai] HTTP POST 失败 code=%d pass%d 复用%d %ums 写@%ums 发完@%ums 发%u空%u 收%u 首收%ums body=%uB rssi=%d wifi=%d heap=%uk psram=%uk%s",
                code, pass + 1, reused ? 1 : 0, (unsigned)(millis() - tp), (unsigned)g_client.first_wr_ms,
                (unsigned)g_client.last_wr_ms, (unsigned)g_client.written, (unsigned)g_client.zero_wr,
@@ -392,9 +322,7 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
       g_client.stop();                       // 发失败/连接已死: 一律弃用, 下一轮重新握手
       s_http->end();
       if (pass == 0 && !s_abort) {
-        // 先用探针问一次"服务端到底怎么说"(见 probe_early_reject 的注释)。若它明确回了个非 2xx,
-        // 那就是它在拒我们 —— 换条新连接重发同一份 body 只会再赔一次同样的上传时间, 且结果一样。
-        // 直接带着真实状态码失败, 把 20 秒的死等压成一次握手(4xx 快速失败也能据此生效)。
+        // 先用探针问一次: 若非 2xx 即服务端在拒我们, 直接带真实状态码失败, 省掉一次无谓重发。
         int pc = probe_early_reject(url, key);
         if (pc >= 300) { g_last_status = pc; return false; }
         continue;                             // 2xx/没读到: 端点本身是好的, 按老路重发一次
@@ -405,15 +333,12 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
       String eb = s_http->getString();
       if (eb.length() > 128) eb = eb.substring(0, 128);
       ai::logf("[ai] HTTP 非200 %d 响应体:%.100s", code, eb.c_str());
-      // 错误体由 getString 读, 是否读尽无保证; 且 4xx/429 后上层多半要换 key 重来 ——
-      // 一律断开, 别把可能错位的流留给下一轮复用(以前靠 ~HTTPClient 顺手停, 现在析构不管了)。
+      // 错误体是否读尽无保证, 且 4xx/429 后多半要换 key: 一律断开, 别把可能错位的流留给下轮复用。
       g_client.stop();
       s_http->end();
       return false;
     }
-    // 读正文: chunked 自定义分块 / Content-Length 定长, 都走同一套"按进展判定"的读取。
-    // (两者都可能跨多个 TCP 段, 所以定长路径也不能用 getString —— 它内部 readBytes 遇
-    //  read()==-1 会提前收工, 同样是截断风险。)
+    // 读正文: chunked 与定长都走 rx_body; 定长也不能用 getString(内部 readBytes 遇 read()==-1 会提前截断)。
     long clen = s_http->getSize();           // Content-Length; -1 = 无(即 chunked)
     bool chunked = s_http->header("Transfer-Encoding").indexOf("chunked") >= 0;
     st.rx_t0 = millis();                     // 读正文的预算起点(等首字节的那道闸从这算)
@@ -434,22 +359,7 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
     }
     st.done_ms = millis() - tp;
     s_http->end();                            // 成功即保留连接(_reuse && _canReuse), 下轮复用
-    // 成功也记一行, 且把一轮拆成四段(这是"延迟到底花在哪"的唯一直接证据):
-    //   写@    首次写入 ≈ TCP 建连+TLS 握手结束(复用时应≈0)
-    //   发完@  最后一次写入完成 ≈ body 上传结束       → 上传耗时 = 发完@ - 写@
-    //   首收@  首个响应字节(状态行)                    → 服务端首包延迟 = 首收@ - 发完@
-    //   正文@  首个正文字节                            → 收完@ - 正文@ = 下载正文耗时
-    //   停顿N次/最长Mms: 正文读取中">200ms 没新字节"的次数与最长间隔 —— 数它就能判断
-    //                    "慢"是服务端在挤牙膏(停顿多且长)还是链路/客户端(停顿少但密集)
-    //   sse=1: 正文以 "data:" 开头, 说明服务端按 SSE 分帧回(那 ai_client 的 SSE 分支就会走)
-    // ⚠️ 下面这条"POST 成功"日志常年在刷屏(每轮都有), 对日常分析价值不大; 要排查每轮延迟,
-    //    打开下面注释即可(信号就在那几个时间戳里)。平时关着, 让 /log ai on 的日志更干净。
-    // ai::logf("[ai] POST 成功 %d 总%ums 复用%d 写@%ums 发完@%ums 首收@%ums 正文@%ums 收完@%ums 收%uB 正文%uB 停顿%u次/最长%ums sse=%d body=%uB",
-    //          code, (unsigned)(millis() - t0), reused ? 1 : 0, (unsigned)g_client.first_wr_ms,
-    //          (unsigned)g_client.last_wr_ms, (unsigned)g_client.first_rx_ms, (unsigned)st.first_ms,
-    //          (unsigned)st.done_ms, (unsigned)g_client.rx_bytes, (unsigned)resp.length(),
-    //          (unsigned)st.stalls, (unsigned)st.max_gap_ms, resp.startsWith("data:") ? 1 : 0,
-    //          (unsigned)body_len);
+    // (每轮"POST 成功"的延迟分段日志默认关闭(常年刷屏): 需排查每轮延迟时再打开。)
     return resp.length() > 0;
   }
   return false;
@@ -458,22 +368,96 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
 int http_last_status() { return g_last_status; }
 
 void http_stop() {
-  // 只置标志。**不要**在这里无条件 g_client.stop() —— 它可能正被 worker 用在 mbedtls 里面，
-  // 那样就是从脚下抽上下文（0x8 那次 panic 的成因，见 s_tls_mtx 上方注释）。
-  //
-  // 标志本身足够快：读正文的 rx_read 每轮循环都查 s_abort，而 socket 是非阻塞的（每次无数据
-  // 立即返回 -1 再 delay(2)），所以中止延迟是毫秒级。唯一查不到的空档是 POST 内部的
-  // 握手/发送，那一段本来就不可中断，只能等它自己返回（上限 AI_CONNECT_TIMEOUT_MS /
-  // AI_HTTP_TIMEOUT_MS）；用"拆上下文"去抢那几秒，代价是随机的整板 panic，不值。
-  // 而且 worker 在失败路径上本来就会 g_client.stop()（http_post 里 code<=0 与 rx_body 失败两处），
-  // 连接该断的照样会断 —— 这里不断，只是把"什么时候断"交回给持有它的那个任务。
+  // 只置标志, 不在这里无条件 stop() —— 它可能正被 worker 用在 mbedtls 里, 那样等于从脚下抽上下文。
+  // s_abort 由 rx_read 每轮检查, 中止延迟毫秒级; POST 内部握手/发送那段不可中断, 只能等它返回。
   s_abort = true;      // 标成主动中止: 让在途的这一轮失败后不再自动重发
   // 能立刻拿到锁 = worker 此刻不在 TLS 里 ⇒ 断开是安全的，顺手断掉还能让下一轮重新握手。
   // 拿不到（worker 正在 POST/读正文）就什么都不做：s_abort 会把它带出来。
-  if (s_tls_mtx && xSemaphoreTake(s_tls_mtx, 0) == pdTRUE) {
-    g_client.stop();
-    xSemaphoreGive(s_tls_mtx);
+  ScopedLock lk(s_tls_mtx, 0);   // 0 超时: 拿不到就算了, 绝不在这里等 worker
+  if (lk.held()) g_client.stop();
+}
+
+// 从响应提取 choices[0].message.content; 同时打印 reasoning_content(思考过程, 截断防刷屏)。
+// broken: 解析失败时置 true(多半是传输层截断/复用残留, 调用方应弃用复用连接)
+bool extract_content(const String& resp, String& content, bool* broken) {
+  // 若响应是 SSE 文本(chunked-SSE 解码产物): 按行取 data: 负载拼成最终 JSON
+  String payload = resp;
+  if (resp.startsWith("data:") || resp.indexOf("\ndata:") >= 0) {
+    payload = "";
+    int i = 0, n = resp.length();
+    while (i <= n) {
+      int j = resp.indexOf('\n', i);
+      if (j < 0) j = n;
+      String ln = resp.substring(i, j);
+      i = j + 1;
+      ln.trim();
+      if (ln.startsWith("data:")) {
+        String d = ln.substring(5); d.trim();
+        if (d == "[DONE]") break;
+        payload += d;
+      }
+    }
   }
+  // 剥离复用连接偶发泄漏的 chunked size 行("hex+换行+{"): JSON 永不始于 hex, 故不会误伤正文。
+  {
+    auto ishex = [](char c){ return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'); };
+    for (int s = 0; s < 4; s++) {              // 最多剥 4 段(防多块错位叠加)
+      const char* q = payload.c_str();
+      int i = 0;
+      while (i < 8 && ishex(q[i])) i++;        // 扫描十六进制前缀
+      if (i == 0) break;                       // 开头非 hex, 非泄漏
+      int j = i;
+      if (q[j] == '\r') j++;
+      if (q[j] == '\n') j++;
+      if (q[j] != '{') break;                  // 后随非 '{', 按正文处理
+      payload = payload.substring(j);          // 剥掉这段 size 行
+    }
+  }
+  JsonDocument doc(&g_js_alloc);
+  if (deserializeJson(doc, payload)) {
+    if (broken) *broken = true;  // 解析失败即视为连接可疑: 截断/残留污染, 调用方弃用复用连接
+    // 解析失败诊断: 打印完整 payload + 结构判据(判断是状体被拼断/chunked 泄漏/SSE 多段拼接)。
+    auto sanitize = [](String s) {
+      for (int i = 0; i < s.length(); i++) {
+        unsigned char ch = (unsigned char)s[i];
+        if (ch < 0x20 || ch == '\x7f') s[i] = '?';
+      }
+      return s;
+    };
+    // 结构判据: 是否含 "\ndata:"(SSE 多帧)、是否含多个 "{"id"..."}(多 JSON 拼接)、是否含 chunk 大小泄漏前缀。
+    bool sse = payload.indexOf("\ndata:") >= 0 || payload.startsWith("data:");
+    int multi_json = 0;
+    for (int i = payload.indexOf("{\"id\""); i >= 0 && i < payload.length(); i = payload.indexOf("{\"id\"", i + 1)) multi_json++;
+    String full = sanitize(payload);
+    ai::logf("[ai] JSON失败 len=%d sse=%d 多json=%d 截断=%d 全文:%s",
+             (int)payload.length(), sse ? 1 : 0, multi_json,
+             (payload.length() > 0 && payload[payload.length() - 1] != '}' && payload[payload.length() - 1] != ']') ? 1 : 0,
+             full.c_str());
+    return false;
+  }
+  const char* rc = doc["choices"][0]["message"]["reasoning_content"] | "";
+  if (rc[0]) {
+    // 完整思考已打串口; /log ai on 时也转发手机(仅 WS); 不回投模型。
+    Serial.print("[ai] 思考: "); Serial.println(rc);
+    blog::forward_text(blog::AI, rc);
+  }
+  const char* c = doc["choices"][0]["message"]["content"] | "";
+  // 注意: content 为空但 reasoning 有值 = 模型只给了思考没给正式回答(安全终止/条件触达)
+  if (!c[0]) {
+    // 空 content 诊断: 打出 finish_reason/用量/content 类型 —— 区分预算全花在思考(finish=length)
+    // 与端点返回空/被过滤的 choices。它们都在响应尾部, 只打头部够不着。
+    JsonVariant cv = doc["choices"][0]["message"]["content"];
+    const char* ct = cv.isNull() ? "null" : cv.is<const char*>() ? "str" : cv.is<JsonArray>() ? "arr" : "其它";
+    const char* em = doc["error"]["message"] | "";
+    ai::logf("[ai] 空content: choices=%d finish=%s content=%s(%uB) reasoning=%uB 补全/总=%u/%u%s%s",
+             (int)doc["choices"].size(), doc["choices"][0]["finish_reason"] | "(无)",
+             ct, (unsigned)strlen(c), (unsigned)strlen(rc),
+             (unsigned)(doc["usage"]["completion_tokens"] | 0), (unsigned)(doc["usage"]["total_tokens"] | 0),
+             em[0] ? " err=" : "", em);
+    if (rc[0]) { Serial.print("[ai] 思考: "); Serial.println(rc); }   // 完整思考只打串口, 不转发手机
+  }
+  content = c;
+  return content.length() > 0;
 }
 
 }  // namespace ai

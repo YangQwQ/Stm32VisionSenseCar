@@ -19,7 +19,6 @@ static void esc_append(PsaBuf& b, const char* s) {
     else if (ch < 0x80) { b.put((char)ch); p++; }
     else {
       // 多字节 UTF-8: 校验续字节, 非法/残缺则替换为 '?'(防云端判 invalid unicode code point, 400)
-      // 历史环回喂的模型 reason 偶发携非良构多字节(如不合法的 unicode escape), 只能防御。
       int need;
       if (ch >= 0xC2 && ch <= 0xDF) need = 1;
       else if (ch >= 0xE0 && ch <= 0xEF) need = 2;
@@ -55,24 +54,14 @@ static void b64_append(PsaBuf& b, const uint8_t* in, size_t inlen) {
 static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
   b.put("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,");
   b64_append(b, data, len);
-  b.put("\",\"detail\":\"high\"}}");   // DeepSeek 只认 low/high/original/auto; medium 会被 422 拒(夹取小目标需保细节)
+  b.put("\",\"detail\":\"high\"}}");   // DeepSeek 只认 low/high/original/auto; medium 会被 422 拒
 }
 
 // 屏幕像素 → 地面坐标(单应投影)由独立模块 ground_proj 负责: ground::screen_to_world。
 
-// 构建请求 body 的结构说明
-// goal 当前任务目标(可被插话/ task_goal 热替换); hrole/htext/hn = 历史环条目(角色+文本,
-// 同时含 assistant=AI 决策 与 user=插话), 逐条作为独立消息回喂, 构成真多轮对话记录。
-// 消息通道: system(固定规则) → user(目标=用户输入) → 历史环 → 独立 system 诊断消息
-// (板状态/任务笔记/任务列表/注意: 提示/空间记忆, 承载所有**非用户输入**) → user(画面描述+图)。
-// 图预算 ≤2: carry 帧(prev/放大/用户图)优先(放弃参考图), 否则 参考图(首轮)+当前帧。
-void build_body(PsaBuf& b, const char* goal, const char* ann, const char* hint,
-                const char* const* hrole, const char* const* htext, int hn,
-                const char* exec_state, unsigned last_age_s,
-                const char* note, const char* prog,
-                const uint8_t* frame, size_t frame_len,
-                const uint8_t* prev, size_t prev_len,
-                bool use_prev, bool use_edited, const uint8_t* edited, size_t edited_len) {
+// 构建请求 body(入参见 BodyReq)。消息通道: system(规则) → user(目标) → 历史环 → system(诊断)
+// → user(画面+图)。
+void build_body(PsaBuf& b, const BodyReq& r) {
   PsaBuf sys;
 sys.put(R"PROMPT(
 你是一个小车车手, 负责坐在小车左后方根据画面快速决策控制小车完成目标
@@ -113,12 +102,20 @@ sys.put(R"PROMPT(
 ## 外观描述
 	- [画面上]右下可见小车主体的前半部分, 顶部的机械臂结构连接至夹爪
 	- [画面上]总是可见夹爪左指, 夹爪左前端向左上伸出的黑色细棍的平直段为左指, 长约2.5cm
-	- 左指右边的黑色立方体是夹爪的舵机, 右指被其遮挡。[两指之间]是左右指之间的区域, 画面上表现为左指与舵机间的空隙, 松爪时该区域宽约3cm
-## 状态判定
+	- 左指右边的纯黑色立方体是夹爪的舵机, 右指被其遮挡。[两指之间]是左右指之间的区域, 画面上表现为左指与舵机间的空隙, 松爪时该区域宽约3cm
+
+## 通用的状态判定
 	- 如何准确判断物体位置
 		+ if (系统显示物体的屏幕坐标与观察到的画面基本一致): 系统提供的距离数字准确
 		+ elif (目标[较远]): 自己观测的屏幕坐标可靠
 		+ else: 无需考虑坐标, 用[画面上]的物体位置关系判断
+	- 目标状态判定
+		+ if (曾经发现过目标):
+			* if (上一步为前进 || 上一步为 arm raise/pose 动作): 可能被遮挡或过于靠近
+			* elif (上一步为旋转): 可能旋转过头
+			* else: 目标可能已被移动, 考虑重新搜索
+		+ else: 需要搜索目标, 可以每步60度旋转搜索, 同时标记较开阔区域, 搜索不到目标时可以前往该区域重新搜索
+## 夹取[目标物体]时的状态判定
 	- 距离判定
 		+ if ([目标物体] py>=0.3 || 系统提示[目标物体]已[接近]):
 			* if ([目标物体]在[画面上]处于左指上方位置, 水平方向上不相交): [目标物体]距离[接近], 需要对准
@@ -126,28 +123,18 @@ sys.put(R"PROMPT(
 		+ else: [目标物体]仍处于[较远]距离
 	- 对准判定
 		+ if ([目标物体]在[画面上]不可见): 没有[对准]
-		+ elif (未arm low 或夹爪高度大于2cm): 无法[对准], 需要先arm low
+		+ elif (未arm low 或夹爪高度大于2cm):
+			* if (夹爪松开): 无法[对准], 需要先arm low
+			* elif ([目标物体]在[画面上]的左侧与左指右侧紧贴)): 当前已[夹住][目标物体]
 		+ else:
 			* if ([目标物体]不处于[过近]距离):
 				- if ([目标物体]在[画面上]处于左指正上方): 此时[目标物体]已对准, 可以继续接近
 			* else:
 				- if ([目标物体]在[画面上]处于左指左侧): [目标物体]没有[对准], 位置偏左, 需要稍微后退并左转对准
 				- elif ([目标物体]在[画面上]处于夹爪舵机右侧或被机械臂结构遮挡)): [目标物体]没有[对准], 位置偏右, 需要稍微后退并右转对准
-				- elif ([目标物体]在[画面上]的左侧与左指右侧紧贴)): [目标物体]进入[两指之间], 可以用 grasp/clip 夹取
+				- elif ([目标物体]在[画面上]的左侧与左指右侧紧贴)): [目标物体]进入[两指之间], 可以用 grasp/clip 夹取, 若已 clip 可以抬臂检查是否夹住
 				- elif ([目标物体]被遮挡, 难以辨认或基本不可见): [目标物体]可能已被卡住, 抬臂并后退会比较合适
 				- else: [目标物体]可能已经进入[两指之间], zoom后无法确认可以尝试夹取
-	- 夹取结果判定
-		+ if (夹爪未clip): 未执行夹取, 不可能[夹住]
-		+ elif([目标物体]在[画面上]不可见): [目标物体]被遮挡或丢失
-		+ elif ([画面上]夹爪右指图层在[目标物体]上, 即遮挡[目标物体]): [目标物体]仍在地面上, 未[夹住]
-		+ else:
-			* if ([目标物体]进入[两指之间]): 已[夹住]
-	- 目标状态判定
-		+ if (曾经发现过目标):
-			* if (上一步为前进 || 上一步为机械臂动作): 可能被遮挡或过于靠近
-			* elif (上一步为旋转): 可能旋转过头
-			* else: 目标可能已被移动, 考虑重新搜索
-		+ else: 需要搜索目标, 可以每步60度旋转搜索, 同时标记较开阔区域, 搜索不到目标时可以前往该区域重新搜索
 
 # 工作流程
 	1. 确认目标: 确认当前目标以及是否需要更新
@@ -165,31 +152,30 @@ b.put("{\"model\":");
   b.put("},{\"role\":\"user\",\"content\":");
   {
     PsaBuf gt;
-    gt.put("任务目标: "); gt.put(goal ? goal : "");
-    if (ann && ann[0]) { gt.put("(操作者标注: "); gt.put(ann); gt.put(")"); }
+    gt.put("任务目标: "); gt.put(r.goal ? r.goal : "");
+    if (r.ann && r.ann[0]) { gt.put("(操作者标注: "); gt.put(r.ann); gt.put(")"); }
     esc_append(b, gt.p ? gt.p : "");
   }
   b.put("}");
   // 历史环: 逐条独立消息(assistant=自己之前的决策 / user=操作者插话), 构成真多轮对话记录。
-  for (int i = 0; i < hn; i++) {
+  for (int i = 0; i < r.hn; i++) {
     b.put(",{\"role\":");
-    esc_append(b, hrole[i]);
+    esc_append(b, r.hrole[i]);
     b.put(",\"content\":");
-    esc_append(b, htext[i]);
+    esc_append(b, r.htext[i]);
     b.put("}");
   }
-  // 本轮诊断: 独立 system 消息承载所有**非用户输入**(板状态/任务笔记/任务列表/注意: 提示/空间记忆),
-  // 不再挂在 user 通道冒充用户发言。因诊断与画面分成两条消息, 末条 user 插话也无需再并入当前 user。
+  // 本轮诊断: 独立 system 消息承载所有**非用户输入**(板状态/任务笔记/任务列表/注意: 提示/空间记忆)。
   PsaBuf dia;
-  if (exec_state && exec_state[0]) { dia.put(exec_state); dia.put("; "); }
-  if (last_age_s > 0) {
-    char age[40]; snprintf(age, sizeof(age), "上一指令约%us前执行; ", last_age_s);
+  if (r.exec_state && r.exec_state[0]) { dia.put(r.exec_state); dia.put("; "); }
+  if (r.last_age_s > 0) {
+    char age[40]; snprintf(age, sizeof(age), "上一指令约%us前执行; ", r.last_age_s);
     dia.put(age);
   }
   // 任务笔记/任务列表: AI 自己写入并持续喂回(目标外观/计划/各任务状态), 无需每轮重新推断。
-  if (note && note[0]) { dia.put("任务笔记: "); dia.put(note); dia.put("; "); }
-  if (prog && prog[0]) { dia.put(prog); dia.put("; "); }  // prog 为已渲染的"任务列表: ..."文本
-  if (hint && hint[0]) { dia.put("注意: "); dia.put(hint); dia.put("。"); }
+  if (r.note && r.note[0]) { dia.put("任务笔记: "); dia.put(r.note); dia.put("; "); }
+  if (r.prog && r.prog[0]) { dia.put(r.prog); dia.put("; "); }  // prog 为已渲染的"任务列表: ..."文本
+  if (r.hint && r.hint[0]) { dia.put("注意: "); dia.put(r.hint); dia.put("。"); }
   { // 空间记忆喂回(车向 + 已记物体, 当前车头局部系)
     char mem_s[448];
     ai::mem_feed(mem_s, sizeof(mem_s));
@@ -200,15 +186,14 @@ b.put("{\"model\":");
     esc_append(b, dia.p);
     b.put("}");
   }
-  // 当前 user: 画面(文本描述整体转义一次 + 图块), 只承载图像输入。
-  // ⚠️ 图片受 API 限制只能走 user 消息(放 system 会被 400), 于是"系统实时画面"也以 user 身份到达 ——
-  // 就地声明来源, 否则模型会把画面当成用户发来的东西。
+  // 当前 user: 画面(文本描述转义 + 图块), 只承载图像输入。
+  // ⚠️ 图片受 API 限制只能走 user 消息(放 system 会 400), 故需就地声明"系统实时画面"来源。
   b.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
   PsaBuf ut;
-  if (frame) {
-    if (use_prev && prev && prev_len > 0) {
+  if (r.frame.p) {
+    if (r.use_prev && r.prev.p && r.prev.n > 0) {
       ut.put("下面按顺序给出两张系统实时画面(非用户发送): 上一帧、当前帧: ");
-    } else if (use_edited && edited) {
+    } else if (r.use_edited && r.edited.p) {
       ut.put("下面按顺序给出: 用户发送的参考图、当前帧(系统实时画面, 非用户发送): ");
     } else {
       ut.put("当前画面如下(系统实时画面, 非用户发送): ");
@@ -218,8 +203,8 @@ b.put("{\"model\":");
   }
   esc_append(b, ut.p ? ut.p : "");
   b.put("}");
-  if (frame) {
-    // 图片块间需逗号分隔; 首个(text 之后)不加。修 multi-image 缺逗号导致的 400。
+  if (r.frame.p) {
+    // 图片块间需逗号分隔, 首个(图块首项)不加; 缺逗号会 400。
     b.put(",");
     bool first = true;
     auto img = [&](const uint8_t* d, size_t n) {
@@ -228,9 +213,9 @@ b.put("{\"model\":");
       first = false;
     };
     // 图预算 ≤2: carry 帧(prev/放大/用户图)优先(此时放弃参考图); 否则 参考图(首轮)+当前帧
-    if (use_prev && prev && prev_len > 0) img(prev, prev_len);
-    else if (use_edited && edited) img(edited, edited_len);
-    img(frame, frame_len);
+    if (r.use_prev && r.prev.p && r.prev.n > 0) img(r.prev.p, r.prev.n);
+    else if (r.use_edited && r.edited.p) img(r.edited.p, r.edited.n);
+    img(r.frame.p, r.frame.n);
   }
   b.put(R"CFG(]}],"temperature":0.3,"max_tokens":8192,"reasoning_effort":"low","response_format":{"type":"json_object"}})CFG");
 }

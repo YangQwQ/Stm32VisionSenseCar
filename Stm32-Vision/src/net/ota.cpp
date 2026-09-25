@@ -78,8 +78,7 @@ static void ota_quiesce() {
   cmd::set_streaming(false);      // 停 UDP 图传（ws_stream_task 随即释放帧缓冲副本）
   JsonDocument doc;
   doc["scope"] = "all";
-  // 停四轮 + 清机械臂连续动作；顺带覆盖 mvfy::end()（exec 的 stop 分支里已调，运动到位验证任务
-  // 随即回到 IDLE 停止抓帧软解），故这里不必再单独停一次运动验证。
+  // 停四轮 + 清机械臂连续动作。
   exec::act("stop", doc.as<JsonObjectConst>());
   ble::set_quiet(true);  // 停 BLE 广播：与 WiFi 共用 2.4G 射频，广播开着 WiFi 吞吐掉到约 1/4
 }
@@ -173,16 +172,16 @@ void ota::init() {
 // 故端口被占时我这侧必定失败，判据双向成立。
 // 三态而非两态：连探测 socket 都开不出来（socket 表满 / 内存紧，正是卡死时的样子）时不下结论，
 // 免得凭一次失败的探测就去 end() 掉一个其实好好的监听。
-enum OtaPort { OTA_PORT_HELD, OTA_PORT_FREE, OTA_PORT_UNKNOWN };
+enum class OtaPort : uint8_t { Held, Free, Unknown };
 
 static OtaPort ota_port_probe() {
   int fd = lwip_socket(AF_INET, SOCK_DGRAM, 0);
-  if (fd < 0) return OTA_PORT_UNKNOWN;
+  if (fd < 0) return OtaPort::Unknown;
   sockaddr_in a = {};
   a.sin_family = AF_INET;
   a.sin_port = htons(k_ota_port);
   a.sin_addr.s_addr = htonl(INADDR_ANY);
-  OtaPort r = (lwip_bind(fd, (sockaddr*)&a, sizeof(a)) != 0) ? OTA_PORT_HELD : OTA_PORT_FREE;
+  OtaPort r = (lwip_bind(fd, (sockaddr*)&a, sizeof(a)) != 0) ? OtaPort::Held : OtaPort::Free;
   lwip_close(fd);  // 抢到的端口立刻还回去，别自己占着 3232
   return r;
 }
@@ -206,17 +205,17 @@ void ota::update() {
   if (s_check_at == 0 || millis() - s_check_at >= k_check_ms) {
     s_check_at = millis();
     OtaPort port = ota_port_probe();
-    if (port == OTA_PORT_FREE) {  // 没人在听：重新起来
+    if (port == OtaPort::Free) {  // 没人在听：重新起来
       // end() 先把半初始化状态清干净再 begin。这一步不只是洁癖：NetworkUDP::begin 的 socket 失败
       // 路径**不调 stop()**，会把刚 malloc 的 1460B tx_buffer 漏掉，只有 _udp_ota.stop()（= end 里
       // 那步）才 free —— 少了这行，重试每轮都漏 1.4KB。
       ArduinoOTA.end();
       ArduinoOTA.begin();
       port = ota_port_probe();
-      if (port == OTA_PORT_HELD) {
+      if (port == OtaPort::Held) {
         blog::logf(blog::SYS, "ArduinoOTA 就绪：%s.local:%u（IP %s）", k_ota_host,
                    (unsigned)k_ota_port, WiFi.localIP().toString().c_str());
-      } else if (port == OTA_PORT_FREE &&
+      } else if (port == OtaPort::Free &&
                  (!s_fail_log_at || millis() - s_fail_log_at >= k_fail_log_ms)) {
         s_fail_log_at = millis();
         blog::logf(blog::SYS,
@@ -227,7 +226,7 @@ void ota::update() {
       // 第二次探测若是 UNKNOWN（刚建过 socket，多半只是探测本身失败）则保留原状态：
       // handle() 内部对未初始化是空转，乐观放行不会出错。
     }
-    if (port != OTA_PORT_UNKNOWN) s_ready = (port == OTA_PORT_HELD);
+    if (port != OtaPort::Unknown) s_ready = (port == OtaPort::Held);
   }
   if (!s_ready) return;  // 明确没起来就别 handle（内部 _initialized=false，handle 会空转）
   // ⚠️ 上传期间这个 handle() 会一直阻塞到收完固件（数十秒），loop 里其它 update 在此期间停摆

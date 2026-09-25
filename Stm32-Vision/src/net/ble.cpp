@@ -195,11 +195,10 @@ void ble::init() {
   addWriteChar(k_ai_model);
   addWriteChar(k_cmd);
 
-  // 状态特征：读 + 通知（需 CCCD 描述符）
+  // 状态特征：读 + 通知（CCCD 由 NimBLE 依 NOTIFY 属性自动添加，勿手动 addDescriptor(BLE2902)）
   g_status_char = svc->createCharacteristic(
       BLEUUID(k_status),
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  g_status_char->addDescriptor(new BLE2902());
   g_status_char->setCallbacks(new CharCB());
 
   svc->start();

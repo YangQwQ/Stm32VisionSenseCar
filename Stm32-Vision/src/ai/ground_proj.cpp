@@ -1,7 +1,5 @@
-// ground_proj.cpp — 屏幕像素 → 地面坐标（单应矩阵）投影，namespace `ground`。
-// 相机固定俯视车前地面：屏幕归一化 (u,v) → 车头系地面 cm（x=车右+, y=车前+）。
-// 求解用 Householder QR：正规方程法在 ESP32 单精度 FPU 下条件数平方放大会崩
-// （曾算出 H=(480,-567)）；QR 不放大条件数，double 软件模拟也够。
+// ground_proj.cpp — 屏幕像素 → 地面坐标(单应矩阵)投影。相机固定俯视车前地面。
+// 求解用 Householder QR: 正规方程法在 ESP32 单精度 FPU 下条件数平方放大会崩, QR 不放大条件数。
 
 #include "Calibration.h"   // 屏幕→地面单应标定点（Calibration.h 集中，加测点改那里即可）
 #include "src/ai/ground_proj.h"
@@ -64,8 +62,7 @@ bool ground::init(void) {
   us = us / kGroundCalN; vs = vs / kGroundCalN; xs = xs / kGroundCalN; ys = ys / kGroundCalN;
   if (us < 1e-9) us = 1; if (vs < 1e-9) vs = 1; if (xs < 1e-9) xs = 1; if (ys < 1e-9) ys = 1;
 
-  // 大工作数组不放栈：loopTask 栈 8K，嵌套 init→qr_fit 两套 [2N][8] 易溢出（见历史 panic）。
-  // 静态放 .bss（仅 init 期用一次，无并发），省下 ≈6KB 栈。
+  // 大工作数组不放栈: loopTask 栈 8K, 嵌套 init→qr_fit 两套 [2N][8] 会溢出; 静态放 .bss(仅 init 期用一次)。
   static double A[2 * kGroundCalN][8], b[2 * kGroundCalN];
   for (int i = 0; i < kGroundCalN; i++) {
     double u = (kGroundCal[i][0] - um) / us, v = (kGroundCal[i][1] - vm) / vs;
@@ -91,9 +88,8 @@ bool ground::init(void) {
                     (ey - (float)kGroundCal[i][3]) * (ey - (float)kGroundCal[i][3]));
     if (e > maxerr) maxerr = e;
   }
-  // QR 成功即启用像素观测。回验误差仅作精度日志、不再因此禁用：相机略斜/远点像素点击误差
-  // 会让个别标定点残差 >5cm，但整体最短二乘仍可用；禁用会让 AI 退回只有方位的 rel_deg，
-  // 反而损失距离。screen_to_world 自带 0..1 与地面范围护栏防外推，误差大只致坐标偏差、不崩溃。
+  // QR 成功即启用像素观测, 回验误差仅作精度日志(个别标定点残差大不影响整体二乘; 禁用会让 AI
+  // 退回只有方位的 rel_deg)。screen_to_world 自带护栏防外推, 误差大只致偏差不崩溃。
   if (maxerr <= 5.f) { blog::logf(blog::CAM, "单应QR求解成功 回验最大误差=%.1fcm", maxerr); return true; }
   blog::logf(blog::CAM, "单应QR回验超差(%.1fcm)，仍启用像素观测（坐标偏差上限≈该值）", maxerr);
   return true;
@@ -102,8 +98,7 @@ bool ground::init(void) {
 bool ground::ready() { return s_ready; }
 
 // 屏幕归一化像素 (u,v) → 车头系地面 (x右+, y前+) cm。
-// 单应只在标定区域内可信，区域外分母趋零会剧烈外推（AI 报错/越界像素时可达数千 cm）。
-// 故限制：输入须在 0..1，输出须在可接受地面范围，否则返回 false（上层回退 rel_deg）。
+// 单应只在标定区域内可信, 区域外分母趋零会剧烈外推 ⇒ 限制输入须在 0..1、输出须在可接受范围。
 bool ground::screen_to_world(float u, float v, float* x, float* y) {
   if (!s_ready) return false;
   if (u < 0.f || u > 1.f || v < 0.f || v > 1.f) return false;
@@ -136,14 +131,14 @@ static double inv3(const float a[9], float r[9]) {
   return d;
 }
 
-// 车头系地面 (x右+, y前+) cm → 屏幕归一化像素 (u,v)。
-// 单应对称可逆: 正向 A·(un,vn,1)∝(xn,yn,1), 反解即 A⁻¹·(xn,yn,1)。归一化 (mean/std) 亦然。
-// 精度: 记忆坐标本就是无里程计的推算值+单应前瞻误差(几 cm), 投影回屏幕也就对应几十像素的
-// 位置指示 —— 只用于"去画面那个大概位置看一眼目标在不在", 不做导航, 这点误差可接受。
+// 车头系地面 (x右+, y前+) cm → 屏幕归一化像素 (u,v)。单应对称可逆: 反解即 A⁻¹·(xn,yn,1), 归一化亦然。
+// 仅用于"去画面大概位置看一眼目标在不在", 不做导航, 厘米级误差可接受。
 bool ground::world_to_screen(float x, float y, float* u, float* v) {
   if (!s_ready) return false;
   float xn = (x - SX_MU) / SX_S, yn = (y - SY_MU) / SY_S;   // 归一化到标定区
-  float A[9] = { H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7], 1.0f };  // 行优先 3×3
+  // 行优先 3×3（H 为 double：显式收窄，值不变）
+  float A[9] = { (float)H[0], (float)H[1], (float)H[2], (float)H[3],
+                 (float)H[4], (float)H[5], (float)H[6], (float)H[7], 1.0f };
   float Ai[9];
   if (inv3(A, Ai) == 0) return false;
   // (un, vn, 1) ∝ Ai·(xn, yn, 1), 除 w 得非齐次

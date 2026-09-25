@@ -1,7 +1,6 @@
 #include "src/exec/direct_exec.h"
 #include "src/exec/nezha_direct.h"
 #include "src/exec/bivar.h"
-#include "src/exec/motion_verify.h"   // 运动到位验证：受阻/旋转到位停轮兜底
 #include "src/core/board_log.h"   // blog::logf（临时调试 armdbg 用）
 #include "Calibration.h"   // 集中式校准数据（舵机限位/移动表/标定点）
 #include <math.h>
@@ -159,7 +158,6 @@ static void send_spin(const JsonObjectConst& p) {
     long msv = p["ms"].is<int>() ? (long)(p["ms"] | 0) : 0;
     if (msv > 0) {
       exec::set_move_cap_ms((int)msv);
-      mvfy::begin("spin", 0);
       return;
     }
   }
@@ -167,16 +165,12 @@ static void send_spin(const JsonObjectConst& p) {
     // 目标角 → 通电时长：查表插值（见 spin_ms_for）。实测启动段与稳态速率差异大，查表最准。
     long ms = spin_ms_for((float)ang);
     exec::set_move_cap_ms(ms > 0 ? (int)ms : 1);
-    mvfy::begin("spin", (float)ang);
-  } else if (dir == 0) {
-    mvfy::end(); mvfy::consume();
-  } else {
+  } else if (dir != 0) {
     // 持续旋转（无 angle_deg / 无 ms）：摇杆 SpinMode 的主入口(捏杆转、松手 spin(0) 停)。
     // 不带任何"自动到点自停"的兜底: 一是它会骗人(用户以为只转一点、实际转 2.6s 半天)，
     // 二是持续旋转本就不累积车向底座(car_update_pose 只在带 angle_deg 时 +转角)，转了也不进入
     // 姿态基准，自动停毫无价值。靠显式 stop 或 spin(0) 收尾 —— 这是摇杆天然语义。
     // AI 侧 spin 一律带 angle_deg(见 ai_client 补默认角)，走的是上面定角分支，不会进这里。
-    mvfy::begin("spin", 0);
   }
 }
 
@@ -238,29 +232,16 @@ void exec::reset(void) {
   clear_active();
   clear_grasp_pending();
   s_arm_rej.armed = false;  // 回正清掉旧的"目标不可达"诊断，避免状态残留误导
-  mvfy::end(); mvfy::consume();  // 回正同样结束到位验证
   exec::init();
 }
 
 void exec::update_tick(void) {
-  // 运动受阻心跳：mvfy 异步任务已测出「受阻/转不大」，轮询到位即停轮（mvfy 自身不下发，保持单一职责）。
-  if (mvfy::should_stop()) {
-    mvfy::consume();
-    drive_motors(0);
-    s_car_motion = 0;
-    s_spin = 0;
-    s_move_cap_until = 0;  // 同时清掉可能正在倒计时的定距/定角时限，避免误重写
-    mvfy::end();
-    blog::logf(blog::EXEC, "mvfy: 视觉判定受阻/转不大, 已停轮");
-  }
   // AI 持续/微操动作的行驶时限兜底：到期自动停轮（转向/机械臂不干预），状态复位便于 AI 看到"停止"。
   if (s_move_cap_until != 0 && (long)(millis() - s_move_cap_until) >= 0) {
     s_move_cap_until = 0;
     drive_motors(0);
     s_car_motion = 0;
     s_spin = 0;  // 原地旋转定角到点也一并复位，避免状态误报"仍在原地转"
-    // 到点收尾（定角 spin / 定距 move / AI 时限兜底走同一条通路）：停轮 + 结束视觉测量。
-    mvfy::end();
   }
   // arm grasp 第二步：合爪等够时间后自动定量抬臂（起点锚在舵机真实位置，见 setup_active）。
   if (s_grasp_lift_at != 0 && (long)(millis() - s_grasp_lift_at) >= 0) {
@@ -432,9 +413,6 @@ static void send_move(const JsonObjectConst& p) {
     set_steer_pwm((int16_t)(STEER_CENTER + s * 30.0f));
   }
   s_spin = 0;  // 常规行驶（move）接管后清除原地旋转
-  // 运动到位验证：车轮在动即开始检测（画面无变化判定受阻；手动摇杆同模式重发不重置）。
-  if (fabsf(th) > 0.001f) mvfy::begin("move");
-  else { mvfy::end(); mvfy::consume(); }
   // 带 distance_cm = 定距微操：本板无里程计，按时长近似自停。实测 actual≈v·(t−死区)+c，
   // v/c 随油门插值标定表，时长 = MV_START_MS + (cm−c)/v。
   // ⚠️ 两处都别省：v/c 表拟合自长脉冲，短脉冲会整段落在起步死区里 —— 车一动不动，而
@@ -459,7 +437,6 @@ static void send_stop(const JsonObjectConst& p) {
     drive_motors(0);
     s_car_motion = 0;
     s_spin = 0;
-    mvfy::end(); mvfy::consume();  // 停止轮子：结束到位验证，释放帧缓冲预算
   }
 }
 
