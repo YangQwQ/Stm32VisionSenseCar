@@ -8,6 +8,7 @@
 //
 // 排列依据(照 `round_land` 的**实际次序**抄, 不照提示词次序):
 //   observe        写记忆, 不碰硬件
+//   delete         删记忆, 不碰硬件(与 observe 同处"动作前", 紧挨其后)
 //   carry_image    取帧, ⚠️ 必须在**所有**动作之前(否则 AI 收到车还在动的画面, 白等一轮)
 //   move           approach 自己会挪车, 故排在其它动作之前
 //   zoom           读的是"本轮动作之前"的画面
@@ -22,6 +23,7 @@ namespace {
 const ai::ToolSpec kTools[] = {
   // key            doc      grp  parse                    run      feedback  logfmt
   { "observe",     nullptr,   0,  ai::parse_observe,       nullptr, nullptr, nullptr },
+  { "delete",      nullptr,   0,  ai::parse_delete,        nullptr, nullptr, nullptr },
   { "carry_image", nullptr,   0,  ai::parse_carry_image,   nullptr, nullptr, nullptr },
   { "move",        nullptr,   0,  ai::parse_move,          nullptr, nullptr, nullptr },
   { "zoom",        nullptr,   0,  ai::parse_zoom,          nullptr, nullptr, nullptr },

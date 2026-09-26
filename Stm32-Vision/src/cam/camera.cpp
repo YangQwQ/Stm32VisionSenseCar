@@ -14,6 +14,9 @@ static bool s_ready = false;
 // AWB/AEC 预热帧数：相机上电/切分辨率后，内部 ISP 增益从默认值起、仅在**出帧**时更新统计收敛
 // （光 sleep 无效）。固定取这么多帧丢弃，喂收敛后再把帧分发给消费者，避免首个业务帧偏色/偏曝。
 static const int HI_WARM = 4;
+// 切分辨率（hires ↔ VGA）是重开相机、AWB 从零重来，比上电那次更难收敛（实测偶尔仍偏绿）。
+// 故切配置的预热比上电多喂几帧，不与上电共用一份常量。
+static const int HI_WARM_RECONFIG = HI_WARM + 3;
 
 // ---- 高清快照（request_hires 返回物） ----
 // request_hires 抓到有效高清帧后，必须**在切回 VGA / deinit 之前**把字节拷进这块 PSRAM：
@@ -194,13 +197,13 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
   // 图传会停一拍，放大镜本就偶尔一下）。
   // 跳到有效帧后，**在 deinit 回 VGA 之前**把字节拷进快照：deinit 释放整套高清帧缓冲池，
   // 不拷则下面 return 的是一个悬垂指针（buf/width/len 清零）。真正的高清驱动帧不返回给调用方。
-  for (int i = 0; i < HI_WARM + 4; i++) {
+  for (int i = 0; i < HI_WARM_RECONFIG + 4; i++) {
     camera_fb_t* cv = esp_camera_fb_get();
     if (!cv) break;
     bool valid = cv->width > 0 && cv->height > 0 && cv->len > 0;
     blog::logf(blog::CAM, "[cam] reconfig hires: 候选帧%d w=%u h=%u len=%u%c", i,
                (unsigned)cv->width, (unsigned)cv->height, (unsigned)cam::jpeg_len(cv), valid ? '+' : '-');
-    if (i < HI_WARM || !valid) { esp_camera_fb_return(cv); continue; }   // 预热帧/无效帧作废
+    if (i < HI_WARM_RECONFIG || !valid) { esp_camera_fb_return(cv); continue; }   // 预热帧/无效帧作废
     d = cv;
     break;
   }
@@ -236,7 +239,7 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
       apply_sensor_calib();
       // 回 VGA 同样是"重开相机"：AWB/AEC 又被重置，立即放行会让 zoom 之后的整幅帧头几帧偏绿。
       // 同高清段一样固定取帧丢弃喂收敛，收敛后再恢复分发（仍在 s_cam_mtx 锁内，图传会再停一拍）。
-      for (int i = 0; i < HI_WARM; i++) {
+      for (int i = 0; i < HI_WARM_RECONFIG; i++) {
         camera_fb_t* w = esp_camera_fb_get();
         if (!w) break;
         esp_camera_fb_return(w);

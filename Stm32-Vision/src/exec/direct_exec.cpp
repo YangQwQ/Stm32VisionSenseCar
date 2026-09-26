@@ -47,7 +47,6 @@ static int32_t s_lift_t0  = 0;
 
 // 小车行驶状态（本地合成用）：0 停 / 1 前 / 2 后
 static int s_car_motion = 0;
-static int s_steer_dir  = 0;  // 0 正前 / 1 左 / 2 右
 static int s_spin = 0;        // 原地旋转：0 无 / 1 左进右退(右转/顺时针) / -1 左退右进(左转/逆时针)
 
 // 夹心逻辑位置（车头系：x 前方cm / h 离地cm）。持续按钮在它之上步进后经 arm_pose 单点定位，
@@ -206,7 +205,6 @@ static void set_steer_pwm(int16_t p) {
   if (p < STEER_LO) p = STEER_LO;
   if (p > STEER_HI) p = STEER_HI;
   s_steer = p; write_steer();
-  s_steer_dir = p == STEER_CENTER ? 0 : (p < STEER_CENTER ? 1 : 2);
 }
 
 void exec::init(void) {
@@ -446,7 +444,6 @@ bool exec::set_servo(uint8_t logical, uint16_t pwm) {
   switch (logical) {
     case 0:  // 转向
       s_steer = (int16_t)pwm; write_steer();
-      s_steer_dir = pwm == STEER_CENTER ? 0 : (pwm < STEER_CENTER ? 1 : 2);
       return true;
     case 1:  // 左 = 前后移爪
       s_reach = (int16_t)pwm; write_reach();
@@ -646,13 +643,12 @@ bool exec::light_on(const char* kind) {
 bool exec::read_state(char* buf, size_t cap) {
   const char* car = s_spin != 0 ? (s_spin > 0 ? "原地右转" : "原地左转")
                                 : (s_car_motion == 1 ? "前进" : (s_car_motion == 2 ? "后退" : "停止"));
-  const char* steer = s_steer_dir == 1 ? "向左" : (s_steer_dir == 2 ? "向右" : "向前");
   const char* grip = s_grip <= GRIP_CLOSE + 5 ? "clip" : "release";
   // 机械臂到限位提示：告诉 AI 继续同向动作不会再有变化（需反向或调整姿态）。
-  const char* reach_lim = s_reach >= REACH_HI - 2 ? " 移爪到顶"
-                        : (s_reach <= REACH_LO + 2 ? " 移爪缩到底" : "");
-  const char* lift_lim  = s_lift >= LIFT_HI - 2 ? " 抬落最低"
-                        : (s_lift <= LIFT_LO + 2 ? " 抬到顶" : "");
+  const char* reach_lim = s_reach >= REACH_HI - 2 ? "夹爪前伸最远 "
+                        : (s_reach <= REACH_LO + 2 ? "夹爪回缩最近 " : "");
+  const char* lift_lim  = s_lift >= LIFT_HI - 2 ? "夹爪高度触底 "
+                        : (s_lift <= LIFT_LO + 2 ? "夹爪高度触顶 " : "");
   // 末端前端坐标（前向运动学）：让 AI 知道夹爪现在伸到多前、多高，判断还能往哪移/当前高度。
   // 括号内为左右舵机 PWM（Servo2=移爪 s_reach / Servo4=抬落 s_lift），供 exec_log 校准机械臂坐标。
   float fk_x = 0, fk_h = 0;
@@ -660,18 +656,17 @@ bool exec::read_state(char* buf, size_t cap) {
   if (fk_x < 0) fk_x = 0;
   // 臂态语义：当前处于哪个固定姿态（low/raise/clip/grasp/release/fold），移动臂位的动作后清空。
   // 给 AI 明确反馈，避免"已折叠仍反复 fold / 已夹取却不知处于何态"。爪态(开/合)单独看 s_grip。
-  const char* arm_stat = "";
+  const char* arm_stat = "非固定";
   switch (s_arm_mode) {
-    case ARM_LOW:     arm_stat = " low"; break;
-    case ARM_RAISE:   arm_stat = " raise"; break;
-    case ARM_CLIP:    arm_stat = " clip"; break;
-    case ARM_GRASP:   arm_stat = " grasp"; break;
-    case ARM_RELEASE: arm_stat = " release"; break;
-    case ARM_FOLD:    arm_stat = " fold"; break;
+    case ARM_LOW:     arm_stat = "low"; break;
+    case ARM_RAISE:   arm_stat = "raise"; break;
+    case ARM_GRASP:   arm_stat = "grasp"; break;
+    case ARM_FOLD:    arm_stat = "fold"; break;
     default: break;
   }
-  snprintf(buf, cap, "小车状态:%s 方向%s | 夹爪:前%.0fcm(%d) 高%.0fcm(%d) 爪:%s%s%s%s",
-    car, steer, fk_x, (int)s_reach, fk_h, (int)s_lift, grip, reach_lim, lift_lim, arm_stat);
+  // 调试时才使用带pwm的
+  // snprintf(buf, cap, "小车状态:%s | 夹爪:前%.0fcm(%d) 高%.0fcm(%d) %s%s 爪开合: %s %s姿态", car, fk_x, (int)s_reach, fk_h, (int)s_lift, reach_lim, lift_lim, grip, arm_stat);
+  snprintf(buf, cap, "小车状态:%s | 夹爪:(%.0f, %.0f) %s%s爪开合: %s %s姿态", car, fk_x, fk_h, reach_lim, lift_lim, grip, arm_stat);
   // 撞边界/不可达诊断：反馈"想去哪、实际落到哪/反解成多少"，帮用户/AI 判断机械臂边界
   // （exec_log 推给手机）。reason=1 表示撞边界但已夹到最近合法点继续移动，非错误。
   // 只在诊断新鲜时挂（见 ARM_DIAG_FRESH_MS）：它是"刚下的那条指令的结果"，过期的别重复报。

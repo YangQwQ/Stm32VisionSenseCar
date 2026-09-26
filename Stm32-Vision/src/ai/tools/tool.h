@@ -63,6 +63,7 @@ struct ToolSpec {
 
 // ---- 各工具的 parse 实现(逐通道一个文件) ----
 const char* parse_observe(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);      // t_observe.cpp
+const char* parse_delete(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);       // t_observe.cpp
 const char* parse_carry_image(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);  // t_meta.cpp
 const char* parse_move(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);         // t_move.cpp
 const char* parse_zoom(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);         // t_zoom.cpp

@@ -20,17 +20,17 @@ const char* ai::parse_task_note(JsonVariantConst root, JsonDocument& dst, char* 
   return nullptr;
 }
 
-// tasks: 整表重写(每项完成与否由模型自己维护)。
+// tasks: 整表重写, 每项就是任务名(**纯字符串**数组; 每项完成与否由 task_done 标记)。
 const char* ai::parse_tasks(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
   (void)err; (void)cap;
   if (root["tasks"].is<JsonArrayConst>()) dst["tasks"] = root["tasks"].as<JsonArrayConst>();
   return nullptr;
 }
 
-// task_done: 标记第 index 项完成(`index` 是 **1-based**, 见 round_land 的读法)。
+// task_done: 标记若干项完成, 数组里是任务编号(**纯数字**, 首项为 1; 见 round_land 的读法)。
 const char* ai::parse_task_done(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
   (void)err; (void)cap;
-  if (root["task_done"].is<JsonObjectConst>())
-    dst["task_done"] = root["task_done"].as<JsonObjectConst>();
+  if (root["task_done"].is<JsonArrayConst>())
+    dst["task_done"] = root["task_done"].as<JsonArrayConst>();
   return nullptr;
 }

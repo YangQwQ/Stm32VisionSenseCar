@@ -656,6 +656,54 @@ static void land_carry_image(RoundCtx& c, JsonDocument& cmdD) {
   }
 }
 
+// ---- observe: 收下数组里的一条观测 ----
+// 名字必填; 位置优先用屏幕像素 px/py(单应解算, 精度高), 越界/解算失败或没报像素则回退模型自估的
+// rel_deg/dist_cm。⚠️ obs_warn 是单条缓冲: 一轮报多个物体时只留**第一条**回告, 免得后面的覆盖前面的。
+static void land_observe_one(RoundCtx& c, JsonObjectConst ob) {
+  const char* nm = ob["name"] | "";
+  // 只要 AI 提交 observe(写明了名字+位置)就说明它这一帧看到了该物体、要记录 → 一律视为可见;
+  // 它不对某物 observe, 该物就不会被刷新(新旧由 mem 的过期轮数体现)。
+  if (!nm[0]) {
+    // name 必填: 无名观测无法归属到任何物体, 只能丢弃。明确回告(否则 AI 以为已记住)
+    if (!c.obs_warn[0]) snprintf(c.obs_warn, sizeof(c.obs_warn),
+                                 "上轮 observe 没给 name, 该观测已被忽略(记忆里没有它); 每次 observe 都要带 name");
+    return;
+  }
+  float px = ob["px"] | 0.0f, py = ob["py"] | 0.0f;
+  // 本轮 AI 看的是放大图时, 它的 px/py 是相对那块裁框的: 先换回全幅再交给单应。
+  // 这一步是精确算术(裁框是程序记账) ⇒ AI 只需在局部指认目标, 不必在全幅估绝对位置。
+  if (c.sent_zoomed) {
+    float lx = px, ly = py;
+    px = c.to_full_x(px); py = c.to_full_y(py);
+    if (lx >= 0.0f && lx <= 1.0f && ly >= 0.0f && ly <= 1.0f)
+      ai::logf("[放大镜] 「%s」局部(%.2f,%.2f) → 全幅(%.2f,%.2f)", nm, lx, ly, px, py);
+  }
+  bool has_px = ob["px"].is<float>() || ob["px"].is<int>();
+  bool has_py = ob["py"].is<float>() || ob["py"].is<int>();
+  bool rec;
+  if (has_px && has_py) {
+    rec = ai::mem_observe_xy(nm, true, px, py);
+    if (!rec) {  // 像素越界: 若另给了角度+距离, 退回粗测(距离为 0 则同样记不成)
+      ai::logf("[ai] 观测「%s」像素(%.2f,%.2f)不可用 → 退回模型自估 rel=%.0f° dist=%.0fcm",
+               nm, px, py, ob["rel_deg"] | 0.0f, ob["dist_cm"] | 0.0f);
+      rec = ai::mem_observe(nm, true, ob["rel_deg"] | 0.0f, ob["dist_cm"] | 0.0f);
+    }
+  } else {
+    // 没给像素 = 位置只能记模型自估的厘米/角度。模型没有测距能力, 自估偏小, 照它对准会把车
+    // 往错的方向指挥; 记还是照记(approach/goto 用粗值够用), 但要把话说清并要回像素指认。
+    ai::logf("[ai] 观测「%s」未给 px/py → 只能记模型自估 rel=%.0f° dist=%.0fcm(非实测)",
+             nm, ob["rel_deg"] | 0.0f, ob["dist_cm"] | 0.0f);
+    if (!c.obs_warn[0])
+      snprintf(c.obs_warn, sizeof(c.obs_warn),
+               "上轮 observe 没给 px/py: 位置只能按你自报的厘米记(自估不准); 请用 px/py 指认画面里的目标再对准");
+    rec = ai::mem_observe(nm, true, ob["rel_deg"] | 0.0f, ob["dist_cm"] | 0.0f);
+  }
+  if (!rec && !c.obs_warn[0])   // 可见却没记成: 回告, 否则 AI 以为已锁定而实际记忆为空
+    snprintf(c.obs_warn, sizeof(c.obs_warn),
+             "上轮 observe 的「%s」没记进记忆(px/py 越界且缺可用距离), 位置仍未知; 请据当前画面重新确认后再 observe",
+             nm);
+}
+
 // ---------------- 落地(分组通道 → 执行 / 元数据 / 反馈) ----------------
 static void round_land(RoundCtx& c, JsonDocument& cmdD, const String& content) {
   // ---- 分组通道提取(新协议): move/arm/light/zoom 可选, 缺席=该子系统不动 ----
@@ -675,58 +723,20 @@ static void round_land(RoundCtx& c, JsonDocument& cmdD, const String& content) {
   // 重置"上轮是否可能遮挡目标"标记: 本轮的提示已用上一轮的值构建完, 这里起重新累计供下一轮。
   // 只有**真正的遮挡源**(收臂进视野/后退)会在下方重标为 true; spin/前进是主动去找、zoom/wait 空动作轮仍为 false。
   c.last_round_hide_target = false;
-  // 空间记忆: 先解析 AI observe, 且必须用**动作前**的车位姿把观测转全局 —— 位置在所有动作之前:
-  // 本轮动作落不落地都要收下这一帧观测(观测是事实), 而坐标换算基准是动作前的车姿态。
-  if (cmdD["observe"].is<JsonObject>()) {
-    JsonObjectConst ob = cmdD["observe"].as<JsonObjectConst>();
-    const char* nm = ob["name"] | "";
-    // 只要 AI 提交 observe(写明了名字+位置)就说明它这一帧看到了该物体、要记录 → 一律视为可见;
-    // 它不对某物 observe, 该物就不会被刷新(新旧由 mem 的过期轮数体现)。
-    bool vis = true;
-    if (!nm[0]) {
-      // name 必填: 无名观测无法归属到任何物体, 只能丢弃。明确回告(否则 AI 以为已记住)
-      if (vis) snprintf(c.obs_warn, sizeof(c.obs_warn),
-                        "上轮 observe 没给 name, 该观测已被忽略(记忆里没有它); 每次 observe 都要带 name");
-    } else {
-      // 优先用屏幕像素 px/py(单应解算, 精度高); 越界/解算失败或没报像素则回退 rel_deg/dist。
-      float px = ob["px"] | 0.0f, py = ob["py"] | 0.0f;
-      // 本轮 AI 看的是放大图时, 它的 px/py 是相对那块裁框的: 先换回全幅再交给单应。
-      // 这一步是精确算术(裁框是程序记账) ⇒ AI 只需在局部指认目标, 不必在全幅估绝对位置。
-      if (c.sent_zoomed) {
-        float lx = px, ly = py;
-        px = c.to_full_x(px); py = c.to_full_y(py);
-        if (lx >= 0.0f && lx <= 1.0f && ly >= 0.0f && ly <= 1.0f)
-          ai::logf("[放大镜] 「%s」局部(%.2f,%.2f) → 全幅(%.2f,%.2f)", nm, lx, ly, px, py);
-      }
-      bool has_px = ob["px"].is<float>() || ob["px"].is<int>();
-      bool has_py = ob["py"].is<float>() || ob["py"].is<int>();
-      bool rec;
-      if (has_px && has_py) {
-        rec = ai::mem_observe_xy(nm, vis, px, py);
-        if (!rec) {  // 像素越界: 若另给了角度+距离, 退回粗测(距离为 0 则同样记不成)
-          ai::logf("[ai] 观测「%s」像素(%.2f,%.2f)不可用 → 退回模型自估 rel=%.0f° dist=%.0fcm",
-                   nm, px, py, ob["rel_deg"] | 0.0f, ob["dist_cm"] | 0.0f);
-          rec = ai::mem_observe(nm, vis, ob["rel_deg"] | 0.0f, ob["dist_cm"] | 0.0f);
-        }
-      } else {
-        // 没给像素 = 位置只能记模型自估的厘米/角度。模型没有测距能力, 自估偏小, 照它对准会把车
-        // 往错的方向指挥; 记还是照记(approach/goto 用粗值够用), 但要把话说清并要回像素指认。
-        ai::logf("[ai] 观测「%s」未给 px/py → 只能记模型自估 rel=%.0f° dist=%.0fcm(非实测)",
-                 nm, ob["rel_deg"] | 0.0f, ob["dist_cm"] | 0.0f);
-        if (vis && !c.obs_warn[0])
-          snprintf(c.obs_warn, sizeof(c.obs_warn),
-                   "上轮 observe 没给 px/py: 位置只能按你自报的厘米记(自估不准); 请用 px/py 指认画面里的目标再对准");
-        rec = ai::mem_observe(nm, vis, ob["rel_deg"] | 0.0f, ob["dist_cm"] | 0.0f);
-      }
-      if (vis && !rec)   // 可见却没记成: 回告, 否则 AI 以为已锁定而实际记忆为空
-        snprintf(c.obs_warn, sizeof(c.obs_warn),
-                 "上轮 observe 的「%s」没记进记忆(px/py 越界且缺可用距离), 位置仍未知; 请据当前画面重新确认后再 observe",
-                 nm);
+  // 空间记忆: 先解析 AI observe(数组, 一轮可报多个物体), 且必须用**动作前**的车位姿把观测转全局 ——
+  // 位置在所有动作之前: 本轮动作落不落地都要收下这一帧观测(观测是事实), 换算基准是动作前的车姿态。
+  if (cmdD["observe"].is<JsonArray>())
+    for (JsonObjectConst ob : cmdD["observe"].as<JsonArrayConst>()) land_observe_one(c, ob);
+  // 删除物体记忆(delete): 与 observe 同属动作前的记忆操作, 紧挨其后 —— 不影响本轮动作。
+  if (cmdD["delete"].is<JsonArray>())
+    for (JsonVariantConst it : cmdD["delete"].as<JsonArrayConst>()) {
+      if (!it.is<const char*>()) continue;   // 只认字符串名字
+      const char* nm = it.as<const char*>();
+      if (!nm || !nm[0]) continue;
+      ai::logf("[ai] 删除物体记忆: %s%s", nm, ai::mem_forget(nm) ? "" : "(记忆里没有该物体)");
     }
-  }
   // ---- 主动作/并行辅助标记(供末尾统一落地与反馈); acted 用 RoundCtx, 勿在此重复遮蔽 ----
   bool nav_done = false;                 // approach 已执行导航
-  const char* nav_why = nullptr;         // approach 结果说明(供主动作反馈/历史)
   const char* nav_tgt = mv["target"] | "";
   // ---- 带图请求: ⚠️ 提到所有动作之前(approach 会挪车) ⇒ 预取到的必是"本轮动作前"的画面 ----
   land_carry_image(c, cmdD);
@@ -741,26 +751,20 @@ static void round_land(RoundCtx& c, JsonDocument& cmdD, const String& content) {
       cmdF["params"]["target"] = nav_tgt[0] ? nav_tgt : "(最近)";
       String fb = build_feedback(c.t.id, cmdF);
       ai::enqueue_result(fb.c_str(), c.t.fn, c.t.ctx);
-      {
-        const char* r = cmdD["reason"] | "";
-        PsaBuf ld;
-        ld.put("approach 被拦(与合爪同轮), 原因: "); ld.put(r);
-        utf8_clamp_tail(ld.p);
-        if (ld.len) c.hist_add("assistant", ld.p);
-      }
+      if (content.length() > 0) c.hist_add("assistant", content.c_str());   // 历史回喂 AI 的实际输出
       c.got = true; c.net_fail = 0;
       return;
     }
     float tx, ty;
     bool found = ai::mem_find(nav_tgt[0] ? nav_tgt : nullptr, &tx, &ty);
     if (!found) {
-      nav_why = nav_tgt[0] ? "approach 目标不在记忆里, 请先 observe 锁定" : "approach 无可用目标记忆, 请先 observe";
+      ai::logf("[ai] %s", nav_tgt[0] ? "approach 目标不在记忆里(得先 observe)" : "approach 无可用目标记忆");
     } else {
       ai::logf("[ai] approach 目标 全局(%.0f,%.0f)cm 停距%dcm", tx, ty, AI_APPROACH_STOP_CM);
       ai::NavR r = ai::navigate_to(c.t.generation, tx, ty, AI_APPROACH_STOP_CM);
       if (r == ai::NavR::Interrupted) { c.interrupted = true; c.done = true; return; }   // 被接管: 本任务作废
       nav_done = true;
-      nav_why = (r == ai::NavR::Reached) ? "已自动靠近目标, 交还你微操" : "靠近收敛结束, 由你继续";
+      ai::logf("[ai] %s", r == ai::NavR::Reached ? "已自动靠近目标, 交还微操" : "靠近收敛结束");
       c.last_act_ms = (unsigned long)(esp_timer_get_time() / 1000);
     }
     c.acted = true;   // approach 算一次有意推进(空转兜底/死循环都销账)
@@ -818,13 +822,6 @@ static void round_land(RoundCtx& c, JsonDocument& cmdD, const String& content) {
     cmdF["params"]["on"] = c.zoom_on;
     String fb = build_feedback(c.t.id, cmdF);
     ai::enqueue_result(fb.c_str(), c.t.fn, c.t.ctx);
-    {
-      const char* r = cmdD["reason"] | "";
-      PsaBuf ld;
-      ld.put(c.zoom_on ? "zoom 放大镜" : "zoom 回全幅"); ld.put(", 原因: "); ld.put(r);
-      utf8_clamp_tail(ld.p);
-      if (ld.len) c.hist_add("assistant", ld.p);
-    }
     // 换视角是有意推进, 但空操作(要一张手上就有的图)不算:
     if (c.zoom_on) { c.stall = 0; c.stall_hint = false; }
   }
@@ -837,24 +834,27 @@ static void round_land(RoundCtx& c, JsonDocument& cmdD, const String& content) {
     } }
   if (cmdD["tasks"].is<JsonArray>()) {
     JsonArrayConst ta = cmdD["tasks"].as<JsonArrayConst>();
-    // tasks = "重写整个任务列表", 提示词只给名字 ⇒ done 不从 JSON 读: 重写即从"全部未完成"重来,
-    // 进度一律由 task_done 标记(渲染时才看得出来谁完成)。
+    // tasks = "重写整个任务列表", 每项就是一个名字(纯字符串) ⇒ done 不从 JSON 读: 重写即从"全部未完成"
+    // 重来, 进度一律由 task_done 标记(渲染时才看得出来谁完成)。
     int n = 0;
-    for (JsonObjectConst it : ta) {
+    for (JsonVariantConst it : ta) {
       if (n >= 8) break;
-      const char* nm = it["name"] | "";
-      if (!nm[0]) continue;
+      if (!it.is<const char*>()) continue;   // 只认字符串项; 写成对象 {"name":..} 的一律跳过
+      const char* nm = it.as<const char*>();
+      if (!nm || !nm[0]) continue;
       strncpy(c.s_tasks[n].name, nm, 47); c.s_tasks[n].name[47] = 0;
       c.s_tasks[n].done = false;
       n++;
     }
     if (n > 0 || c.s_task_n > 0) { c.s_task_n = n; ai::logf("[ai] 任务列表更新(%d项)", c.s_task_n); }
   }
-  if (cmdD["task_done"].is<JsonObject>()) {
-    int idx = (cmdD["task_done"]["index"] | 0) - 1;
-    if (idx >= 0 && idx < c.s_task_n) {
-      c.s_tasks[idx].done = cmdD["task_done"]["done"] | false;
-      ai::logf("[ai] 任务%d → %s", idx + 1, c.s_tasks[idx].done ? "完成" : "未完成");
+  if (cmdD["task_done"].is<JsonArray>()) {
+    // 数组里列出的是任务编号(纯数字, 首项为 1), 一律置完成: 一次可标多项, 越界项静默跳过。
+    for (JsonVariantConst it : cmdD["task_done"].as<JsonArrayConst>()) {
+      int idx = (it | 0) - 1;
+      if (idx < 0 || idx >= c.s_task_n) continue;
+      if (!c.s_tasks[idx].done) ai::logf("[ai] 任务%d → 完成", idx + 1);
+      c.s_tasks[idx].done = true;
     }
   }
   { const char* tgoal = cmdD["task_goal"] | "";
@@ -988,30 +988,27 @@ static void round_land(RoundCtx& c, JsonDocument& cmdD, const String& content) {
       ai::dump_note(nb);
     }
   }
-  // 历史回喂: 合并串(或 approach/等待说明) + 完整 reason
-  {
-    const char* r = cmdD["reason"] | "";
-    const char* goal_v = cmdD["goal"] | "";
-    const char* what = merge_str[0] ? merge_str
-                       : (nav_done ? (nav_why ? nav_why : "approach") : "wait");
-    if (!strcmp(goal_v, "abort")) what = "中止并等待用户输入";   // 别让历史里只写个 wait
-    PsaBuf ld;
-    ld.put(what);
-    ld.put(", 原因: "); if (r) ld.put(r);
-    utf8_clamp_tail(ld.p);
-    if (ld.len) c.hist_add("assistant", ld.p);
-  }
+  // 历史回喂: AI 的**实际输出**(原样 JSON, 含它自己写的 reason) —— 让它看到自己上轮到底发了什么,
+  // 而不是程序复述的动作摘要(摘要与它真正发出的指令可能不一致: 被拦/被钳制/补默认值都在程序侧发生)。
+  if (content.length() > 0) c.hist_add("assistant", content.c_str());
 
   // ---------- AI 决策日志: 本轮"用了哪些工具 + 完整 JSON" ----------
   // 复盘靠原样 JSON、不能截断: 用 blog::forward_text 走 PSRAM 任意长转发(不占 logf 的栈缓冲); 另打短摘要。
   if (content.length() > 0) {
     char tob[160] = {0};   // 短摘要: JSON 里的顶层工具 + 主动作
     bool first = true;
-    if (cmdD["observe"].is<JsonObject>()) {
-      JsonObjectConst ob = cmdD["observe"].as<JsonObjectConst>();
-      snprintf(tob, sizeof(tob), "observe(%s,px%.2f,py%.2f)",
-               ob["name"] | "", ob["px"] | 0.0f, ob["py"] | 0.0f);
+    if (cmdD["observe"].is<JsonArray>()) {
+      JsonArrayConst oa = cmdD["observe"].as<JsonArrayConst>();
+      JsonObjectConst ob = oa.size() > 0 ? oa[0].as<JsonObjectConst>() : JsonObjectConst();
+      snprintf(tob, sizeof(tob), "observe(%s,px%.2f,py%.2f%s)",
+               ob["name"] | "", ob["px"] | 0.0f, ob["py"] | 0.0f,
+               oa.size() > 1 ? ",..." : "");
       first = false;
+    }
+    if (cmdD["delete"].is<JsonArray>()) {
+      char db[24];
+      snprintf(db, sizeof(db), "delete(%u项)", (unsigned)cmdD["delete"].as<JsonArrayConst>().size());
+      ai::safe_append(tob, sizeof(tob), &first, db);
     }
     if (has_zoom) first = ai::safe_append(tob, sizeof(tob), &first, "zoom");
     if (has_move && is_mv)  ai::safe_append(tob, sizeof(tob), &first, is_ap ? "approach" : "move");
