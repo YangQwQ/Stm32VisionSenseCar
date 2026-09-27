@@ -6,10 +6,10 @@
 namespace ground {
 
 // 启动拟合(QR 求解 + 回验)并打印诊断, setup 期调用一次。失败则禁用像素观测(ready()=false),
-// 上层 px/py 观测自动回退 rel_deg。
+// 上层 px/py 观测一律解算不成。
 bool init();
 
-// 单应是否就绪。就绪后 px/py 像素观测方可解算；未就绪时上层应回退 rel_deg 兜底。
+// 单应是否就绪。就绪后 px/py 像素观测方可解算；未就绪时 observe 的位置一律记不成。
 bool ready();
 
 // 屏幕归一化像素 (u,v) → 车头系地面 (x右+, y前+) cm。

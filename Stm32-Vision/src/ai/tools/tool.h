@@ -10,14 +10,11 @@
 // 漏一处**不报错、只是静默失效**(已踩三次, 见 memory `ai-cmd-param-whitelist-copy`: light 的
 // kind/on、zoom 的 px/py/scale/reset 都是这么丢的)。有表之后"改词表"塌缩成"改一个文件"。
 //
-// ⚠️ **表内顺序是承重的, 而且指的是执行顺序**: 它就是 `round_land` 的实际落地次序, 带时序语义 ——
-//    `carry_image` 必须在所有动作落地**之前**取帧(否则 AI 收到车还在动的画面, 白等一轮),
-//    `approach` 自己会挪车故排在其它动作之前。改顺序前先读 `ai_round.cpp` 里 `land_carry_image`
-//    与 approach 块、以及夹取前特写那段的注释。
-//    ⚠️ 提示词的呈现顺序**不是**这个顺序(现提示词把 move 写在 arm 前、不含 carry_image 的位置),
-//    阶段 3 靠 `group` 单独生成, 不要拿表序当提示词序。
-//    已知代价: 校验也按表序跑, 故"同一次返回里有多个非法键"时报出的**是哪一个**会变(错误文本本身不变,
-//    也是唯一会变的东西); 单个非法键的行为完全一致。
+// ⚠️ **表序现在只决定校验顺序**: `validate_cmd` 按表序逐项跑 parse, 故"同一次 car 里有多个非法键"时
+//    报出的是表里靠前的那一个(错误文本本身不变, 这是表序唯一还会影响的东西); 单个非法键的行为完全一致。
+//    **落地顺序不在这张表里**: car 内部各通道的次序在 `ai_round.cpp` 的 `land_car`(observe/delete 在所有
+//    动作**之前**、approach 在其它动作之前), 工具之间的次序在 `dispatch_calls`(mem → car → look → finish)。
+//    ⚠️ 提示词里的呈现顺序也不是表序(键名/取值/用法现写在 `ai_prompt.cpp` 的 `tools_schema()` 工具描述里)。
 namespace ai {
 
 struct RoundCtx;
@@ -45,7 +42,7 @@ struct ToolSpec {
   const char* (*parse)(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);
 
   // ② 落地: 执行(本地处理 或 `exec::act`)并写回执片段。收的是**整份规范化文档**而非自己的子对象:
-  //    多个工具要读同级键(典型如 `reason`, approach/zoom 都把它的原文记进历史环)。这是本方案
+  //    多个工具要读同级键(典型如 car 落地时要一并看同级的 `task_goal`/`done`/`goal`)。这是本方案
   //    已接受的折中 —— 换取逐通道迁移时行为可逐字对照, 不做插件式注册/动态分配/虚函数。
   //    阶段 1 的校验批次里先为 nullptr, 由后续批次填入。
   ToolR (*run)(RoundCtx& c, JsonDocument& cmdD);
@@ -73,13 +70,16 @@ const char* parse_task_done(JsonVariantConst root, JsonDocument& dst, char* err,
 const char* parse_task_goal(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);    // t_tasks.cpp
 const char* parse_arm(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);          // t_arm.cpp
 const char* parse_light(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);        // t_meta.cpp
-const char* parse_reason(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);       // t_meta.cpp
 const char* parse_done(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);         // t_meta.cpp
 const char* parse_goal(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);         // t_meta.cpp
 
 // registry.cpp 里的有序表(顺序 = 执行顺序, 见文件头注)。返回数组首址并写回项数。
 // 数组是文件级 `const` 常量, 只在启动时构造一次, 无动态分配。
 const ToolSpec* tools(int* n);
+
+// 请求体尾部的工具声明原文: `"tools":[...],"tool_choice":"auto"`(ai_prompt.cpp, 静态只读字面量)。
+// agent 循环的四个工具(car/look/mem/finish)在这里对模型声明; 行为与判据仍在系统提示词里。
+const char* tools_schema();
 // 按键查表; 未登记返回 nullptr。
 const ToolSpec* tool_by_key(const char* key);
 // 表完整性自检: key 非空且唯一、parse 非空。异常打一条日志(廉价保险, 不做断言)。init 时调一次。

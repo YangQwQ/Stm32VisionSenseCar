@@ -189,7 +189,7 @@ bool ai::append_chat(const char* text) {
       strncpy(g_chat, text, sizeof(g_chat) - 1);
       g_chat[sizeof(g_chat) - 1] = 0;
       g_chat_has = true;
-      blog::logf(blog::AI, "插话入队: %s", text);
+      blog::logf(blog::AI, "用户消息入队: %s", text);
     }
   }
   return fed;

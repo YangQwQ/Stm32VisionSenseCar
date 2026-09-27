@@ -11,10 +11,7 @@
 
 // ---- 舵机限位 / 回中（大圣机械臂_NeZha 三舵机，勿随意改） ----
 // Servo2=移爪  Servo3=夹爪  Servo4=抬落；Servo1=转向。
-// ⚠️ 正前 2026-09-22 又调到 147（145 实测略右斜、150 也是右斜）：147 目测更正，但用户自己也
-// 摆不十分正，属±2 内尝鲜值。120/180 仍是左右限位。回中偏几度的后果是 steering=0 直线 move
-// 斜着走，短距到点判定被斜向位移带偏（实测 goto(30,30) 到 (40,30)，X 超 10cm）。
-inline constexpr int STEER_CENTER = 147, STEER_LO = 120, STEER_HI = 180;     // 转向：正前/左/右
+inline constexpr int STEER_CENTER = 146, STEER_LO = 120, STEER_HI = 180;     // 转向：正前/左/右
 inline constexpr int REACH_CENTER = 200, REACH_LO = 120, REACH_HI = 250;     // 移爪
 inline constexpr int GRIP_CENTER = 140, GRIP_CLOSE = 50, GRIP_LO = 50, GRIP_HI = 140;  // 夹爪
 inline constexpr int LIFT_CENTER = 180, LIFT_LO = 115, LIFT_HI = 250;        // 抬落
@@ -33,11 +30,6 @@ inline constexpr float ARM_STALL_EPS_CM = 0.05f;
 // ---- 低姿夹取准备位（arm 指令 act="low" 的落点）----
 // 夹心 x=车头前 cm / h=离地 cm。取可达域里"够低、又离车身够远"的一个**实测点**（kArmPts 弯带在
 // 低处很窄），于是它反解出来的 pwm 就是真值，不靠外插。用法：先把爪降到这儿，再靠车的前后移动
-// 把目标送进两指之间 —— 比让上层去猜一个够不着的 (x,h) 可靠（猜错的代价是空夹且无任何报错）。
-// ⚠️ 重新标定 kArmPts 后必须连同复核本值（以及按它推出的"目标应落在画面 v≈0.62~0.69"）。
-// ⚠️ 这两个数是**请求值**，不是落点：低处弯带边缘上"请求 (7.0,0.5) 实际只落到 (7.8,0.8)"这类
-// 偏差是常态（FK∘IK 在稀疏点处不互逆），而状态行会把偏差报成"位姿没到位"、让 AI 以为动作失败。
-// 现值是**实机逐点核过、落点无诊断**的一组：(8.0,1.0) → 实际落 (8,1)，pwm 170/232。
 inline constexpr float ARM_LOW_X_CM = 8.0f;
 inline constexpr float ARM_LOW_H_CM = 1.0f;
 // 固定抬臂位（arm 指令 act="raise" 的落点）：夹取后验证/看清爪下时一次到位（S 形缓动，
@@ -52,18 +44,11 @@ inline constexpr int   GRASP_SETTLE_MS = 250;  // 合爪到抬臂之间的等待
 // ---- 原地旋转的车身几何（AI 姿态累积用）----
 // 坐标系原点=车头，但四轮差速原地旋转的枢轴是车几何中心、不是车头原点——于是旋转时车头原点
 // 本身会移动。car_update_pose 拿车头相对枢轴的距离折算这段位移，否则旋转后记忆坐标整体漂移
-// （实测原地转 90° 车头漂到 (5,-5)~(5,-6.5)，方向=右转右后/左转左后，与刚性枢轴模型一致）。
-// 纯刚性按轮距中心算（车前 15.5cm 全长→8.25cm）会高估约 1.4 倍（模型 11cm vs 实测 8cm），
-// 存在滑移，取经验折中值（5~7cm 区间都试过，方向与量级对得上）。
 inline constexpr float SPIN_PIVOT_BEHIND_CM = 6.0f;
 
 // ---- 小车移动时长近似（电机无编码器，只能按时长模拟距离/角度） ----
 // 移动 actual_cm ≈ v(throttle)·t_s + c(throttle)，按油门插值；原地转角用时 ms/度随转速骤升。
 inline constexpr int   SPIN_MIN_SPEED = 800;   // 低于此转速原地旋转拖不动，抬升到可靠值
-// ⚠️ 0.15 与 0.25 两档是 2026-09-22 真机实测重定的（各 cm=2/4/6/9 正反各一次，共 16 个样本，
-// 用板端同一单应反投影量位移）。这两档此前**全无实测依据**，而它们恰好是 AI 的唯一工作区间：
-// AI 近场发的油门是 0.1~0.25（实测 0.1/0.2）。
-//
 // 模型 actual = v·max(0, t − 死区)，分别拟合：
 //   th=0.15 独拟合 v=6.60 B=354ms RMSE 0.46cm（8 点，拟合很干净）
 //   th=0.25 独拟合 v=8.98 B=380ms RMSE 1.51cm（8 点，散布大，单独不足以定值）
@@ -76,28 +61,16 @@ inline constexpr int   SPIN_MIN_SPEED = 800;   // 低于此转速原地旋转拖
 inline constexpr float MV_SPEED_X[] = { 0.15f, 0.25f, 0.5f,  1.0f };
 inline constexpr float MV_SPEED_Y[] = { 6.6f,  7.8f,  11.3f, 12.5f };
 inline constexpr float MV_COAST_X[] = { 0.15f, 0.25f, 0.5f,  1.0f };
-// ⚠️ 0.5 档 2026-09-22 实测定距(理论:实际): 10:12 / 20:21.5 / 30:32.25 / 40:42 ⇒ 恒定超出约 1.75cm
-// (拟合 实际≈理论×1.0075+1.75, 斜率已准, 主要是起停余量偏小)。1.7 → 3.45。其余档未重测, 别外推。
 inline constexpr float MV_COAST_Y[] = { 0.0f,  0.0f,  3.45f, 1.75f };
 inline constexpr int   MV_N = (int)(sizeof(MV_SPEED_Y) / sizeof(MV_SPEED_Y[0]));
-// 定距脉冲的**起步死区**与**脉冲下限**（ms）。v/c 表是在**长脉冲**上拟合的，短脉冲会整段落进死区：
-// 实测（红灯斑点位移标定，throttle 0.35）指令 3cm(217ms)、5cm(404ms) 整车纹丝不动，8cm(684ms) 起才动，
-// 且每段都比指令少走 2~3.5cm —— 即每段脉冲开头都有一截"电机通电但车不动"的时间。
-// ⚠️ 危害不是"走不准"而是**同源不一致**：`car_update_pose` 按 distance_cm 累加车位移，于是 AI 记忆里
-// "已经小步顶到位"、实际原地没动，它据此下探合爪 → 对着空气夹（实测空夹的主要来路）。AI 若自己挑
-// 2cm 以内的步长，整步都落在死区里 —— 对准的最后几厘米会变成空转。
 inline constexpr int   MV_START_MS = 320;      // 死区补偿：每段定距脉冲加上这段（它不产生位移）
 inline constexpr int   MV_MIN_PULSE_MS = 500;  // 脉冲下限：宁可多走一两厘米，也不能"指令走了、车没动"
 // 原地旋转：**角度→通电ms 查表插值**（spin_ms 直接测，重复执行累计到 90° 取平均）。
-// 实测曲线(用户 2026-09-24, spin_ms 直测)：
-//   t(ms)    1    10   15   25   50   100   500   750   2250  4500
-//   deg    0.96  2.2 3.25 4.5 6.43 10.56   40    60  173.1 337.5
 // 每度所需ms单调上升(启动瞬间快 ~1ms/°, 稳态 ~13ms/°) ⇒ 单斜率+滑行角公式无法拟合，查表最直接。
 // 表内角升序；目标角在表内线性插值、超出末点用末段斜率外推。0 点隐含 (0,0)。
 inline constexpr int   SPIN_TBL_N = 10;
 inline constexpr float SPIN_TBL_DEG[SPIN_TBL_N] = { 0.0f, 2.2f, 3.25f, 4.5f, 6.43f, 10.56f, 40.0f, 60.0f, 173.1f, 337.5f };
 inline constexpr int   SPIN_TBL_MS[SPIN_TBL_N]  = { 0,   10,    15,    25,   50,    100,    500,    750,    2250,   4500 };
-// ⚠️ 上述曲线在特定电池电压/地面下测得；电压下降转速变慢，电压/地面变了需重测。
 
 // ---- 屏幕→地面 单应标定点（改镜头/移相机后重测此表） ----
 // 每行一个坐标对：(屏幕归一化 u, v) → (车头系地面 x右+, y前+ cm)。

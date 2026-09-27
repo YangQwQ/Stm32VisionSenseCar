@@ -74,7 +74,7 @@ bool ground::init(void) {
   }
 
   if (!qr_fit(A, b, H)) {
-    blog::logf(blog::CAM, "单应QR求解失败，像素观测禁用（px/py 观测将回退 rel_deg）");
+    blog::logf(blog::CAM, "单应QR求解失败，像素观测禁用（observe 的 px/py 一律记不成）");
     s_ready = false;
     return false;
   }
@@ -88,8 +88,8 @@ bool ground::init(void) {
                     (ey - (float)kGroundCal[i][3]) * (ey - (float)kGroundCal[i][3]));
     if (e > maxerr) maxerr = e;
   }
-  // QR 成功即启用像素观测, 回验误差仅作精度日志(个别标定点残差大不影响整体二乘; 禁用会让 AI
-  // 退回只有方位的 rel_deg)。screen_to_world 自带护栏防外推, 误差大只致偏差不崩溃。
+  // QR 成功即启用像素观测, 回验误差仅作精度日志(个别标定点残差大不影响整体二乘)。
+  // screen_to_world 自带护栏防外推, 误差大只致偏差不崩溃。
   if (maxerr <= 5.f) { blog::logf(blog::CAM, "单应QR求解成功 回验最大误差=%.1fcm", maxerr); return true; }
   blog::logf(blog::CAM, "单应QR回验超差(%.1fcm)，仍启用像素观测（坐标偏差上限≈该值）", maxerr);
   return true;

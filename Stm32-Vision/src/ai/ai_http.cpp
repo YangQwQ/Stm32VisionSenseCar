@@ -74,6 +74,9 @@ static void on_wifi_event(WiFiEvent_t ev, WiFiEventInfo_t info) {
 
 // 最近一次响应的 HTTP 状态码(HTTPClient 写入, 供上层 4xx 快速失败判定; 0=未知)。
 static int g_last_status = 0;
+// 最近一次非 200 响应的错误体(前若干字节)。留档是为了让上层的 4xx 快速失败能报出**云端给的具体原因**
+// (如 "Failed to parse the request body as JSON: trailing characters at ..."), 而不是笼统的"疑似参数或限流"。
+static char s_last_err[160];
 // http_stop() 置位: 本轮被主动中止, 不该再走 pass1 重发(否则白传一遍整包)。
 static volatile bool s_abort = false;
 
@@ -282,6 +285,7 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
   if (!s_tls_mtx) s_tls_mtx = xSemaphoreCreateMutex();   // 只有 worker 调用本函数 ⇒ 无建锁竞态
   ScopedLock tls_lk(s_tls_mtx);
   g_last_status = 0;  // 入口重置, 避免沿用上一轮 4xx/429 误判
+  s_last_err[0] = 0;  // 同上: 错误体也要清, 免得本轮网络失败时报出上一轮的错误原因
   s_abort = false;    // 本轮开始: 清掉上一次打断的标记(跨轮的取消由 worker 自己判 gen)
   const size_t body_len = strlen(body);
   static bool s_tls_cfg = false;
@@ -332,6 +336,7 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
     if (code != 200) {
       String eb = s_http->getString();
       if (eb.length() > 128) eb = eb.substring(0, 128);
+      snprintf(s_last_err, sizeof(s_last_err), "%s", eb.c_str());   // 留档供上层带出去
       ai::logf("[ai] HTTP 非200 %d 响应体:%.100s", code, eb.c_str());
       // 错误体是否读尽无保证, 且 4xx/429 后多半要换 key: 一律断开, 别把可能错位的流留给下轮复用。
       g_client.stop();
@@ -367,6 +372,9 @@ bool http_post(const char* url, const char* key, const char* body, String& resp,
 
 int http_last_status() { return g_last_status; }
 
+// 最近一次非 200 响应的错误体(空串=该次没读到)。仅 http_post() 返回 false 后立即读取才有意义。
+const char* http_last_error() { return s_last_err; }
+
 void http_stop() {
   // 只置标志, 不在这里无条件 stop() —— 它可能正被 worker 用在 mbedtls 里, 那样等于从脚下抽上下文。
   // s_abort 由 rx_read 每轮检查, 中止延迟毫秒级; POST 内部握手/发送那段不可中断, 只能等它返回。
@@ -377,9 +385,10 @@ void http_stop() {
   if (lk.held()) g_client.stop();
 }
 
-// 从响应提取 choices[0].message.content; 同时打印 reasoning_content(思考过程, 截断防刷屏)。
-// broken: 解析失败时置 true(多半是传输层截断/复用残留, 调用方应弃用复用连接)
-bool extract_content(const String& resp, String& content, bool* broken) {
+// ---------------- 响应解析(content / tool_calls 两入口共用) ----------------
+// 响应体 → JSON 文档: 先处理 SSE(data: 拼接)与 chunked 泄漏前缀, 再反序列化。
+// 返回 false = 反序列化失败(置 broken; 多半是传输层截断/复用残留 ⇒ 调用方应弃用复用连接)。
+static bool parse_resp(const String& resp, JsonDocument& doc, bool* broken) {
   // 若响应是 SSE 文本(chunked-SSE 解码产物): 按行取 data: 负载拼成最终 JSON
   String payload = resp;
   if (resp.startsWith("data:") || resp.indexOf("\ndata:") >= 0) {
@@ -413,7 +422,6 @@ bool extract_content(const String& resp, String& content, bool* broken) {
       payload = payload.substring(j);          // 剥掉这段 size 行
     }
   }
-  JsonDocument doc(&g_js_alloc);
   if (deserializeJson(doc, payload)) {
     if (broken) *broken = true;  // 解析失败即视为连接可疑: 截断/残留污染, 调用方弃用复用连接
     // 解析失败诊断: 打印完整 payload + 结构判据(判断是状体被拼断/chunked 泄漏/SSE 多段拼接)。
@@ -435,29 +443,51 @@ bool extract_content(const String& resp, String& content, bool* broken) {
              full.c_str());
     return false;
   }
+  return true;
+}
+
+// 思考内容: 完整打串口, /log ai on 时也转发手机(仅 WS)。此处不落库; 回投模型由调用方负责
+// (extract_tool_calls 把它拷进 out["reasoning"], 随回合存历史, 组包时原样回传)。
+static void log_reasoning(const JsonDocument& doc) {
   const char* rc = doc["choices"][0]["message"]["reasoning_content"] | "";
-  if (rc[0]) {
-    // 完整思考已打串口; /log ai on 时也转发手机(仅 WS); 不回投模型。
-    Serial.print("[ai] 思考: "); Serial.println(rc);
-    blog::forward_text(blog::AI, rc);
+  if (!rc[0]) return;
+  Serial.print("[ai] 思考: "); Serial.println(rc);
+  blog::forward_text(blog::AI, rc);
+}
+
+// 从响应提取工具调用, 规范化进 out["calls"]: [{"id","name","args"}(args 为模型给的参数 JSON 原文)...]。
+// 返回调用数(0 = 没调工具)。⚠️ 返回的字符串是 out 这份 PSRAM 池文档里的视图, 调用方用完即弃, 别留指针。
+// 同时打印 reasoning_content; 无调用时打诊断(区分 finish=length 预算被思考吃光 / 模型只回了文本)。
+int extract_tool_calls(const String& resp, JsonDocument& out, bool* broken) {
+  JsonDocument doc(&g_js_alloc);
+  if (!parse_resp(resp, doc, broken)) return 0;
+  log_reasoning(doc);
+  // 思考原文交给调用方(随回合存进历史): 带 tools 的请求必须原样回传, 否则模型每轮都得从头重推。
+  // ⚠️ 用 String 赋值才会拷进 out 这份池; 直接塞 const char* 只存指针, doc 一析构就悬空。
+  const char* rcx = doc["choices"][0]["message"]["reasoning_content"] | "";
+  if (rcx[0]) out["reasoning"] = String(rcx);
+  JsonArrayConst tcs = doc["choices"][0]["message"]["tool_calls"].as<JsonArrayConst>();
+  int cnt = 0;
+  JsonArray dst = out["calls"].to<JsonArray>();
+  for (JsonObjectConst tc : tcs) {
+    const char* nm = tc["function"]["name"] | "";
+    if (!nm[0]) continue;
+    JsonObject d = dst.add<JsonObject>();
+    d["id"] = tc["id"] | "";
+    d["name"] = nm;
+    d["args"] = tc["function"]["arguments"] | "";
+    cnt++;
   }
-  const char* c = doc["choices"][0]["message"]["content"] | "";
-  // 注意: content 为空但 reasoning 有值 = 模型只给了思考没给正式回答(安全终止/条件触达)
-  if (!c[0]) {
-    // 空 content 诊断: 打出 finish_reason/用量/content 类型 —— 区分预算全花在思考(finish=length)
-    // 与端点返回空/被过滤的 choices。它们都在响应尾部, 只打头部够不着。
-    JsonVariant cv = doc["choices"][0]["message"]["content"];
-    const char* ct = cv.isNull() ? "null" : cv.is<const char*>() ? "str" : cv.is<JsonArray>() ? "arr" : "其它";
+  if (cnt == 0) {
+    const char* c = doc["choices"][0]["message"]["content"] | "";
+    const char* rc = doc["choices"][0]["message"]["reasoning_content"] | "";
     const char* em = doc["error"]["message"] | "";
-    ai::logf("[ai] 空content: choices=%d finish=%s content=%s(%uB) reasoning=%uB 补全/总=%u/%u%s%s",
-             (int)doc["choices"].size(), doc["choices"][0]["finish_reason"] | "(无)",
-             ct, (unsigned)strlen(c), (unsigned)strlen(rc),
+    ai::logf("[ai] 无工具调用: finish=%s content=%uB reasoning=%uB 补全/总=%u/%u%s%s",
+             doc["choices"][0]["finish_reason"] | "(无)", (unsigned)strlen(c), (unsigned)strlen(rc),
              (unsigned)(doc["usage"]["completion_tokens"] | 0), (unsigned)(doc["usage"]["total_tokens"] | 0),
              em[0] ? " err=" : "", em);
-    if (rc[0]) { Serial.print("[ai] 思考: "); Serial.println(rc); }   // 完整思考只打串口, 不转发手机
   }
-  content = c;
-  return content.length() > 0;
+  return cnt;
 }
 
 }  // namespace ai

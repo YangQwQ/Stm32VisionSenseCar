@@ -3,21 +3,21 @@
 
 #include <string.h>
 
-// 工具表(**顺序 = 执行顺序**, 理由见 tool.h 头注)。改这张表之前先读 tool.h 的头注, 以及
-// `ai_round.cpp` 里三处带时序契约的注释: `land_carry_image` / approach 块 / 夹取前特写那次取帧。
+// 工具表(顺序只决定**校验顺序**, 理由见 tool.h 头注)。落地顺序在 `ai_round.cpp`:
+// car 内部各通道由 `land_car` 排序, 工具之间由 `dispatch_calls` 排序(mem → car → look → finish)。
 //
-// 排列依据(照 `round_land` 的**实际次序**抄, 不照提示词次序):
+// 排列依据(照 `land_car` 的**实际次序**抄, 不照提示词次序):
 //   observe        写记忆, 不碰硬件
 //   delete         删记忆, 不碰硬件(与 observe 同处"动作前", 紧挨其后)
-//   carry_image    取帧, ⚠️ 必须在**所有**动作之前(否则 AI 收到车还在动的画面, 白等一轮)
+//   carry_image    旧键(已并入 look), 保留兜底
 //   move           approach 自己会挪车, 故排在其它动作之前
-//   zoom           读的是"本轮动作之前"的画面
+//   zoom           旧键(已并入 look), 保留兜底
 //   任务记账四键    纯元数据
-//   arm            含"夹取前特写"那次取帧(故排在 move 之后, 与 move 同轮时先等车停稳)
+//   arm            机械臂动作
 //   light          灯
-//   尾部三个元数据  reason/done/goal, 无硬件动作; 排尾部是为尽量贴近旧校验次序
+//   尾部两个元数据  done/goal(旧终态键, 保留兜底; 现行收尾走 finish 工具)
 //
-// 阶段 1 的校验批次只填 `parse`; `run`/`feedback`/`logfmt` 留 nullptr, 由后续批次补上。
+// 阶段 1 的校验批次只填 `parse`; `run`/`feedback`/`logfmt` 留 nullptr。
 // `doc`(模型读到的文案)阶段 3 才逐条搬 —— 现在全为 nullptr 是**有意的**, 见 tool.h。
 namespace {
 const ai::ToolSpec kTools[] = {
@@ -33,7 +33,6 @@ const ai::ToolSpec kTools[] = {
   { "task_goal",   nullptr,   0,  ai::parse_task_goal,     nullptr, nullptr, nullptr },
   { "arm",         nullptr,   0,  ai::parse_arm,           nullptr, nullptr, nullptr },
   { "light",       nullptr,   0,  ai::parse_light,         nullptr, nullptr, nullptr },
-  { "reason",      nullptr,   0,  ai::parse_reason,        nullptr, nullptr, nullptr },
   { "done",        nullptr,   0,  ai::parse_done,          nullptr, nullptr, nullptr },
   { "goal",        nullptr,   0,  ai::parse_goal,          nullptr, nullptr, nullptr },
 };

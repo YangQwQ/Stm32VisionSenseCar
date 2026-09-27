@@ -4,7 +4,7 @@
 // (写入 `RoundCtx` 的步骤表 `tasks[]`, 每轮再渲染回喂模型)。故这里只做形状检查、不做取值校验。
 // ⚠️ 阶段 5 的任务状态镜像(`ai_task`)会从这里取发布点。
 
-// task_goal: 把插话/新意图提升为当前任务目标(AI 显式标记)。
+// task_goal: 把用户的新意图提升为当前任务目标(AI 显式标记)。
 const char* ai::parse_task_goal(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
   (void)err; (void)cap;
   const char* tg = root["task_goal"] | "";

@@ -16,7 +16,7 @@ namespace ai {
 // 向 char 缓冲安全追加一段(空串跳过; 首个不清分隔、后续加 "; ")。返回 false 表示缓冲已满。
 bool safe_append(char* buf, size_t cap, bool* first, const char* part);
 
-// 校验并规范化 AI 输出到 out{type,params,reason}。返回 nullptr 通过; 否则返回错误字符串。
+// 校验并规范化 AI 输出到 out{type,params}(外加旧终态键 done/goal)。返回 nullptr 通过; 否则返回错误字符串。
 const char* validate_cmd(const char* content, JsonDocument& out, char* err_buf, size_t err_cap);
 
 }  // namespace ai

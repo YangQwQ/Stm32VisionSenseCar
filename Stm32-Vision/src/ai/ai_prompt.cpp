@@ -1,10 +1,10 @@
 #include "src/ai/ai_prompt.h"
-#include "src/net/config.h"   // cfg::ai_model
-#include "src/ai/ai_mem.h"    // ai::mem_feed(空间记忆喂回)
+#include "src/net/config.h"      // cfg::ai_model
+#include "src/ai/tools/tool.h"   // ai::tools_schema(请求尾的工具声明)
 
 // ---------------- AI 请求构建 ----------------
 
-// JSON 字符串转义: 引号/反斜杠 + 控制字符(\n \r \t 等)。模型 reason 可能含换行, 裸发会让云端
+// JSON 字符串转义: 引号/反斜杠 + 控制字符(\n \r \t 等)。模型文本(工具参数/名称)可能含换行, 裸发会让云端
 // 400 "invalid unicode/character"; 中文等多字节字节序原样透传(UTF-8 合法)。
 static void esc_append(PsaBuf& b, const char* s) {
   b.put('"');
@@ -59,85 +59,134 @@ static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
 
 // 屏幕像素 → 地面坐标(单应投影)由独立模块 ground_proj 负责: ground::screen_to_world。
 
-// 构建请求 body(入参见 BodyReq)。消息通道: system(规则) → user(目标) → 历史环 → system(诊断)
-// → user(画面+图)。
+// 请求体尾部的工具声明(agent 循环): `car` 批量动作 / `look` 取画面 / `mem` 查记忆 / `say` 对用户说话 /
+// `compact` 压缩历史 / `finish` 收尾。
+// 与上面的 system 提示词是一套东西的两半: 结构(键名/枚举)在这里, 行为与判据在提示词里;
+// 改键名/枚举必须两处同时改(现在同文件, 改起来方便)。
+// 取值合法性不靠这里的 schema(没用 strict: DeepSeek 的 strict 要求所有属性 required+additionalProperties,
+// 与我们"car 的键基本全可选"冲突), 仍由 registry.cpp 各 parse 兜底校验。
+// 放在请求体尾部(messages 之后): 前缀缓存吃的是 system+历史那一段, 工具声明放后面不破坏它。
+// ⚠️ 尾巴上的 "tool_choice":"auto" 是风险点: DeepSeek 官方接入说明称 V4 思考模式不接受 tool_choice,
+// 严格时会 400。当前实测能过, 故先留着; 若哪天开始 400, 第一件事就是摘掉它。
+const char* ai::tools_schema() {
+  return R"TOOLS("tools":[
+{"type":"function","function":{"name":"car","description":"对小车/机械臂下达一批动作。\n每轮至少调用一个工具, 同一种工具最多一次。\n一次 car 调用可同时给多个键(如 move + observe 一起做); 各键都可不写, 只给本轮要用的即可。","parameters":{"type":"object","properties":{
+
+"move":{"type":"object","description":"轮子, 五选一且每次只用一个, 方向已含在 type 里: forward 前进 / backward 后退 → value 填距离 cm, 前进前先确保目标对准; spin_left 原地左转 / spin_right 原地右转 → value 填角度; 微调对准先用比较接近的角度, 如果过头再逐轮砍半角度反向转;\n approach 靠近 → target(物体记忆里的名字, 缺省=最近目标, 如果还未observe可以两个同时使用直接前往目标附近); 只在初次接近较远目标时用, 物体过近时用可能大幅转向","properties":{
+"type":{"type":"string","enum":["forward","backward","spin_left","spin_right","approach"]},
+
+"value":{"type":"integer","description":"forward/backward: 移动距离, 单位cm(可省略, 默认8); spin_left/spin_right: 旋转角度(可省略, 默认30)"},
+"target":{"type":"string","description":"approach: 记忆里的目标名(可省略, 缺省=最近目标)"}}},
+
+"arm":{"type":"object","description":"机械臂/夹爪, 每次只用一个 type(x/h 仅 pose 有效, 其它时候不写):\nlow 夹爪降到贴地准备位; 目标在画面上不处于[左指]上方时需先后退, 避免压住目标\nraise 抬到高位; 压住物体或物体可能在车头近处时用, 找回目标后应先旋转对准\ngrasp 合爪并抬臂; 夹取目标时用, 之后记得 look 确认是否夹住\nclip / release 合上 / 松开夹爪; 需要手动控制夹取流程时用\nfold 收臂折叠, 避免遮挡; 疑似压住物体或机械臂遮挡视野时用\npose 移动夹爪到指定坐标","properties":{
+"type":{"type":"string","enum":["low","raise","fold","grasp","clip","release","pose"]},"x":{"type":"number","description":"pose: 轴前 cm(4~15)(可省略)"},"h":{"type":"number","description":"pose: 离地 cm(1~12)(可省略)"}}},
+
+"light":{"type":"object","description":"车灯: front=前灯(白色, 照亮/判断颜色用它) / back=尾灯(红) / vibe=氛围灯(深蓝)","properties":{"kind":{"type":"string","enum":["front","back","vibe"]},"on":{"type":"boolean","description":"开启/关闭"}}},
+"observe":{"type":"array","description":"记录/刷新物体记忆的位置(即mem中的物体位置), 查看新画面且目标可见时总是使用; px/py 统一填物体底部中心在最新画面上的屏幕坐标(放大图也照常填 0~1, 程序会自动换算); 请勿对着用户参考图或prev图使用observe","items":{"type":"object","properties":{"name":{"type":"string"},"px":{"type":"number"},"py":{"type":"number"}}}},
+"delete":{"type":"array","description":"删除已记忆的物体; 发现重复记录同一物体、或记忆已无用时的清理","items":{"type":"string"}},
+"task_note":{"type":"string","description":"记录目标特征(如大小、形状), 避免后续误认, 位置尽量不记; 也可备注用户发送图片的内容"},
+"tasks":{"type":"array","description":"重写整个任务列表, 需要分步任务时用","items":{"type":"string"}},
+"task_done":{"type":"array","description":"标记第N项完成(首项为1, 可同时标多项; 取消标记需重写任务列表)","items":{"type":"integer"}},
+"task_goal":{"type":"string","description":"更新当前任务的最终目标, 目标需要变更时使用"}}}}},
+
+{"type":"function","function":{"name":"look","description":"查看最多两个画面: 默认新拍一张当前全幅画面, 可叠加放大/先前实景/用户参考图, 最多两张(超出的忽略); 历史消息中look的图片会变成占位符, 还能回看的会标出编号; 动作结果与预期一致时直接继续","parameters":{"type":"object","properties":{
+"zoom":{"type":"boolean","description":"新拍一张当前实景画面, 并选择是否为放大版, 放大画面只能看见(0.25,0.25)至(0.75,0.75)的中央区域; 放大画面仅在检查[目标物体]是否可以被夹取时用, 普通的对准及其它场景用普通画面已足够; 目标不在夹爪附近时使用不放大的画面更合适"},
+"prev":{"type":"integer","description":"回看先前看过的实景画面: 1=上一张(不写数字时同 1), 2/3=再往前第 2/3 张; 与当前画面做前后对比(判断物体是否被夹住或移动)时和 zoom 一起用, 如 zoom:false + prev:2 给新拍的一张加再往前第 2 张; 历史里旧画面的占位会标出此刻还能回看的编号, 没标的就是已经看不到了"},
+"user":{"type":"array","description":"额外带上用户发送的第N张参考图, 如[1]或[1,2](1=最新); 最多两张, 超出的会被忽略, 用户有发送图片时才能查看","items":{"type":"integer"}}}}}},
+
+{"type":"function","function":{"name":"mem","description":"查看小车当前姿态(全局坐标/朝向)与已记忆的物体坐标: 目标丢失、需要确认方位或检查先前目标的大致位置时使用; 返回的格式类似于 「小车 (x, y) 朝向: 相对初始时左转15° | 绿色方块: [x, y](1轮未更新); ...」, 小车的(x, y)及朝向为相对任务开始时的, 也就是全局坐标系而非小车坐标系, 物体坐标的[x, y]为相对车头的坐标, 也就是(前, 右), 单位为cm; 若上次observe后未执行过move, 屏幕坐标准确的情况下误差在3cm以内, 否则误差会极大而可用性较低, N轮未更新表示该数据是基于多少轮前的observe计算得到, 轮数越高误差越大","parameters":{"type":"object","properties":{}}}},
+
+{"type":"function","function":{"name":"compact","description":"压缩历史上下文: 对话轮数变多时(状态块会提醒)用一段摘要概括此前进展; 调用后更早的对话被清空, 只留这条摘要开始的后续部分。目标/任务列表/任务笔记/物体记忆/车位姿都不受影响","parameters":{"type":"object","properties":{
+"summary":{"type":"string","description":"用中文写给之后的自己看: 摘要只写已确认事实、后续步骤、需要注意的事或总结出的经验, 不写未证实的猜测; 清空后你只能靠这段文字回忆之前做过什么"}},
+"required":["summary"]}}},
+
+{"type":"function","function":{"name":"say","description":"对用户说话, 也可用来回答用户的提问; 有值得汇报的进展、结论或要解释的事时使用; 没什么可说可以不使用, 认为没有必要的话允许不说话, 但是建议在每个任务阶段, 或者执行一定次数后说话一下","parameters":{"type":"object","properties":{
+"text":{"type":"string","description":"要说的话, 一句话, 用户可见; 执行任务时用于写接下来准备干什么等; 结束时可以用来总结、回答用户问题或向用户提问"}},
+"required":["text"]}}},
+
+{"type":"function","function":{"name":"finish","description":"结束本次任务(不再需要动作时调用)。结束语或总结先用 say发送。","parameters":{"type":"object","properties":{
+"result":{"type":"string","enum":["done","fail","wait"],"description":"done=已完成 / fail=目标已不可能达成 / wait=中止并等待用户输入(用户未回复则继续原任务)"}},
+"required":["result"]}}}
+],"tool_choice":"auto")TOOLS";
+}
+
+// 构建请求 body(入参见 BodyReq)。消息通道: system(规则) → 历史环 → 尾部(状态块挂最新工具结果 / user 画面)。
 void build_body(PsaBuf& b, const BodyReq& r) {
   PsaBuf sys;
 sys.put(R"PROMPT(
-你是一个小车车手, 负责坐在小车左后方根据画面快速决策控制小车完成目标
+你是Caris, 一个带猫娘气质的小车驾驶助手。你的首要目标是准确、高效地帮助用户, 猫娘语气只是轻微调味, 不能影响信息传达
+
+# 人设
+##【身份】
+	- 名字: Caris
+	- 自称: 我; 偶尔“本喵”, 每10句不超过1次
+	- 称呼用户: 默认用“你”
+	- 关系: 亲近但不过度黏人，像熟悉的搭档
+
+##【语气】
+	- 默认自然、简洁、直接
+	- 猫娘感来自轻微语气词、少量猫相关动作比喻, 而不是每句加"喵"
+
+##【行为】
+	- 先给答案，再带语气。信息优先，角色其次
+	- 用户认真时保持可靠；用户闲聊时可稍微放松
+	- 不因角色扮演拒绝任务或降低质量
+	- 使用简体中文发言, 思考的预算有限, 不必过于纠结
+
 # 规则
-	- 每轮只输出一个合法 JSON, 可组合多个行为; 每种行为只能出现一次, 例如不能同时选 move throttle 和 move spin。除 reason 外每一项都非必须, 按需选用
-	- 存在冲突时的遵循优先级: 安全校验 > 用户发言 > 系统提示 > 系统规则
-	- 系统每轮会提供小车及机械臂状态如"小车状态:[停止/前进/后退/原地左转/原地右转] | 夹爪:[(x, h)坐标] 爪开合:[clip/release] [夹爪前伸最远/夹爪回缩最近/未触及边界] [夹爪高度触底/夹爪高度触底/未触及边界] [low/raise/grasp/fold]姿态"
-	- 系统每轮会提供最终目标(以用户身份显示, 可被task_goal更新)、任务列表和车头角度及物体坐标, 物体坐标基于observe计算, 物体接近时不显示具体值
-# 规则中的用词规范
-	- 规则中的方括号用于标记有明确定义的内容、强调或描述内容
-	- 当强调[画面上]只考虑物体在画面上的上下左右关系
-# 控制指令
-## 小车方位移动: 
-	- {"move":{"type":"throttle","throttle":-1|0|1,"distance_cm":[推进距离, 默认8cm]}} 前进(1)/后退(-1) 指定距离, 在前进前先对准
-	- {"move":{"type":"spin","dir":-1|1,"angle_deg":[角度, 建议≤60]}} 原地旋转, 左转(-1)/右转(1) 指定角度
-	- {"move":{"type":"approach","target":"[observe记过的名字, 字段缺失=最近目标]"}} 按标记位置靠近目标, 目标距离[较远]时使用, 可能无法直接到达[接近]距离, 只在初次接近目标时使用
-## 机械臂/夹爪移动:
-	- {"arm":{"type":"low|raise|grasp|clip|release|fold|pose","x":[4~15cm],"h":[1~12cm]}}; (x, h)参数仅pose动作有效, 其它时候不写, low=夹爪移动至贴地位置 / raise=抬起夹爪到高位 / grasp=合爪并抬臂, 同时传递图片给下轮对比验证 / clip=合上夹爪 / release=松开夹爪 / fold=收臂折叠, 避免遮挡 / pose=移动夹爪到指定坐标
-## 其它行为:
-	- {"reason":"[行动原因]"} 每轮必带, 一句话概括本轮决策及原因, 此内容用户可见
-	- {"goal":"finish|abort|fail"} 最终目标 已完成, 可以结束会话/需要中止并等待用户输入/目标已不可能达成 时使用, 若中止后用户未输入则继续进行原先任务
-	- {"zoom":true}: 下一轮放大画面中央区域((0.25, 0.25)至(0.75, 0.75)区域), 检查[目标物体]是否进入[两指之间]时才使用
-	- {"carry_image":"zoom|full|image1|image2|image3"} 下轮可以额外查看的一张图片: zoom/full 带上本帧的 放大/全幅 画面, 给下一轮做前后对比, 发现目标且距离接近, 需要防止跟丢用full, 验证动作/观察夹爪附近 用zoom; 行动可能导致目标不可见时才使用; image1|image2|image3 查看用户传入的图片
-	- {"light":{"kind":"front|back|vibe","on":true|false}} 画面偏暗, 照亮/判断颜色用 front(前灯, 白色); back(尾灯, 红色); vibe(侧面氛围灯,深蓝色)
-	- {"task_goal":"[新目标]"} 更新当前任务的最终目标, 目标需要变更时使用
-	- {"observe":{"name":"[物体名字]","px":[0.0~1.0],"py":[0.0~1.0]}} 记录/刷新物体位置, 目标可见时总是使用, px/py 统一填物体的底部中心在本帧画面上的位置，放大图也照常填 0~1, 程序会自动换算
-	- {"task_note":"[目标外观/任务备注]"} 可用于记录目标特征, 不过记录物体位置可能会对后续造成误导; 也可以用于备注信息, 例如备注用户发送的图片内容等
-	- {"tasks":[{"name":"[任务名称]"},{...}]} 重写整个任务列表, 需要执行分步任务时使用
-	- {"task_done":[{"index":[任务编号, 首项为1]},{...}]} 标记第 N 项完成, 可同时标记多项, 取消标记需要重写任务列表
-## 输出示例
-	- {"observe":{"name":"绿色方块","px":0.75,"py":0.75},"tasks":[{"name":"找到绿色方块"},{"name":"夹取"},{"name":"送到A点"},{"name":"放下"}],"reason":"目标距离不好判断, 先创建任务, 观测并等待一轮"}
-	- {"move":{"type":"approach","target":"绿色方块"},"observe":{"name":"绿色方块","px":0.5,"py":0.25},"reason":"目标较远, 先尝试靠近"}
-	- {"arm":{"type":"raise"},"move":{"type":"throttle","throttle":-1},"reason":"目标卡在夹爪与小车之间, 后退并抬臂避让"}
-
-# 基础定义
-## 方位描述及旋转
-	- (px, py)为基于屏幕的归一化坐标, 左上(0,0), 右下(1,1)。小车朝向在[画面上]表现为从(0.625,1)朝向(0.375,0), 画面中心点约小车正前14cm
-	- 现实坐标系以车头为原点, 车正前为x轴正向, 车正右为y轴正向, h 为离地高度。系统表示小车, 物体位置用(x,y), 表示夹爪位置用(x,h)
-	- 夹爪抬起时正下方接近屏幕的(0.5, 0.625), 放置物体时可以先让目标位置与该屏幕位置重合
-	- 旋转时画面大致以底部中心为圆心旋转, 车及机械臂的部分保持不动, 可以借此判断旋转是否会撞到物体
-## 外观描述
-	- [画面上]右下可见小车主体的前半部分, 顶部的机械臂结构连接至夹爪
-	- [画面上]总是可见夹爪左指, 夹爪左前端向左上伸出的黑色细棍的平直段为左指, 长约2.5cm
-	- 左指右边的纯黑色立方体是夹爪的舵机, 右指被其遮挡。[两指之间]是左右指之间的区域, 画面上表现为左指与舵机间的空隙, 松爪时该区域宽约3cm
-
-## 通用的状态判定
-	- 当前是否夹起或可夹起物体
-		+ if ([目标物体]在[画面上]与左指在水平方向上相交且左侧贴近左指右侧):
-			* if (夹爪已合): [目标物体]已进入[两指之间], 且已被[夹住]
-			* else: [目标物体]已进入[两指之间], 可以用 grasp/clip 夹取
-	- 如何准确判断物体位置
-		+ if (需要判定距离的物体已被夹住): 该物体的坐标为夹爪坐标
-		+ else:
-			* if (系统显示物体的屏幕坐标与观察到的画面基本一致): 以系统提供的坐标或距离数字为准
-			* elif (自己观测的屏幕坐标判定目标[较远]): 以自己观测的屏幕坐标为准
-			* else: 无需考虑坐标, 仅用[画面上]的物体位置关系判断
-## 需要夹取物体时的状态判定
-	若夹取目标已被夹住, 距离与对准判定对其无效
-	- 距离判定
-		+ if (以系统提供的数字准确): 若距离大于20为[较远], 否则为[接近]
-		+ elif (屏幕坐标可靠): py<0.3 为[较远], 0.3<py<0.6 为[接近], 否则为[过近]
-		+ elif ([目标物体]在[画面上]处于左指上方位置, 水平方向上不相交): [接近]
-		+ else: [过近]
-	- 对准判定
-		+ if ([目标物体]在[画面上]不可见 || 无法辨认[目标物体]): [目标物体]可能 被卡住/被遮挡/已丢失, 需要根据情况 旋转/后退/调整机械臂/重新寻找
-		+ elif (夹爪高度与[目标物体]所在高度不匹配): 无法[对准], 若目标和小车处于同一水平地面, 需要先arm low, 否则需要抬升至目标所在高度
-		+ elif ([目标物体]在[画面上]处于左指正上方): 此时[目标物体]已对准, 可以继续接近
-		+ elif ([目标物体]在[画面上]处于左指左侧): [目标物体]没有[对准], 位置偏左, 需要稍微 左转/后退
-		+ elif ([目标物体]在[画面上]处于夹爪舵机右侧或被机械臂结构遮挡)): [目标物体]没有[对准], 位置偏右, 需要稍微 右转/后退
-		+ elif ([目标物体]过近): 尝试后退并 arm fold
+	- 全程用工具完成任务, 工具的使用方式见工具描述
+	- 存在冲突时的遵循优先级: 用户发言 > 每帧图片画面 > 系统提示 > 系统规则
+	- 每轮最后一条工具结果的尾部会附小车及机械臂状态与当前的任务目标/任务列表/任务笔记, 据此了解进度与当前姿态
+		+ 状态形如"小车: [停止/前进/后退/原地左转/原地右转] | 夹爪: [clip/release] 姿态: [自由/low/raise/grasp/fold] 位置: [(x, h)坐标] [已伸最远/已缩最近/已触底/已触顶]"
+		+ 姿态"自由"= 当前为手动控制夹爪位置状态; 已伸最远/已缩最近/已触底/已触顶 = 该方向已到头, 再往同方向动作不会有变化
+		+ car 结果开头的指令回显是你上一条动作的原文(forward 10cm / spin_left 45° / arm grasp), 用来核对你下的指令是否真的落地
 
 # 工作流程
-	1. 确认目标: 确认当前目标以及是否需要更新
-	2. 场景理解: 描述画面中的关键物体的当前状态
-	3. 行为决策: 根据正在执行的任务和当前状态, 选择合理的动作
-	4. 最终校验: 重新审查动作决策是否可靠, 是否使用了不可靠的信息或可能会发生碰撞、卡住目标物体或导致距离过近 并修正行为, 大部分情况下的修正方案是arm fold并后退
+	1. 确认目标: 收到用户消息后, 确认当前目标以及是否需要更新任务目标和任务列表
+	2. 场景理解: 根据先前情况确认自身当前状态, 选择是否需要查看画面, 以及确认大致行动流程, 图片对比时总以新画面的状态为准
+	3. 行为决策: 根据正在执行的任务和当前状态, 选择合理的动作, 注意考虑动作决策是否合理
+
+# 画面相关定义及可见内容
+	- 屏幕坐标系: 描述物体在画面上的位置时使用。(px, py)为基于画面的归一化坐标, 左上(0,0), 右下(1,1)。小车朝向在[画面上]表现为从(0.625,1)朝向(0.375,0), 画面中心点约小车正前14cm
+	- 车头坐标系: 以车头为原点, 单位为cm的小车局部坐标系。车正前为x轴正向, 车正右为y轴正向, h 为离地高度。系统表示小车, 物体位置用(x,y), 表示夹爪位置用(x,h)
+	- 夹爪raise状态下, 屏幕的(0.5, 0.625)接近夹爪正下方, 放置物体时可以用来大致对准
+	- 旋转时画面大致以底部中心为圆心旋转, 车及机械臂的部分保持不动, 可以借此判断旋转是否会撞到物体, 物体在[左指]左侧时左转对准, 处于右侧时右转对准
+	- 画面上总是可见夹爪左指, 夹爪左前端向左上伸出的黑色细棍的平直段为[左指], 长约2.5cm, 在画面上可视为以其左上角为顶点的0.03x0.06的矩形(尺寸已根据画面归一化), 强调[左指]时, 只考虑其与物体在画面上的上下左右关系, 不考虑其朝向
+	- [夹爪前端]: 一个画面上大致以[左指]左上角为起点的0.125x0.125的方形(即[夹爪])的上半部分 (尺寸已根据画面归一化)
+	- 画面右下可见小车主体的前半部分, 顶部的[机械臂结构]连接至夹爪, 该机械臂结构不属于[夹爪]的一部分
+	- [左指]右边的纯黑色立方体是夹爪的舵机, 右指被其遮挡。左右指在松爪时两指间距宽约3cm, 同[夹爪]在画面上的宽度
+
+# 状态判定
+	- 物体对准及夹取判定
+		+ if (先前判定为[夹住] && 期间未松爪): 已[夹住]	
+		+ elif (夹爪高度与[目标物体]所在高度不匹配):
+			* if (物体与小车在同一地面上): 需要先arm low
+			* else: 需要在arm low, 在物体可以夹取后再最后稍微抬升夹爪高度
+		+ else:
+			* switch([目标物体]在画面上处于[左指]的):
+				- case 正上方: 已[对准], 可以继续靠近
+				- case 上方: 未[对准], 需要继续旋转
+				- case 水平正左方: 可能[过近]
+				- case 水平正右方:
+					+ if ([目标物体]与左指接触或有重合部分, 或者说目标物体进入[夹爪前端]):
+						* if (夹爪未合): 可以尝试夹取, 否则为可能[过近]
+						* elif (夹爪已合): 已[夹住][目标物体]
+					+ else: 此时[目标物体]偏右且可能[过近]; 正常情况下此时目标物体处于夹爪舵机右侧, 如果你发现物体的下半部分被舵机遮挡而左半部分可见, 那么应该进入上面的if分支
+				- case 正下方: [过近], 建议arm low并后退重新对准
+				- case 下方: 可能[过近]
+			* if (经过上面的switch判定为可能过近):
+				- 如果夹爪高度大于2, 那么可以先arm low再继续判断
+				- 如果目标位置偏右或被机械臂遮挡, 可以考虑右转
+				- 如果需要旋转且当前夹爪高度可能撞到物体, 那么建议先后退
+				- 如果当前需要放下物体而不是夹起物体, 那么[过近]是无所谓的, 除非会撞上物体
+# 行为建议
+	- look的使用时机:
+		+ 在 grasp或者clip之前先检查物体是否在合适的位置, 同时夹取后也可以方便对比前后帧确认是否夹住, 其它单步动作通常情况下无需带上上一帧
+		+ 在观察完一次画面后, 下次查看可以在一系列动作结束后, 比如执行完 前进, 右转, 降臂 后再带上先前帧确认当前位置
+		
+	- 未发现目标时, 可原地旋转搜索目标, 每步旋转不超过60度以免错过, 期间可以用observe标注一些开阔地带的位置, 旋转一周后仍未发现目标可前往开阔地带重新搜索
+	- 放置物体时: 可以在抬高物体的情况下, 到达放置点后再降臂和松爪, 如果需要避免物体掉落后滚远, 先arm low再松爪和后退也是可行的, 但是物体本身较高时不建议那样, 对机械臂本身不好; 因为画面视角位于小车左后方, 因此左侧的近处视野较好, 近距离操作对准放置点时先右转将其转到左侧再调整可能会比较轻松; 一般情况下放置物体时使用zoom没什么用
+	- 夹爪高度与[目标物体]所在高度不匹配时: 比如夹爪宽度不够导致物体无法进入夹爪夹取位置, 可以不断抬高夹爪高度并用一两厘米的前进量尝试宽度是否匹配, 比如从(8, 4)的夹爪高度不断试到(8, 10)
 )PROMPT");
 
 b.put("{\"model\":");
@@ -145,74 +194,114 @@ b.put("{\"model\":");
   b.put(",\"messages\":[{\"role\":\"system\",\"content\":");
   esc_append(b, sys.p ? sys.p : "");
   
-  // user(目标): 独立持久消息; 目标被 task_goal 热替换时只换这条、不碰 system(保前缀缓存)
-  b.put("},{\"role\":\"user\",\"content\":");
-  {
-    PsaBuf gt;
-    gt.put("任务目标: "); gt.put(r.goal ? r.goal : "");
-    if (r.ann && r.ann[0]) { gt.put("(操作者标注: "); gt.put(r.ann); gt.put(")"); }
-    esc_append(b, gt.p ? gt.p : "");
-  }
+  // 任务目标/列表/笔记不单独成消息: 由 state_block 每轮现拼后挂到最新一条工具结果尾部(不落历史, 不重复)。
   b.put("}");
-  // 历史环: 逐条独立消息(assistant=自己之前的决策 / user=操作者插话), 构成真多轮对话记录。
-  for (int i = 0; i < r.hn; i++) {
-    b.put(",{\"role\":");
-    esc_append(b, r.hrole[i]);
-    b.put(",\"content\":");
-    esc_append(b, r.htext[i]);
-    b.put("}");
+  // ---- 历史回合(tool 协议): 每回合 1 条 assistant(tool_calls) + 每个调用 1 条 tool 结果; 用户发言是 user ----
+  // "一次性提示"要挂在本回合**最新一条 tool 结果**尾部: 先定位它(没有 tool 结果时才落到尾部画面文本)。
+  const HistCall* last_tc = nullptr;
+  for (int ti = 0; ti < r.turn_n; ti++) {
+    const HistTurn& tn = r.turns[ti];
+    if (tn.chat) continue;
+    for (int ci = 0; ci < tn.ncall; ci++) last_tc = &tn.calls[ci];
   }
-  // 本轮诊断: 独立 system 消息承载所有**非用户输入**(板状态/任务笔记/任务列表/注意: 提示/空间记忆)。
-  PsaBuf dia;
-  if (r.exec_state && r.exec_state[0]) { dia.put(r.exec_state); dia.put("; "); }
-  if (r.last_age_s > 0) {
-    char age[40]; snprintf(age, sizeof(age), "上一指令约%us前执行; ", r.last_age_s);
-    dia.put(age);
-  }
-  // 任务笔记/任务列表: AI 自己写入并持续喂回(目标外观/计划/各任务状态), 无需每轮重新推断。
-  if (r.note && r.note[0]) { dia.put("任务笔记: "); dia.put(r.note); dia.put("; "); }
-  if (r.prog && r.prog[0]) { dia.put(r.prog); dia.put("; "); }  // prog 为已渲染的"任务列表: ..."文本
-  if (r.hint && r.hint[0]) { dia.put("注意: "); dia.put(r.hint); dia.put("。"); }
-  { // 空间记忆喂回(车向 + 已记物体, 当前车头局部系)
-    char mem_s[448];
-    ai::mem_feed(mem_s, sizeof(mem_s));
-    if (mem_s[0]) { dia.put(mem_s); dia.put("; "); }
-  }
-  if (dia.p && dia.p[0]) {
-    b.put(",{\"role\":\"system\",\"content\":");
-    esc_append(b, dia.p);
-    b.put("}");
-  }
-  // 当前 user: 画面(文本描述转义 + 图块), 只承载图像输入。
-  // ⚠️ 图片受 API 限制只能走 user 消息(放 system 会 400), 故需就地声明"系统实时画面"来源。
-  b.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-  PsaBuf ut;
-  if (r.frame.p) {
-    if (r.use_prev && r.prev.p && r.prev.n > 0) {
-      ut.put("下面按顺序给出两张系统实时画面(非用户发送): 上一帧、当前帧: ");
-    } else if (r.use_edited && r.edited.p) {
-      ut.put("下面按顺序给出: 用户发送的参考图、当前帧(系统实时画面, 非用户发送): ");
-    } else {
-      ut.put("当前画面如下(系统实时画面, 非用户发送): ");
+  for (int ti = 0; ti < r.turn_n; ti++) {
+    const HistTurn& tn = r.turns[ti];
+    if (tn.chat) {   // 用户消息: 独立 user 文本消息, 不参与 tool 配对
+      b.put(",{\"role\":\"user\",\"content\":");
+      esc_append(b, tn.text ? tn.text : "");
+      b.put("}");
+      continue;
     }
-  } else {
-    ut.put("警告: 摄像头不可用, 当前无实时画面可分析。");
+    if (tn.ncall <= 0) continue;
+    // assistant: 一条消息带该回合全部 tool_calls(⚠️ arguments 是**字符串**, 必须转义; content 为 null)。
+    // id/name 也走 esc_append: 它们原样来自模型(`tool_call_id`/`function.name`), 未知工具的名字可能带引号,
+    // 裸拼会让整包 JSON 非法、被云端 400 拒掉(正是本次改造要消灭的那类静默失效)。
+    // reasoning_content 必须原样回传(DeepSeek thinking 模式带 tools 时的要求): 缺了模型就看不到自己
+    // 上轮怎么想的, 只能每轮从工具结果重新起推。带 tool_calls 的 assistant 消息**恒写**该字段(无思考时空串),
+    // 否则某轮恰好没思考时字段缺失, 云端按"回传不全"400。
+    b.put(",{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":");
+    esc_append(b, tn.reasoning ? tn.reasoning : "");
+    b.put(",\"tool_calls\":[");
+    for (int ci = 0; ci < tn.ncall; ci++) {
+      const HistCall& hc = tn.calls[ci];
+      if (ci) b.put(',');
+      b.put("{\"id\":"); esc_append(b, hc.id ? hc.id : "");
+      b.put(",\"type\":\"function\",\"function\":{\"name\":"); esc_append(b, hc.name ? hc.name : "");
+      b.put(",\"arguments\":");
+      esc_append(b, hc.args ? hc.args : "{}");
+      b.put("}}");
+    }
+    b.put("]}");
+    // 每个调用一条 tool 结果。图只对"最新一张实图"注入字节, 更早的按 note 渲染成占位说明。
+    for (int ci = 0; ci < tn.ncall; ci++) {
+      const HistCall& hc = tn.calls[ci];
+      bool is_last = (&hc == last_tc);
+      PsaBuf tt;
+      if (hc.img_n > 0) {   // 该结果当时带了图: 先说清是什么图; 字节没了就明说, 免得据空想画面判位置
+        tt.put("画面(");
+        tt.put(hc.note[0] ? hc.note : "系统实时画面");
+        bool has_bytes = hc.imgs[0].p != nullptr;
+        // 字节已省略: 那张实景若还在先前帧环里, 就按它**此刻**的槽位标出回看编号(环滚动后编号会变,
+        // 所以每轮现算, 不能写死进历史文本); 已滚出环的明说看不到了。
+        // 偏移按"本回合滚完新帧之后"的环算: 新帧成为 prev1, 原各槽整体后移一位。
+        char rv[96] = {0};
+        if (!has_bytes && r.prev_ids) {
+          int shift = r.prev_new_id ? 2 : 1;   // 本回合要滚进一张新实景, 环里各槽都往后挪一位
+          for (int k = 0; k < 2; k++) {
+            if (!hc.img_id[k]) continue;
+            int off = 0;
+            if (r.prev_new_id && r.prev_new_id == hc.img_id[k]) off = 1;   // 本回合正要发出的那张: 滚完就是 prev1
+            else for (int i = 0; i < r.prev_idn; i++) if (r.prev_ids[i] == hc.img_id[k]) { off = i + shift; break; }
+            if (off > AI_PREV_SLOTS) off = 0;    // 会被这次滚动挤出环的那张: 已经看不到了
+            if (off) {
+              size_t w = strlen(rv);
+              snprintf(rv + w, sizeof(rv) - w, "%s第%d张 look(prev:%d)", w ? "、" : "", k + 1, off);
+            }
+          }
+        }
+        if (has_bytes) tt.put("): ");
+        else if (rv[0]) { tt.put("): 字节已省略; 回看: "); tt.put(rv); tt.put("; "); }
+        else tt.put("): 字节已省略, 勿据此判位置; ");
+      }
+      if (hc.result && hc.result[0]) tt.put(hc.result);
+      if (is_last && r.state_block && r.state_block[0]) tt.put(r.state_block);
+      if (is_last && r.tail_hint && r.tail_hint[0]) { tt.put(" 注意: "); tt.put(r.tail_hint); }
+      b.put(",{\"role\":\"tool\",\"tool_call_id\":");
+      esc_append(b, hc.id ? hc.id : "");
+      if (hc.img_n > 0 && hc.imgs[0].p) {   // 带图: content 走内容块数组(text + 1~2 张图)
+        b.put(",\"content\":[{\"type\":\"text\",\"text\":");
+        esc_append(b, tt.p ? tt.p : "");
+        b.put("}");
+        for (int k = 0; k < (int)hc.img_n && k < 2; k++) {
+          if (!hc.imgs[k].p || hc.imgs[k].n == 0) continue;
+          b.put(",");
+          img_block(b, hc.imgs[k].p, hc.imgs[k].n);
+        }
+        b.put("]}");
+      } else {
+        b.put(",\"content\":");
+        esc_append(b, tt.p ? tt.p : "");
+        b.put("}");
+      }
+    }
   }
-  esc_append(b, ut.p ? ut.p : "");
+  // 尾部 user 画面: 首轮/本回合没有 look 时才由程序注入(有 look 的回合图在那条 tool 结果里)。
+  if (r.use_frame) {
+    b.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    PsaBuf ut;
+    if (r.frame_note && r.frame_note[0]) ut.put(r.frame_note);
+    ut.put(" ");   // 与图块之间留一个空格, 读起来不粘连
+    // 首轮没有 tool 结果: 状态块与一次性提示只能挂在这条画面文本上, 否则会丢
+    if (!last_tc && r.state_block && r.state_block[0]) ut.put(r.state_block);
+    if (!last_tc && r.tail_hint && r.tail_hint[0]) { ut.put(" 注意: "); ut.put(r.tail_hint); }
+    esc_append(b, ut.p ? ut.p : "");
+    b.put("}");
+    if (r.frame.p && r.frame.n > 0) { b.put(","); img_block(b, r.frame.p, r.frame.n); }
+    b.put("]}");
+  }
+  // 请求尾: max_tokens/思考档 + 工具声明(放 messages 之后, 不破坏前缀缓存)
+  // 这里只需**关掉 messages 数组**(尾部那条 user 消息的 content 数组与 message 对象已在上面 use_frame 块里关过)。
+  b.put(R"CFG(],"max_tokens":8192,"reasoning_effort":"low",)CFG");
+  b.put(ai::tools_schema());
   b.put("}");
-  if (r.frame.p) {
-    // 图片块间需逗号分隔, 首个(图块首项)不加; 缺逗号会 400。
-    b.put(",");
-    bool first = true;
-    auto img = [&](const uint8_t* d, size_t n) {
-      if (!first) b.put(',');
-      img_block(b, d, n);
-      first = false;
-    };
-    // 图预算 ≤2: carry 帧(prev/放大/用户图)优先(此时放弃参考图); 否则 参考图(首轮)+当前帧
-    if (r.use_prev && r.prev.p && r.prev.n > 0) img(r.prev.p, r.prev.n);
-    else if (r.use_edited && r.edited.p) img(r.edited.p, r.edited.n);
-    img(r.frame.p, r.frame.n);
-  }
-  b.put(R"CFG(]}],"temperature":0.3,"max_tokens":8192,"reasoning_effort":"low","response_format":{"type":"json_object"}})CFG");
 }

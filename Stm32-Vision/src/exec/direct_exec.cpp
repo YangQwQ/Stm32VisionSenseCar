@@ -645,18 +645,18 @@ bool exec::read_state(char* buf, size_t cap) {
                                 : (s_car_motion == 1 ? "前进" : (s_car_motion == 2 ? "后退" : "停止"));
   const char* grip = s_grip <= GRIP_CLOSE + 5 ? "clip" : "release";
   // 机械臂到限位提示：告诉 AI 继续同向动作不会再有变化（需反向或调整姿态）。
-  const char* reach_lim = s_reach >= REACH_HI - 2 ? "夹爪前伸最远 "
-                        : (s_reach <= REACH_LO + 2 ? "夹爪回缩最近 " : "");
-  const char* lift_lim  = s_lift >= LIFT_HI - 2 ? "夹爪高度触底 "
-                        : (s_lift <= LIFT_LO + 2 ? "夹爪高度触顶 " : "");
+  const char* reach_lim = s_reach >= REACH_HI - 2 ? " 已伸最远"
+                        : (s_reach <= REACH_LO + 2 ? " 已缩最近" : "");
+  const char* lift_lim  = s_lift >= LIFT_HI - 2 ? " 已触底"
+                        : (s_lift <= LIFT_LO + 2 ? " 已触顶" : "");
   // 末端前端坐标（前向运动学）：让 AI 知道夹爪现在伸到多前、多高，判断还能往哪移/当前高度。
   // 括号内为左右舵机 PWM（Servo2=移爪 s_reach / Servo4=抬落 s_lift），供 exec_log 校准机械臂坐标。
   float fk_x = 0, fk_h = 0;
   arm_fk(s_reach, s_lift, &fk_x, &fk_h);
   if (fk_x < 0) fk_x = 0;
-  // 臂态语义：当前处于哪个固定姿态（low/raise/clip/grasp/release/fold），移动臂位的动作后清空。
+  // 臂态语义：当前处于哪个固定姿态（low/raise/grasp/fold），移动臂位的动作后回到"自由"。
   // 给 AI 明确反馈，避免"已折叠仍反复 fold / 已夹取却不知处于何态"。爪态(开/合)单独看 s_grip。
-  const char* arm_stat = "非固定";
+  const char* arm_stat = "自由";
   switch (s_arm_mode) {
     case ARM_LOW:     arm_stat = "low"; break;
     case ARM_RAISE:   arm_stat = "raise"; break;
@@ -665,8 +665,9 @@ bool exec::read_state(char* buf, size_t cap) {
     default: break;
   }
   // 调试时才使用带pwm的
-  // snprintf(buf, cap, "小车状态:%s | 夹爪:前%.0fcm(%d) 高%.0fcm(%d) %s%s 爪开合: %s %s姿态", car, fk_x, (int)s_reach, fk_h, (int)s_lift, reach_lim, lift_lim, grip, arm_stat);
-  snprintf(buf, cap, "小车状态:%s | 夹爪:(%.0f, %.0f) %s%s爪开合: %s %s姿态", car, fk_x, fk_h, reach_lim, lift_lim, grip, arm_stat);
+  // snprintf(buf, cap, "小车: %s | 夹爪: %s 姿态: %s 位置: (%.0f, %.0f)(%d,%d) %s%s", car, grip, arm_stat, fk_x, fk_h, (int)s_reach, (int)s_lift, reach_lim, lift_lim);
+  snprintf(buf, cap, "小车: %s | 夹爪: %s 姿态: %s 位置: (%.0f, %.0f)%s%s",
+           car, grip, arm_stat, fk_x, fk_h, reach_lim, lift_lim);
   // 撞边界/不可达诊断：反馈"想去哪、实际落到哪/反解成多少"，帮用户/AI 判断机械臂边界
   // （exec_log 推给手机）。reason=1 表示撞边界但已夹到最近合法点继续移动，非错误。
   // 只在诊断新鲜时挂（见 ARM_DIAG_FRESH_MS）：它是"刚下的那条指令的结果"，过期的别重复报。

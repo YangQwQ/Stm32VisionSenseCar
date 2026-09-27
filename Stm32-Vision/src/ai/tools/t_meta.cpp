@@ -5,16 +5,8 @@
 
 // 提示词"其它"段的键: 顶层元数据 + light 通道 + 带图请求回显。
 // ⚠️ 这几项归一个文件是按**提示词分段**归的, 不是按"有没有副作用"——`light` 是真硬件动作
-//    (哪吒灯命令字节), 与 reason/goal/done 这类纯文案键性质完全不同。阶段 3 生成提示词时
+//    (哪吒灯命令字节), 与 goal/done 这类纯文案键性质完全不同。阶段 3 生成提示词时
 //    它们会落在同一段里, 这才是它们同处一处的唯一理由。
-
-// reason: 模型自述本轮意图, 只进日志/历史环/回执, 无校验点。
-const char* ai::parse_reason(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
-  (void)err; (void)cap;
-  const char* reason = root["reason"] | "";
-  if (reason[0]) dst["reason"] = reason;
-  return nullptr;
-}
 
 // done: 任务完结标记(等同 finish)。只认 true —— 显式给 false 不写键, 免得把"写了 false"与"没写"混同。
 const char* ai::parse_done(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
@@ -36,8 +28,9 @@ const char* ai::parse_goal(JsonVariantConst root, JsonDocument& dst, char* err, 
   return nullptr;
 }
 
-// carry_image: 下轮额外携带哪张图("zoom"/"full"/"image1~3")。
-// 不校验取值: 分派端(`land_carry_image`)对认不出的值退化为"什么都不带", 无副作用。
+// carry_image: 下轮额外携带哪张图("zoom"/"full"/"image1~3")。**旧写法**, 已并入 look 工具
+// (见 ai_prompt.cpp 的 look.zoom/prev/user)。保留本键只为兜底: 模型偶尔仍会发时不报错,
+// 实际由 ai_round 的 land_car 打印一句"已并入 look, 本次未生效"。取值照旧不校验。
 const char* ai::parse_carry_image(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
   (void)err; (void)cap;
   const char* cimg = root["carry_image"] | "";
