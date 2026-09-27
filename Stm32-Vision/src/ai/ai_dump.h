@@ -9,8 +9,8 @@
 namespace ai {
 
 
-// 留存一帧(组包前调用)。img=JPEG 原始字节(空=本轮无画面); with_prev=本轮除这帧外还带了上一帧
-// (AI 上轮要了 carry_image:"full" 做对比)。同一轮重复调用(组包重试)只占一个槽位、就地覆盖。
+// 留存一帧(组包前调用)。img=JPEG 原始字节(空=本轮无画面); with_prev=本轮除这帧外还带了另一张图
+// (look 一次给了两张做对比)。同一轮重复调用(组包重试)只占一个槽位、就地覆盖。
 void dump_push(const uint8_t* img, size_t n, bool with_prev);
 
 // 给最近一次 push 的那帧补上标注(这一轮做了什么/被谁拒了), 并让它对 HTTP 可见。

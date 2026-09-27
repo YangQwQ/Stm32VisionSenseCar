@@ -3,40 +3,9 @@
 #include <Arduino.h>
 #include <string.h>
 
-// 提示词"其它"段的键: 顶层元数据 + light 通道 + 带图请求回显。
-// ⚠️ 这几项归一个文件是按**提示词分段**归的, 不是按"有没有副作用"——`light` 是真硬件动作
-//    (哪吒灯命令字节), 与 goal/done 这类纯文案键性质完全不同。阶段 3 生成提示词时
-//    它们会落在同一段里, 这才是它们同处一处的唯一理由。
-
-// done: 任务完结标记(等同 finish)。只认 true —— 显式给 false 不写键, 免得把"写了 false"与"没写"混同。
-const char* ai::parse_done(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
-  (void)err; (void)cap;
-  if (root["done"].is<bool>() && root["done"].as<bool>()) dst["done"] = true;
-  return nullptr;
-}
-
-// goal: 任务终态(finish=完成 / abort=请求中止 / fail=执行失败)。
-// 非法值**明拒而不放过** —— 放过就会被下游当成"没写 goal", 任务在该结束的轮次继续空跑。
-const char* ai::parse_goal(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
-  const char* goal = root["goal"] | "";
-  if (!goal[0]) return nullptr;
-  if (strcmp(goal, "finish") && strcmp(goal, "abort") && strcmp(goal, "fail")) {
-    snprintf(err, cap, "AI 非法 goal=%s(可用 finish/abort/fail)", goal);
-    return err;
-  }
-  dst["goal"] = goal;
-  return nullptr;
-}
-
-// carry_image: 下轮额外携带哪张图("zoom"/"full"/"image1~3")。**旧写法**, 已并入 look 工具
-// (见 ai_prompt.cpp 的 look.zoom/prev/user)。保留本键只为兜底: 模型偶尔仍会发时不报错,
-// 实际由 ai_round 的 land_car 打印一句"已并入 look, 本次未生效"。取值照旧不校验。
-const char* ai::parse_carry_image(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
-  (void)err; (void)cap;
-  const char* cimg = root["carry_image"] | "";
-  if (cimg[0]) dst["carry_image"] = cimg;
-  return nullptr;
-}
+// car 的 light 通道 + goal 工具的两个键(set/finish)。
+// ⚠️ light 是真硬件动作(哪吒灯命令字节), 与 set/finish 这类纯文案键性质完全不同; 同处一文件只是
+//    因为它们都"形状简单、无数组", 与 t_observe/t_tasks 的列表型键分开。
 
 // light 通道: kind 合法, on 必须显式给 bool(缺省拒, 防 AI 漏写 on 把灯误关)。
 const char* ai::parse_light(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
@@ -52,5 +21,26 @@ const char* ai::parse_light(JsonVariantConst root, JsonDocument& dst, char* err,
     return "AI light 缺 on(bool): 必须显式给 on:true/false(缺省会把灯误关)";
   dst["light"]["kind"] = kind;
   dst["light"]["on"] = src["on"].as<bool>();
+  return nullptr;
+}
+
+// goal.set: 更新当前任务的最终目标(纯字符串, 原样透传; 是否变化由落地侧比对)。
+const char* ai::parse_set(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
+  (void)err; (void)cap;
+  const char* g = root["set"] | "";
+  if (g[0]) dst["set"] = g;
+  return nullptr;
+}
+
+// goal.finish: 任务终态(done=完成 / fail=执行失败 / wait=中止并等待用户输入)。
+// 非法值**明拒而不放过** —— 放过就会被下游当成"没写 finish", 任务在该结束的轮次继续空跑。
+const char* ai::parse_finish(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap) {
+  const char* g = root["finish"] | "";
+  if (!g[0]) return nullptr;
+  if (strcmp(g, "done") && strcmp(g, "fail") && strcmp(g, "wait")) {
+    snprintf(err, cap, "AI 非法 finish=%s(可用 done/fail/wait)", g);
+    return err;
+  }
+  dst["finish"] = g;
   return nullptr;
 }

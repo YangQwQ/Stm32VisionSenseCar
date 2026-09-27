@@ -21,7 +21,7 @@ struct ResultItem {
 static QueueHandle_t g_result_q = nullptr;
 
 // 用户编辑图暂存(PSRAM 环形, 保留最近 3 张)+ 时间戳/插入序号; worker 内只读快照由
-// set_edited_image/取图互斥。AI 侧记为 image1(最新)/image2/image3, 供 carry_image:"image1~3" 按需查看。
+// set_edited_image/取图互斥。任务起点由 worker 取快照并统一编号(ImageN), 供 look(image=[N]) 按需回看。
 static uint8_t* g_edited[AI_EDITED_SLOTS] = {};
 static size_t g_edited_len[AI_EDITED_SLOTS] = {};
 static uint64_t g_edited_ts[AI_EDITED_SLOTS] = {};

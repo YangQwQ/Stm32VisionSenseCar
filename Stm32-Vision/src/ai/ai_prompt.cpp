@@ -59,8 +59,8 @@ static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
 
 // 屏幕像素 → 地面坐标(单应投影)由独立模块 ground_proj 负责: ground::screen_to_world。
 
-// 请求体尾部的工具声明(agent 循环): `car` 批量动作 / `look` 取画面 / `mem` 查记忆 / `say` 对用户说话 /
-// `compact` 压缩历史 / `finish` 收尾。
+// 请求体尾部的工具声明(agent 循环): `car` 批量动作 / `mem` 物体记忆(记录/删除/查询) / `task` 任务记账 /
+// `goal` 目标与收尾 / `look` 取画面 / `say` 对用户说话 / `compact` 压缩历史。
 // 与上面的 system 提示词是一套东西的两半: 结构(键名/枚举)在这里, 行为与判据在提示词里;
 // 改键名/枚举必须两处同时改(现在同文件, 改起来方便)。
 // 取值合法性不靠这里的 schema(没用 strict: DeepSeek 的 strict 要求所有属性 required+additionalProperties,
@@ -70,8 +70,7 @@ static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
 // 严格时会 400。当前实测能过, 故先留着; 若哪天开始 400, 第一件事就是摘掉它。
 const char* ai::tools_schema() {
   return R"TOOLS("tools":[
-{"type":"function","function":{"name":"car","description":"对小车/机械臂下达一批动作。\n每轮至少调用一个工具, 同一种工具最多一次。\n一次 car 调用可同时给多个键(如 move + observe 一起做); 各键都可不写, 只给本轮要用的即可。","parameters":{"type":"object","properties":{
-
+{"type":"function","function":{"name":"car","description":"对小车/机械臂下达一批动作。\n每轮至少调用一个工具, 同一种工具最多一次。\n一次 car 调用可同时给多个键(如 move + light 一起做); 各键都可不写, 只给本轮要用的即可。","parameters":{"type":"object","properties":{
 "move":{"type":"object","description":"轮子, 五选一且每次只用一个, 方向已含在 type 里: forward 前进 / backward 后退 → value 填距离 cm, 前进前先确保目标对准; spin_left 原地左转 / spin_right 原地右转 → value 填角度; 微调对准先用比较接近的角度, 如果过头再逐轮砍半角度反向转;\n approach 靠近 → target(物体记忆里的名字, 缺省=最近目标, 如果还未observe可以两个同时使用直接前往目标附近); 只在初次接近较远目标时用, 物体过近时用可能大幅转向","properties":{
 "type":{"type":"string","enum":["forward","backward","spin_left","spin_right","approach"]},
 
@@ -81,32 +80,37 @@ const char* ai::tools_schema() {
 "arm":{"type":"object","description":"机械臂/夹爪, 每次只用一个 type(x/h 仅 pose 有效, 其它时候不写):\nlow 夹爪降到贴地准备位; 目标在画面上不处于[左指]上方时需先后退, 避免压住目标\nraise 抬到高位; 压住物体或物体可能在车头近处时用, 找回目标后应先旋转对准\ngrasp 合爪并抬臂; 夹取目标时用, 之后记得 look 确认是否夹住\nclip / release 合上 / 松开夹爪; 需要手动控制夹取流程时用\nfold 收臂折叠, 避免遮挡; 疑似压住物体或机械臂遮挡视野时用\npose 移动夹爪到指定坐标","properties":{
 "type":{"type":"string","enum":["low","raise","fold","grasp","clip","release","pose"]},"x":{"type":"number","description":"pose: 轴前 cm(4~15)(可省略)"},"h":{"type":"number","description":"pose: 离地 cm(1~12)(可省略)"}}},
 
-"light":{"type":"object","description":"车灯: front=前灯(白色, 照亮/判断颜色用它) / back=尾灯(红) / vibe=氛围灯(深蓝)","properties":{"kind":{"type":"string","enum":["front","back","vibe"]},"on":{"type":"boolean","description":"开启/关闭"}}},
-"observe":{"type":"array","description":"记录/刷新物体记忆的位置(即mem中的物体位置), 查看新画面且目标可见时总是使用; px/py 统一填物体底部中心在最新画面上的屏幕坐标(放大图也照常填 0~1, 程序会自动换算); 请勿对着用户参考图或prev图使用observe","items":{"type":"object","properties":{"name":{"type":"string"},"px":{"type":"number"},"py":{"type":"number"}}}},
-"delete":{"type":"array","description":"删除已记忆的物体; 发现重复记录同一物体、或记忆已无用时的清理","items":{"type":"string"}},
-"task_note":{"type":"string","description":"记录目标特征(如大小、形状), 避免后续误认, 位置尽量不记; 也可备注用户发送图片的内容"},
-"tasks":{"type":"array","description":"重写整个任务列表, 需要分步任务时用","items":{"type":"string"}},
-"task_done":{"type":"array","description":"标记第N项完成(首项为1, 可同时标多项; 取消标记需重写任务列表)","items":{"type":"integer"}},
-"task_goal":{"type":"string","description":"更新当前任务的最终目标, 目标需要变更时使用"}}}}},
+"light":{"type":"object","description":"车灯: front=前灯(白色, 照亮/判断颜色用它) / back=尾灯(红) / vibe=氛围灯(深蓝)","properties":{"kind":{"type":"string","enum":["front","back","vibe"]},"on":{"type":"boolean","description":"开启/关闭"}}}
+}}}},
 
-{"type":"function","function":{"name":"look","description":"查看最多两个画面: 默认新拍一张当前全幅画面, 可叠加放大/先前实景/用户参考图, 最多两张(超出的忽略); 历史消息中look的图片会变成占位符, 还能回看的会标出编号; 动作结果与预期一致时直接继续","parameters":{"type":"object","properties":{
+{"type":"function","function":{"name":"mem","description":"物体记忆与小车姿态: 记录(observe)/删除(delete)目标位置, 或查询当前记忆。\n只给 observe/delete 时按给的内容返回执行回执; 什么都不给(或空对象)=查询小车全局坐标/朝向与已记忆的物体坐标。","parameters":{"type":"object","properties":{
+"observe":{"type":"array","description":"记录/刷新物体记忆的位置(即查询结果里的物体位置), 查看新画面且目标可见时总是使用; px/py 统一填物体底部中心在最新画面上的屏幕坐标(放大图也照常填 0~1, 程序会自动换算); 请勿对着用户参考图或回看的旧图使用observe","items":{"type":"object","properties":{"name":{"type":"string"},"px":{"type":"number"},"py":{"type":"number"}}}},
+"delete":{"type":"array","description":"删除已记忆的物体; 发现重复记录同一物体、或记忆已无用时的清理","items":{"type":"string"}}
+}}}},
+
+{"type":"function","function":{"name":"task","description":"任务记账(纯记录, 不含动作): note 记要点 / todo 重写任务列表 / done 标记已完成项。","parameters":{"type":"object","properties":{
+"note":{"type":"string","description":"记录目标特征(如大小、形状), 避免后续误认, 位置尽量不记; 也可备注用户发送图片的内容"},
+"todo":{"type":"array","description":"重写整个任务列表, 需要分步任务时用","items":{"type":"string"}},
+"done":{"type":"array","description":"标记第N项完成(首项为1, 可同时标多项; 取消标记需重写任务列表)","items":{"type":"integer"}}
+}}}},
+
+{"type":"function","function":{"name":"goal","description":"任务目标与收尾。set 更新最终目标; finish 结束本次任务(结束语或总结先用 say 发送)。","parameters":{"type":"object","properties":{
+"set":{"type":"string","description":"更新当前任务的最终目标, 目标需要变更时使用"},
+"finish":{"type":"string","enum":["done","fail","wait"],"description":"结束本次任务: done=已完成 / fail=目标已不可能达成 / wait=中止并等待用户输入(用户未回复则继续原任务)"}
+}}}},
+
+{"type":"function","function":{"name":"look","description":"查看最多两个画面: 默认新拍一张当前全幅画面, 可叠加放大或回看先前给过的画面, 最多两张(超出的忽略); 回看编号见结果里的「当前可查看图片」; 历史消息中的旧图会退化成占位符; 动作结果与预期一致时直接继续。查询记忆用 mem, 本工具只管取画面。","parameters":{"type":"object","properties":{
 "zoom":{"type":"boolean","description":"新拍一张当前实景画面, 并选择是否为放大版, 放大画面只能看见(0.25,0.25)至(0.75,0.75)的中央区域; 放大画面仅在检查[目标物体]是否可以被夹取时用, 普通的对准及其它场景用普通画面已足够; 目标不在夹爪附近时使用不放大的画面更合适"},
-"prev":{"type":"integer","description":"回看先前看过的实景画面: 1=上一张(不写数字时同 1), 2/3=再往前第 2/3 张; 与当前画面做前后对比(判断物体是否被夹住或移动)时和 zoom 一起用, 如 zoom:false + prev:2 给新拍的一张加再往前第 2 张; 历史里旧画面的占位会标出此刻还能回看的编号, 没标的就是已经看不到了"},
-"user":{"type":"array","description":"额外带上用户发送的第N张参考图, 如[1]或[1,2](1=最新); 最多两张, 超出的会被忽略, 用户有发送图片时才能查看","items":{"type":"integer"}}}}}},
+"image":{"type":"array","description":"回看先前给过的画面(含用户发送的参考图), 填编号数组; 编号见上一次 look 结果里的「当前可查看图片」, 不要凭空写编号; 与新拍画面合计最多 2 张, 超出的会被忽略, 编号已超出保留范围的会被告知","items":{"type":"integer"}}
+}}}},
 
-{"type":"function","function":{"name":"mem","description":"查看小车当前姿态(全局坐标/朝向)与已记忆的物体坐标: 目标丢失、需要确认方位或检查先前目标的大致位置时使用; 返回的格式类似于 「小车 (x, y) 朝向: 相对初始时左转15° | 绿色方块: [x, y](1轮未更新); ...」, 小车的(x, y)及朝向为相对任务开始时的, 也就是全局坐标系而非小车坐标系, 物体坐标的[x, y]为相对车头的坐标, 也就是(前, 右), 单位为cm; 若上次observe后未执行过move, 屏幕坐标准确的情况下误差在3cm以内, 否则误差会极大而可用性较低, N轮未更新表示该数据是基于多少轮前的observe计算得到, 轮数越高误差越大","parameters":{"type":"object","properties":{}}}},
-
-{"type":"function","function":{"name":"compact","description":"压缩历史上下文: 对话轮数变多时(状态块会提醒)用一段摘要概括此前进展; 调用后更早的对话被清空, 只留这条摘要开始的后续部分。目标/任务列表/任务笔记/物体记忆/车位姿都不受影响","parameters":{"type":"object","properties":{
+{"type":"function","function":{"name":"compact","description":"压缩历史上下文: 对话轮数变多时(状态块会提醒)用一段摘要概括此前进展; 调用后更早的对话被清空, 只留这条摘要开始的后续部分。目标/任务列表/任务笔记/物体记忆/车位姿都不受影响, 但可回看的旧画面(含用户参考图)会一并清空, 要看东西需重新 look","parameters":{"type":"object","properties":{
 "summary":{"type":"string","description":"用中文写给之后的自己看: 摘要只写已确认事实、后续步骤、需要注意的事或总结出的经验, 不写未证实的猜测; 清空后你只能靠这段文字回忆之前做过什么"}},
 "required":["summary"]}}},
 
 {"type":"function","function":{"name":"say","description":"对用户说话, 也可用来回答用户的提问; 有值得汇报的进展、结论或要解释的事时使用; 没什么可说可以不使用, 认为没有必要的话允许不说话, 但是建议在每个任务阶段, 或者执行一定次数后说话一下","parameters":{"type":"object","properties":{
 "text":{"type":"string","description":"要说的话, 一句话, 用户可见; 执行任务时用于写接下来准备干什么等; 结束时可以用来总结、回答用户问题或向用户提问"}},
-"required":["text"]}}},
-
-{"type":"function","function":{"name":"finish","description":"结束本次任务(不再需要动作时调用)。结束语或总结先用 say发送。","parameters":{"type":"object","properties":{
-"result":{"type":"string","enum":["done","fail","wait"],"description":"done=已完成 / fail=目标已不可能达成 / wait=中止并等待用户输入(用户未回复则继续原任务)"}},
-"required":["result"]}}}
+"required":["text"]}}}
 ],"tool_choice":"auto")TOOLS";
 }
 
@@ -148,8 +152,7 @@ sys.put(R"PROMPT(
 
 # 画面相关定义及可见内容
 	- 屏幕坐标系: 描述物体在画面上的位置时使用。(px, py)为基于画面的归一化坐标, 左上(0,0), 右下(1,1)。小车朝向在[画面上]表现为从(0.625,1)朝向(0.375,0), 画面中心点约小车正前14cm
-	- 车头坐标系: 以车头为原点, 单位为cm的小车局部坐标系。车正前为x轴正向, 车正右为y轴正向, h 为离地高度。系统表示小车, 物体位置用(x,y), 表示夹爪位置用(x,h)
-	- 夹爪raise状态下, 屏幕的(0.5, 0.625)接近夹爪正下方, 放置物体时可以用来大致对准
+	- 车头坐标系: 以车头为原点, 单位为cm的小车局部坐标系。车正前为x轴正向, 车正右为y轴正向, h 为离地高度。系统表示物体记忆坐标用(x,y), 表示夹爪位置用(x,h), 但是表示小车位置和角度时以任务初始位置为原点, 如果发生碰撞或无效旋转等可能误差极大
 	- 旋转时画面大致以底部中心为圆心旋转, 车及机械臂的部分保持不动, 可以借此判断旋转是否会撞到物体, 物体在[左指]左侧时左转对准, 处于右侧时右转对准
 	- 画面上总是可见夹爪左指, 夹爪左前端向左上伸出的黑色细棍的平直段为[左指], 长约2.5cm, 在画面上可视为以其左上角为顶点的0.03x0.06的矩形(尺寸已根据画面归一化), 强调[左指]时, 只考虑其与物体在画面上的上下左右关系, 不考虑其朝向
 	- [夹爪前端]: 一个画面上大致以[左指]左上角为起点的0.125x0.125的方形(即[夹爪])的上半部分 (尺寸已根据画面归一化)
@@ -159,34 +162,32 @@ sys.put(R"PROMPT(
 # 状态判定
 	- 物体对准及夹取判定
 		+ if (先前判定为[夹住] && 期间未松爪): 已[夹住]	
-		+ elif (夹爪高度与[目标物体]所在高度不匹配):
-			* if (物体与小车在同一地面上): 需要先arm low
-			* else: 需要在arm low, 在物体可以夹取后再最后稍微抬升夹爪高度
 		+ else:
-			* switch([目标物体]在画面上处于[左指]的):
-				- case 正上方: 已[对准], 可以继续靠近
-				- case 上方: 未[对准], 需要继续旋转
-				- case 水平正左方: 可能[过近]
-				- case 水平正右方:
-					+ if ([目标物体]与左指接触或有重合部分, 或者说目标物体进入[夹爪前端]):
-						* if (夹爪未合): 可以尝试夹取, 否则为可能[过近]
-						* elif (夹爪已合): 已[夹住][目标物体]
-					+ else: 此时[目标物体]偏右且可能[过近]; 正常情况下此时目标物体处于夹爪舵机右侧, 如果你发现物体的下半部分被舵机遮挡而左半部分可见, 那么应该进入上面的if分支
-				- case 正下方: [过近], 建议arm low并后退重新对准
-				- case 下方: 可能[过近]
-			* if (经过上面的switch判定为可能过近):
-				- 如果夹爪高度大于2, 那么可以先arm low再继续判断
-				- 如果目标位置偏右或被机械臂遮挡, 可以考虑右转
-				- 如果需要旋转且当前夹爪高度可能撞到物体, 那么建议先后退
-				- 如果当前需要放下物体而不是夹起物体, 那么[过近]是无所谓的, 除非会撞上物体
+			* switch(目标在画面上处于[左指]的):
+				- case 正上方:
+					+ if (arm处于low姿态): 已[对准]
+					+ else: 可能较远且未[对准], 如果物体离夹爪还有一段距离可以先小幅前进(不超过5cm)再进行后续对准
+				- case 水平正右方(需要重合部分接近左指一半高):
+					+ if ([目标物体]与左指接触或有重合部分 && 目标物体进入[夹爪前端]):
+						* if (夹爪高度与[目标物体]所在高度不匹配): 可以先arm low, 然后不断抬高夹爪高度并用一两厘米的前进量尝试宽度是否匹配, 比如从(8, 4)的夹爪高度不断试到(8, 10)
+						* elif (夹爪未合): 可以grasp夹取
+						* elif (夹爪已合 && (前后画面对比后, 确认物体跟随夹爪移动 || 旋转或抬落机械臂时仍处于当前状态)): 已[夹住][目标物体]
+				- case 正下方:
+					+ if (arm低于5): (夹爪是否已合)?夹爪[过低]:目标物体[过近]
+					+ else: 若已[夹住]物体, 且目标指的是放置点, 那么此时可以放下物体
+				- case 下方:
+					+ if (arm低于5): [过近]或夹爪[过低]
+					+ else: 若已[夹住]物体, 且目标指的是放置点, 那么此时可以放下物体
+				- default: 可能为 偏左/偏右/过近 , 需要自行判断
+
 # 行为建议
 	- look的使用时机:
 		+ 在 grasp或者clip之前先检查物体是否在合适的位置, 同时夹取后也可以方便对比前后帧确认是否夹住, 其它单步动作通常情况下无需带上上一帧
 		+ 在观察完一次画面后, 下次查看可以在一系列动作结束后, 比如执行完 前进, 右转, 降臂 后再带上先前帧确认当前位置
-		
+	- 需要夹取物体时: 如果夹爪高度大于2且[左指]正下方无其它物体, 那么可以先arm low方便对准和避免遮挡; 如果目标位置偏右或被机械臂遮挡, 可以考虑右转; 如果需要旋转且当前夹爪高度可能撞到物体, 那么建议先后退; 如果arm low之后物体被遮挡, 建议后退再重试
 	- 未发现目标时, 可原地旋转搜索目标, 每步旋转不超过60度以免错过, 期间可以用observe标注一些开阔地带的位置, 旋转一周后仍未发现目标可前往开阔地带重新搜索
-	- 放置物体时: 可以在抬高物体的情况下, 到达放置点后再降臂和松爪, 如果需要避免物体掉落后滚远, 先arm low再松爪和后退也是可行的, 但是物体本身较高时不建议那样, 对机械臂本身不好; 因为画面视角位于小车左后方, 因此左侧的近处视野较好, 近距离操作对准放置点时先右转将其转到左侧再调整可能会比较轻松; 一般情况下放置物体时使用zoom没什么用
-	- 夹爪高度与[目标物体]所在高度不匹配时: 比如夹爪宽度不够导致物体无法进入夹爪夹取位置, 可以不断抬高夹爪高度并用一两厘米的前进量尝试宽度是否匹配, 比如从(8, 4)的夹爪高度不断试到(8, 10)
+	- 放置物体时: 可以在抬高物体的情况下, 到达放置点后再降臂、松爪以及后退收臂, 避免物体掉落后滚远, 同时后退方便确认结果; 如果放置点的大小距离和方向都不好准确确定, 那么可以不断小步靠近同时微调对准, 机械臂抬得够高的情况下只用考虑会不会撞到车头; 因为相机固定于小车左后方, 因此左侧近处视野较好, 近距离操作对准放置点时先右转将其转到左侧再调整可能会比较轻松; 一般情况下放置物体时使用zoom没什么用
+	- 当用户发送图片时: 请注意及时查看, 需要的话注意更新任务备注, 避免图片在 compact 之后无法查看
 )PROMPT");
 
 b.put("{\"model\":");
@@ -232,35 +233,21 @@ b.put("{\"model\":");
       b.put("}}");
     }
     b.put("]}");
-    // 每个调用一条 tool 结果。图只对"最新一张实图"注入字节, 更早的按 note 渲染成占位说明。
+    // 每个调用一条 tool 结果。图只对"最新一张实图"注入字节, 更早的按全局编号渲染成占位说明。
     for (int ci = 0; ci < tn.ncall; ci++) {
       const HistCall& hc = tn.calls[ci];
       bool is_last = (&hc == last_tc);
       PsaBuf tt;
-      if (hc.img_n > 0) {   // 该结果当时带了图: 先说清是什么图; 字节没了就明说, 免得据空想画面判位置
+      if (hc.img_n > 0) {   // 该结果当时带了图: 标出各图的全局编号(ImageN); 字节没了就明说, 免得据空想画面判位置
         tt.put("画面(");
-        tt.put(hc.note[0] ? hc.note : "系统实时画面");
-        bool has_bytes = hc.imgs[0].p != nullptr;
-        // 字节已省略: 那张实景若还在先前帧环里, 就按它**此刻**的槽位标出回看编号(环滚动后编号会变,
-        // 所以每轮现算, 不能写死进历史文本); 已滚出环的明说看不到了。
-        // 偏移按"本回合滚完新帧之后"的环算: 新帧成为 prev1, 原各槽整体后移一位。
-        char rv[96] = {0};
-        if (!has_bytes && r.prev_ids) {
-          int shift = r.prev_new_id ? 2 : 1;   // 本回合要滚进一张新实景, 环里各槽都往后挪一位
-          for (int k = 0; k < 2; k++) {
-            if (!hc.img_id[k]) continue;
-            int off = 0;
-            if (r.prev_new_id && r.prev_new_id == hc.img_id[k]) off = 1;   // 本回合正要发出的那张: 滚完就是 prev1
-            else for (int i = 0; i < r.prev_idn; i++) if (r.prev_ids[i] == hc.img_id[k]) { off = i + shift; break; }
-            if (off > AI_PREV_SLOTS) off = 0;    // 会被这次滚动挤出环的那张: 已经看不到了
-            if (off) {
-              size_t w = strlen(rv);
-              snprintf(rv + w, sizeof(rv) - w, "%s第%d张 look(prev:%d)", w ? "、" : "", k + 1, off);
-            }
-          }
+        int wrote = 0;
+        for (int k = 0; k < (int)hc.img_n && k < 2; k++) {
+          if (!hc.img_id[k]) continue;
+          char t[16];
+          snprintf(t, sizeof(t), "%sImage%u", wrote++ ? ", " : "", (unsigned)hc.img_id[k]);
+          tt.put(t);
         }
-        if (has_bytes) tt.put("): ");
-        else if (rv[0]) { tt.put("): 字节已省略; 回看: "); tt.put(rv); tt.put("; "); }
+        if (hc.imgs[0].p) tt.put("): ");
         else tt.put("): 字节已省略, 勿据此判位置; ");
       }
       if (hc.result && hc.result[0]) tt.put(hc.result);

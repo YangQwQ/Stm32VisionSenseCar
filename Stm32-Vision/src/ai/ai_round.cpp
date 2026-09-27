@@ -80,6 +80,13 @@ static volatile bool g_last_continuous = false;
 // 最近一条持续指令的类型(0=无/1=move/2=arm)。兜底 stop 时 Wheels 模式只适用于轮子残留。
 static volatile int g_last_cont_type = 0;
 
+// ---------------- 图片全局编号 ----------------
+// 每张发给模型的图(实景帧 + 用户参考图)各发一个全局递增号 ImageN, **跨任务不重置**: 模型据此回看,
+// 号只增不减 ⇒ 历史里的占位文本可以写死编号, 不必每轮按环滚动现算"还能回看第几张"(旧写法即由此
+// 让模型误判)。只有本模块发号(worker 单线程), 无需加锁。
+static uint32_t g_img_seq = 0;
+static uint32_t img_next_id() { return ++g_img_seq; }
+
 // ---------------- 任务上下文 ----------------
 // 跨回合/跨阶段的全部状态。按值建在 round_run_task 的栈上(worker 那 16KB PSRAM 栈帧内);
 // 历史环**表本身**另在 PSRAM(见 hist_new_turn), 这里只放指针与中小缓冲, 不为它吃栈。
@@ -107,14 +114,13 @@ struct RoundCtx {
   int idle_rounds = 0;              // 连续"无实际动作"回合数
   bool acted = false;               // 本回合是否有实际动作落地(exec 接受)
 
-  // 帧缓冲(PSRAM, 任务期复用): cur = 最近一张发给模型的实景; prev[] = 更早几张(look(prev:N) 回看用), [0]=最新
+  // 帧缓冲(PSRAM, 任务期复用): cur = 最近一张发给模型的实景; prev[] = 更早几张(look 回看用), [0]=最新
   uint8_t* cur = nullptr; size_t cur_len = 0;
-  uint32_t cur_id = 0;              // cur 的帧序号(0=无): 帧发出去后随 prev_roll 进环
+  uint32_t cur_id = 0;              // cur 的全局图片编号(0=无): 帧发出去后随 prev_roll 进环
   uint8_t* prev[AI_PREV_SLOTS] = {};
   size_t prev_len[AI_PREV_SLOTS] = {};
-  uint32_t prev_id[AI_PREV_SLOTS] = {};   // 各槽帧序号(0=空槽); 与 prev/prev_len 同生同灭
-  uint32_t frame_seq = 0;           // 实景帧发号器(每张新拍实景 +1): 历史占位靠它认"这张还在不在环里"
-  uint32_t look_ids[2] = {};        // 本条 look 清单里各图对应的环帧序号(0=不是环里的实景, 如用户参考图)
+  uint32_t prev_id[AI_PREV_SLOTS] = {};   // 各槽全局图片编号(0=空槽); 与 prev/prev_len 同生同灭
+  uint32_t look_ids[2] = {};        // 本条 look 清单里各图的全局编号(与 look_cnt 配对)
   uint8_t* zoom_jpg = nullptr;      // 放大图缓冲(首次用到时分配; 出图后拷进 cur)
   bool frame_moving = false;        // 首帧抓取时车/臂仍在动 → 提示别硬信本帧
   const uint8_t* frame = nullptr;   // 本回合由程序注入尾部 user 的那张图(首轮; 发过一次即清)
@@ -129,7 +135,6 @@ struct RoundCtx {
   LookImg look_set[2];
   uint8_t look_cnt = 0;             // 清单张数(0=本回合没出图)
   bool look_live = false;           // 清单含"新拍的实景" → 才算 observe 基准 / 才滚动 prev
-  char look_desc[96] = {0};         // 整条图的说明(历史占位渲染用), 如"新拍全幅 + 用户第1张参考图"
 
   // 图基准: 模型这回合报的 px/py 指的是"它最后看到的那张图"的裁框 ⇒ 组包时把 pend_* 提交进 sent_*,
   // look 新拍后写 pend_* 供**下一回合**用(同回合 car{observe}+look 时 observe 读到的仍是旧基准)。
@@ -161,8 +166,8 @@ struct RoundCtx {
   struct TaskItem { char name[48]; bool done; };
   TaskItem s_tasks[8] = {};         // AI 维护的任务列表
   int s_task_n = 0;
-  char goal_now[256] = {0};         // 当前任务目标(可被 task_goal 热替换)
-  bool goal_set = false;            // AI 是否已显式 task_goal 过(≠"文案变了": 它常把用户原话原样写回来)
+  char goal_now[256] = {0};         // 当前任务目标(可被 goal.set 热替换)
+  bool goal_explicit = false;       // AI 是否已显式 goal.set 过(≠"文案变了": 它常把用户原话原样写回来)
   char compact_sum[512] = {0};      // compact 工具给的进展摘要: 本回合落地跑完后据此压缩历史(见 compact_history)
 
   // 历史环(PSRAM 表, 任务起点分配 / 收尾释放): 一回合一条, 内含 1~AI_HIST_CALL_MAX 个工具调用
@@ -170,10 +175,10 @@ struct RoundCtx {
   int hist_n = 0;
   uint16_t img_tag_n = 0;           // 图片归属标记发号器: 每回合 +1(0 保留给"无"), 与 img_owner 配对
 
-  // 用户编辑图快照(供整任务复用): 按"新→旧"把槽位记入 ed_order, image1=最新
+  // 用户参考图快照(供整任务复用): 与实景帧统一编号, 各槽记下自己的全局编号 ed_num(0=空槽)
   uint8_t* ed_img[AI_EDITED_SLOTS] = {};
   size_t ed_len[AI_EDITED_SLOTS] = {};
-  int ed_order[AI_EDITED_SLOTS] = {};
+  uint32_t ed_num[AI_EDITED_SLOTS] = {};
   int ed_n = 0;
 
   // ---- 成员函数(与调用者同 TU ⇒ 仍可内联) ----
@@ -207,7 +212,7 @@ static HistTurn* hist_new_turn(RoundCtx& c) {
   if (c.hist_n >= AI_HIST_MAX_TURNS) {   // 兜底淘汰最旧整回合(正常路径应由 compact 先清)
     if (c.hist[0].chat && !c.hist[0].origin && c.hist[0].text)   // 任务起点的目标不提醒(原话常驻目标消息)
       snprintf(c.task_remind, sizeof(c.task_remind),
-               "较早的一条用户消息即将被历史丢弃; 若它表达了新任务/新目标而你还未用 task_goal 更新, 请现在更新。");
+               "较早的一条用户消息即将被历史丢弃; 若它表达了新任务/新目标而你还未用 goal 的 set 更新, 请现在更新。");
     hist_free_turn(c.hist[0]);
     memmove(c.hist, c.hist + 1, (AI_HIST_MAX_TURNS - 1) * sizeof(HistTurn));
     memset(&c.hist[AI_HIST_MAX_TURNS - 1], 0, sizeof(HistTurn));
@@ -231,7 +236,7 @@ static void hist_add_chat(RoundCtx& c, const char* text, bool origin = false) {
 
 // 向当前回合追加一次工具调用(id/name/args/result 字符串拷进 PSRAM; 图只存指针与张数)
 static void hist_add_call(RoundCtx& c, const char* id, const char* name, const char* args,
-                          const char* result, const char* note) {
+                          const char* result) {
   if (!c.hist || c.hist_n <= 0) return;
   HistTurn& tn = c.hist[c.hist_n - 1];
   if (tn.chat || tn.ncall >= AI_HIST_CALL_MAX) return;
@@ -240,7 +245,6 @@ static void hist_add_call(RoundCtx& c, const char* id, const char* name, const c
   hc.name = ps_dup(name ? name : "");
   hc.args = ps_dup(args ? args : "{}");
   hc.result = ps_dup(result ? result : "");
-  if (note && note[0]) { snprintf(hc.note, sizeof(hc.note), "%s", note); }
 }
 
 // compact 落地: 释放除"本回合"外的全部回合, 在最前插一条 AI 自述的进展摘要。
@@ -252,15 +256,23 @@ static void compact_history(RoundCtx& c) {
   memset(&c.hist[0], 0, sizeof(HistTurn));
   c.hist[0].chat = true;
   // 摘要渲染成一条 user 消息: 加固定抬头, 免得模型把它当成用户刚下的新要求。
-  char s[sizeof(c.compact_sum) + 96];
+  // +256 是给抬头留的余量: 摘要满 511B 时, 余量不足会把摘要尾部(甚至半个汉字)截掉, 云端会以
+  // "invalid unicode code point" 400 拒整份请求(抬头约 215B, 511+215 < 512+256)。
+  char s[sizeof(c.compact_sum) + 256];
   snprintf(s, sizeof(s),
-           "【历史已压缩】以下是你自己写的此前进展摘要(更早的对话已清空; 目标/任务列表/任务笔记/物体记忆/车位姿仍在):\n%s",
+           "【历史已压缩】以下是你自己写的此前进展摘要(更早的对话已清空; 目标/任务列表/任务笔记/物体记忆/车位姿仍在; 可回看的旧画面已清空, 要看东西请新拍):\n%s",
            c.compact_sum);
   c.hist[0].text = ps_dup(s);
   c.hist[1] = cur;                                               // 裸指针所有权随之转移
   c.hist_n = 2;
   c.compact_sum[0] = 0;
-  ai::logf("[ai] 历史已压缩, 保留摘要与本回合共 2 条");
+  // 更早的工具调用已随历史清掉, 那些画面(实景帧环 + 用户参考图)再也无从对应 ⇒ 一并作废: 否则
+  // 「当前可查看图片」里会列出一串 AI 自己认不出的编号, 它只能对着空编号凭空猜。编号本身继续递增
+  // (不重置, 免得新图号与摘要里提到的旧号撞车)。缓冲此处只摘号、不释放 —— 同回合 look 可能刚把
+  // look_set 指进这些缓冲, 现在 free 会留悬空指针; 帧环槽位本就复用, 用户图则随任务收尾统一释放。
+  for (int i = 0; i < AI_PREV_SLOTS; i++) { c.prev_len[i] = 0; c.prev_id[i] = 0; }
+  for (int i = 0; i < AI_EDITED_SLOTS; i++) { c.ed_len[i] = 0; c.ed_num[i] = 0; }
+  ai::logf("[ai] 历史已压缩, 保留摘要与本回合共 2 条; 可回看画面已作废");
 }
 
 // 裁剪字符串尾部的残缺 UTF-8 序列: 固定缓冲截断常切在汉字中间, 残留半个字节会让云端判
@@ -349,7 +361,7 @@ enum class PrepR  : uint8_t { Ok, SkipRound, ExitTask, Interrupted };
 enum class AttR   : uint8_t { Got, Retry, Break };
 enum class RoundR : uint8_t { NextRound, ExitTask };
 
-// `car` 工具的落地(分组通道 → 执行 / 元数据 / 反馈): 执行动作并把"这一回合发生了什么"写成结果文本(out)。
+// `car` 工具的落地(move/arm/light 分组通道 → 执行 / 反馈): 执行动作并把"这一回合发生了什么"写成结果文本(out)。
 // 结果文本会作为该次 tool 调用的返回值回喂给模型 —— 这是它唯一的执行反馈通道。
 static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap);
 
@@ -376,7 +388,7 @@ static void round_task_init(RoundCtx& c) {
   // 打印实际端点/模型, 便于排查 404/401 等云端拒绝(配错路径是常见原因)
   ai::logf("[ai] 端点=%s 模型=%s key=%s", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
                 cfg::ai_key().isEmpty() ? "空" : "已配置");
-  // 当前任务目标(独立 user 消息展示; 可被 task_goal 热替换)
+  // 当前任务目标(独立 user 消息展示; 可被 goal.set 热替换)
   snprintf(c.goal_now, sizeof(c.goal_now), "%s", c.t.text ? c.t.text : "");
   // 历史环表(PSRAM): 一回合一条, 内含 1~AI_HIST_CALL_MAX 个工具调用。放 PSRAM 是因为它比 RoundCtx
   // 本身还大(数十回合 × 数个调用), 而 RoundCtx 按值建在 worker 那 16KB 栈上, 塞不下。
@@ -388,9 +400,11 @@ static void round_task_init(RoundCtx& c) {
   } else {
     ai::logf("[ai] 历史环分配失败(PSRAM 不足): 本任务无历史, 模型看不到自己的前几回合");
   }
-  // 用户编辑图快照(供整轮任务复用, 避免中途被覆盖): 暂存里最近 ≤3 张有效图各留一份独立 PSRAM
-  // 副本, 并按"新→旧"把槽位记入 ed_order, 供 look(user=N) 按需带出(image1=最新)。
-  c.ed_n = ai::edited_snapshot(c.ed_img, c.ed_len, c.ed_order, AI_EDITED_SLOTS);
+  // 用户参考图快照(供整轮任务复用, 避免中途被覆盖): 暂存里最近 ≤3 张有效图各留一份独立 PSRAM
+  // 副本, 并与实景帧统一编号(各槽 ed_num), 供 look 按编号回看。
+  int ed_order[AI_EDITED_SLOTS];
+  c.ed_n = ai::edited_snapshot(c.ed_img, c.ed_len, ed_order, AI_EDITED_SLOTS);
+  for (int i = 0; i < AI_EDITED_SLOTS; i++) if (c.ed_img[i] && c.ed_len[i]) c.ed_num[i] = img_next_id();
 }
 
 // ---------------- 回合入口检查(中断 / 掉线 / 等待态) ----------------
@@ -444,7 +458,7 @@ static bool fetch_image(RoundCtx& c, bool zoom, char* note, size_t note_cap, boo
     if (!c.cur) c.cur = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
     if (ok && c.cur && zl <= AI_EDITED_IMG_MAX) {
       memcpy(c.cur, c.zoom_jpg, zl); c.cur_len = zl;   // 统一由 cur 承载"最近一张图"(环做回看)
-      c.cur_id = ++c.frame_seq;
+      c.cur_id = img_next_id();
       if (note && note_cap) snprintf(note, note_cap, "放大%.1f× 全幅(0.25,0.25)-(0.75,0.75)", (double)AI_ZOOM_DEF);
       if (out_zoomed) *out_zoomed = true;
       ai::logf("[放大镜] 高清中央框(0.25,0.25)-(0.75,0.75) → %uKB %dms",
@@ -475,7 +489,7 @@ static bool fetch_image(RoundCtx& c, bool zoom, char* note, size_t note_cap, boo
   bool copied = false;
   if (fl > 0 && fl <= AI_EDITED_IMG_MAX) {
     if (!c.cur) c.cur = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
-    if (c.cur) { memcpy(c.cur, fb->buf, fl); c.cur_len = fl; c.cur_id = ++c.frame_seq; copied = true; }
+    if (c.cur) { memcpy(c.cur, fb->buf, fl); c.cur_len = fl; c.cur_id = img_next_id(); copied = true; }
   }
   // 抓帧后立即归还相机缓冲: AI 的 HTTPS 慢则数秒, 期间一直占着 fb 会把 fb_count=2 的缓冲池耗尽、
   // 饿死并行推流; 帧数据后续一律用这份 PSRAM 副本。
@@ -565,10 +579,6 @@ static AttR round_attempt(RoundCtx& c) {
   br.frame = { c.frame, c.frame_len };
   br.use_frame = c.frame_note[0] != 0;
   br.frame_note = c.frame_note;
-  br.prev_ids = c.prev_id;         // 先前帧环: 历史占位靠它标出"这条旧画面还能用 prev:N 回看"
-  br.prev_idn = AI_PREV_SLOTS;
-  // 本回合将要滚进环的那张(cur): 组包后它就是 prev1, 占位偏移得按"滚过之后"的环算(与下面 prev_roll 的条件一致)
-  br.prev_new_id = (carried && c.cur_len > 0 && (c.frame || c.look_live)) ? c.cur_id : 0;
   build_body(body, br);
   c.pend_hint[0] = 0;   // 一次性消费
   c.task_remind[0] = 0; // 已随状态块挂出
@@ -593,7 +603,7 @@ static AttR round_attempt(RoundCtx& c) {
   if (!http_ok) { if (!c.fail) c.fail = "AI 请求失败"; return AttR::Break; }
   if (c.t.generation != ai::generation()) { c.done = true; c.interrupted = true; return AttR::Break; }  // 在途结果作废
 
-  // 图已随请求发出: 新拍的实景滚进先前帧环(供之后 look(prev:N) 回看), 且不再重复携带字节。
+  // 图已随请求发出: 新拍的实景滚进先前帧环(供之后 look(image=[N]) 按编号回看), 且不再重复携带字节。
   if (carried) {
     if (c.cur_len > 0 && (c.frame || c.look_live)) prev_roll(c);   // 首帧那条也滚一次(尾部画面发完就清)
     c.img_sent = true;
@@ -695,29 +705,35 @@ static void build_state_block(RoundCtx& c, PsaBuf& b) {
   bool has_origin = false;
   for (int i = 0; i < c.hist_n; i++) if (c.hist[i].origin) { has_origin = true; break; }
   b.put("\n任务目标: ");
-  if (!c.goal_set && has_origin) b.put("暂未设置, 请根据用户发言更新");
+  if (!c.goal_explicit && has_origin) b.put("暂未设置, 请根据用户发言更新");
   else b.put(c.goal_now);
   if (c.t.ann && c.t.ann[0]) { b.put(" (操作者标注: "); b.put(c.t.ann); b.put(")"); }
   char ts[320]; render_tasks(c, ts, sizeof(ts));
   if (ts[0]) { b.put("\n"); b.put(ts); }
   if (c.task_note[0]) { b.put("\n任务笔记: "); b.put(c.task_note); }
   if (c.task_remind[0]) { b.put("\n注意: "); b.put(c.task_remind); }
+  // 提示与工具无关, 统一挂在这里(动作类工具的结果只讲"这次动作发生了什么")。
+  if (c.stall_hint) {
+    b.put("\n注意: 连续几回合重复同一批动作、没有进展时可以换个角度重新观察目标");
+    c.stall_hint = false;
+  }
+  if (c.wait_note[0]) { b.put("\n注意: "); b.put(c.wait_note); c.wait_note[0] = 0; }
   // 历史达软上限: 每轮催一次, 直到 AI 调 compact(硬上限兜底前它会先被提醒很多轮)。
   if (c.hist_n >= AI_HIST_SOFT_TURNS) {
     char hb[160];
     snprintf(hb, sizeof(hb),
-             "历史上下文已 %d 轮(建议不超过 %d 轮), 每轮都会重传一遍拖慢响应; 请尽快调用 compact 用一段摘要压缩此前对话",
+             "历史上下文已 %d 轮(建议不超过 %d 轮), 请尽快调用 compact 用一段摘要压缩此前对话",
              c.hist_n, AI_HIST_SOFT_TURNS);
     b.put("\n注意: "); b.put(hb);
   }
 }
 
-// 终态映射(`finish` 工具与旧 `goal`/`done` 键同一套出口): done/finish→收尾; wait/abort→等用户输入; fail→失败收尾。
-static void apply_end(RoundCtx& c, const char* goal_v) {
-  if (!goal_v || !goal_v[0]) return;
+// 终态映射(goal.finish 的唯一出口): done→收尾; wait→等用户输入; fail→失败收尾。
+static void apply_end(RoundCtx& c, const char* fin_v) {
+  if (!fin_v || !fin_v[0]) return;
   JsonDocument st(&g_js_alloc); st["scope"] = "all";
   exec::act("stop", st.as<JsonObjectConst>());   // 终态前先急停, 不留残留动作
-  if (!strcmp(goal_v, "abort") || !strcmp(goal_v, "wait")) {
+  if (!strcmp(fin_v, "wait")) {
     c.wait_user = true;   // 下一回合起进入等待态(不取帧/不发请求), 见 prep_gate 头部
     c.wait_until = (uint64_t)(esp_timer_get_time() / 1000) + AI_WAIT_USER_MS;
     blog::logf(blog::AI, "AI 请求中止, 等待用户输入(最多%us)", (unsigned)(AI_WAIT_USER_MS / 1000));
@@ -728,11 +744,11 @@ static void apply_end(RoundCtx& c, const char* goal_v) {
     JsonDocument f(&g_js_alloc); f["reason"] = wt;
     String fb = build_feedback(c.t.id, f);
     ai::enqueue_result(fb.c_str(), c.t.fn, c.t.ctx);
-  } else if (!strcmp(goal_v, "fail")) {
+  } else if (!strcmp(fin_v, "fail")) {
     c.fail = "AI 判定执行失败";
     c.done = true;
     blog::logf(blog::AI, "AI 判定执行失败");
-  } else {   // finish / done
+  } else {   // done
     c.done = true;
     // 不置 sent_done: 终态 done 统一由 round_task_finish 补发, 这样"完成"与"失败"走同一条出口。
     blog::logf(blog::AI, "AI 判定任务完成");
@@ -748,7 +764,7 @@ static void echo_seg(PsaBuf& b, int* n, const char* key, const char* detail) {
 
 // ---------------- 落地(car 工具) ----------------
 static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap) {
-  // ---- 分组通道提取: move/arm/light 可选, 缺席=该子系统不动(zoom/carry_image 已并入 look, 见下方 legacy) ----
+  // ---- 分组通道提取: move/arm/light 可选, 缺席=该子系统不动(取画面/放大已归 look 工具) ----
   // move 内部单选 throttle/spin/approach; arm 内部单选各固定动作; light 可任意组合。
   JsonObjectConst mv = cmdD["move"].is<JsonObject>() ? cmdD["move"].as<JsonObjectConst>() : JsonObjectConst();
   JsonObjectConst ar = cmdD["arm"].is<JsonObject>()  ? cmdD["arm"].as<JsonObjectConst>()  : JsonObjectConst();
@@ -756,37 +772,17 @@ static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap)
   bool has_arm   = cmdD["arm"].is<JsonObject>();
   bool has_light = cmdD["light"].is<JsonObject>();
   bool has_any   = has_move || has_arm || has_light;
-  // 逐工具执行回执: 每个键把自己的"这次结果"写进对应段, 末尾按工具表序拼成一条(见下方"结果文本")。
+  // 逐工具执行回执: 每个键把自己的"这次结果"写进对应段, 末尾拼成一条(见下方"结果文本")。
   int  seg_n = 0;                     // 有结果的段数(0 = 本轮纯空转)
-  char emv[80] = {0}, earm[48] = {0}, elight[40] = {0}, edel[128] = {0};
-  char etnote[24] = {0}, etasks[40] = {0}, etdone[56] = {0}, etgoal[24] = {0};
+  char emv[80] = {0}, earm[48] = {0}, elight[40] = {0};
   const char* mtype = mv["type"] | "";
   bool is_mv = has_move && !strcmp(mtype, "throttle");
   bool is_sp = has_move && !strcmp(mtype, "spin");
   bool is_ap = has_move && !strcmp(mtype, "approach");
   const char* act = ar["type"] | "";   // arm 子型(low/raise/fold/grasp/clip/release/pose), 无 arm 为空
-  // 空间记忆: 先解析 AI observe(数组, 一回合可报多个物体), 且必须用**那张图拍摄时**的车位姿把观测转全局
-  // (快照随图基准存, 见 RoundCtx::sent_car_*) —— 位置在所有动作之前: 本回合动作落不落地都要收下这一帧观测。
-  if (cmdD["observe"].is<JsonArray>())
-    for (JsonObjectConst ob : cmdD["observe"].as<JsonArrayConst>()) land_observe_one(c, ob);
-  // 删除物体记忆(delete): 与 observe 同属动作前的记忆操作, 紧挨其后 —— 不影响本轮动作。
-  if (cmdD["delete"].is<JsonArray>())
-    for (JsonVariantConst it : cmdD["delete"].as<JsonArrayConst>()) {
-      if (!it.is<const char*>()) continue;   // 只认字符串名字
-      const char* nm = it.as<const char*>();
-      if (!nm || !nm[0]) continue;
-      bool gone = ai::mem_forget(nm);
-      ai::logf("[ai] 删除物体记忆: %s%s", nm, gone ? "" : "(记忆里没有该物体)");
-      snprintf(edel + strlen(edel), sizeof(edel) - strlen(edel), "%s%s%s%s",
-               edel[0] ? ", " : "", gone ? "已删除" : "记忆里没有", nm, gone ? "的记忆" : "");
-    }
   // ---- 主动作/并行辅助标记(供末尾统一落地与反馈); acted 用 RoundCtx, 勿在此重复遮蔽 ----
   bool nav_done = false;                 // approach 已执行导航
   const char* nav_tgt = mv["target"] | "";
-  char legacy[128] = {0};                // 旧键(zoom/carry_image)被忽略时留一句话在结果里
-  if (cmdD["zoom"] | false) snprintf(legacy, sizeof(legacy), "zoom 通道已并入 look(zoom=true), 本次未生效(要放大请调 look)");
-  else if ((cmdD["carry_image"] | "")[0])
-    snprintf(legacy, sizeof(legacy), "carry_image 已并入 look(prev/user), 本次未生效(要看图请调 look)");
   // ---- approach(轮子自动靠近): 本地巡航, 不点云端。与合爪同一回合时拦下(导航后车动、坐标过时) ----
   if (is_ap) {
     // ⚠️ 只拦 approach+**合爪**(grasp/clip): approach 会挪车、坐标过时, 拿旧坐标合爪必空夹。
@@ -821,57 +817,6 @@ static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap)
     c.acted = true;   // approach 算一次有意推进(空转兜底/死循环都销账)
   }
   // move/spin 的默认段长与默认角由 `parse_move` 在规范化时补写(见 `t_move.cpp`): 本文件不再改写指令。
-  // ---------- 任务记账(task_note / tasks / task_done / task_goal): 纯元数据, 不含硬件动作 ----------
-  { const char* tn = cmdD["task_note"] | "";
-    if (tn[0] && strcmp(tn, c.task_note)) {
-      strncpy(c.task_note, tn, sizeof(c.task_note) - 1); c.task_note[sizeof(c.task_note) - 1] = 0;
-      ai::logf("[ai] 任务笔记: %s", c.task_note);
-      snprintf(etnote, sizeof(etnote), "已更新");
-    } }
-  if (cmdD["tasks"].is<JsonArray>()) {
-    JsonArrayConst ta = cmdD["tasks"].as<JsonArrayConst>();
-    // tasks = "重写整个任务列表", 每项就是一个名字(纯字符串) ⇒ done 不从 JSON 读: 重写即从"全部未完成"
-    // 重来, 进度一律由 task_done 标记(渲染时才看得出来谁完成)。
-    int n = 0;
-    for (JsonVariantConst it : ta) {
-      if (n >= 8) break;
-      if (!it.is<const char*>()) continue;   // 只认字符串项; 写成对象 {"name":..} 的一律跳过
-      const char* nm = it.as<const char*>();
-      if (!nm || !nm[0]) continue;
-      strncpy(c.s_tasks[n].name, nm, 47); c.s_tasks[n].name[47] = 0;
-      c.s_tasks[n].done = false;
-      n++;
-    }
-    if (n > 0 || c.s_task_n > 0) {
-      c.s_task_n = n; ai::logf("[ai] 任务列表更新(%d项)", c.s_task_n);
-      snprintf(etasks, sizeof(etasks), "已重写(%d项)", c.s_task_n);
-    }
-  }
-  if (cmdD["task_done"].is<JsonArray>()) {
-    // 数组里列出的是任务编号(纯数字, 首项为 1), 一律置完成: 一次可标多项, 越界项静默跳过。
-    char idxs[32] = {0};   // 命中的编号列表: "1、3"
-    for (JsonVariantConst it : cmdD["task_done"].as<JsonArrayConst>()) {
-      int idx = (it | 0) - 1;
-      if (idx < 0 || idx >= c.s_task_n) continue;
-      if (!c.s_tasks[idx].done) ai::logf("[ai] 任务%d → 完成", idx + 1);
-      c.s_tasks[idx].done = true;
-      snprintf(idxs + strlen(idxs), sizeof(idxs) - strlen(idxs), "%s%d", idxs[0] ? "、" : "", idx + 1);
-    }
-    if (idxs[0]) snprintf(etdone, sizeof(etdone), "已完成第%s项", idxs);
-  }
-  { const char* tgoal = cmdD["task_goal"] | "";
-    if (tgoal[0]) {
-      c.goal_set = true;   // ⚠️ 与文案是否变化无关: 原话常与用户发言一字不差, 用 strcmp 判会把它整段吞掉
-      if (strcmp(tgoal, c.goal_now)) {
-        snprintf(c.goal_now, sizeof(c.goal_now), "%s", tgoal);
-        utf8_clamp_tail(c.goal_now);
-        ai::logf("[ai] 目标更新: %s", c.goal_now);
-        snprintf(etgoal, sizeof(etgoal), "已更新");
-      } else {
-        snprintf(etgoal, sizeof(etgoal), "无变化");
-      }
-    } }
-
   // ---------- 逐通道落地(move/arm/light), 汇总主动作/合并串 ----------
   char merge_str[96] = {0};          // 本轮指令回显串(死循环判据 + 结果文本 + 留档), 段间 " / "
   int  merge_n = 0;                  // 已回显几段(决定要不要补分隔符)
@@ -938,8 +883,8 @@ static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap)
 
   // ---------- 反馈 / 历史 / 死循环 ----------
   if (!has_any && !nav_done) {
-    // 空动作轮(只带 observe/task_* 等元数据): wait 语义自理。不再推手机 —— 模型没话说就不打扰用户,
-    // 要说话请走 say; 中止/等待态的告知由 apply_end 兜底, 不依赖模型开不开口。
+    // 空动作轮(没给 move/arm/light 任一键): 不推手机 —— 模型没话说就不打扰用户, 要说话请走 say;
+    // 中止/等待态的告知由 apply_end 兜底, 不依赖模型开不开口。
     c.stall = 0; c.stall_hint = false;
   } else {
     if (has_main && (any_ok || nav_done)) {
@@ -966,54 +911,23 @@ static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap)
   }
   // ---------- AI 决策日志(car 的键) ----------
   {
-    char tob[160] = {0};   // 短摘要: 用了哪些键 + 主动作
+    char tob[160] = {0};   // 短摘要: 用了哪些键
     bool first = true;
-    if (cmdD["observe"].is<JsonArray>()) {
-      JsonArrayConst oa = cmdD["observe"].as<JsonArrayConst>();
-      JsonObjectConst ob = oa.size() > 0 ? oa[0].as<JsonObjectConst>() : JsonObjectConst();
-      snprintf(tob, sizeof(tob), "observe(%s,px%.2f,py%.2f%s)",
-               ob["name"] | "", ob["px"] | 0.0f, ob["py"] | 0.0f,
-               oa.size() > 1 ? ",..." : "");
-      first = false;
-    }
-    if (cmdD["delete"].is<JsonArray>()) {
-      char db[24];
-      snprintf(db, sizeof(db), "delete(%u项)", (unsigned)cmdD["delete"].as<JsonArrayConst>().size());
-      ai::safe_append(tob, sizeof(tob), &first, db);
-    }
     if (has_move && is_mv)  ai::safe_append(tob, sizeof(tob), &first, is_ap ? "approach" : "move");
     if (has_move && is_sp)  ai::safe_append(tob, sizeof(tob), &first, "spin");
     if (has_arm)            ai::safe_append(tob, sizeof(tob), &first, "arm");
     if (has_light)          ai::safe_append(tob, sizeof(tob), &first, "light");
-    if (legacy[0])          ai::safe_append(tob, sizeof(tob), &first, "旧键(已忽略)");
-    ai::logf("[ai工具] car: %s", tob[0] ? tob : "(纯元数据)");
+    ai::logf("[ai工具] car: %s", tob[0] ? tob : "(无动作键)");
   }
 
-  // ---------- 终态门: 旧键 done/goal 仍兼容(新协议走 finish 工具) ----------
-  if (cmdD["done"].is<bool>() && cmdD["done"].as<bool>()) apply_end(c, "done");
-  apply_end(c, cmdD["goal"] | "");
-
   // ---------- 结果文本(car 的返回值) ----------
-  // 逐工具回执: 本轮调了哪个键就带上它的执行结果(是否落地/被拒/记成什么), 按工具表序拼成一条。
   // 车与臂的当前姿态不在这里 —— 由组包时的状态块统一给出。
   PsaBuf rt;
   rt.put("[执行结果]");
   echo_seg(rt, &seg_n, "move", emv);
   echo_seg(rt, &seg_n, "arm", earm);
   echo_seg(rt, &seg_n, "light", elight);
-  echo_seg(rt, &seg_n, "observe", c.obs_echo);   // 只回本轮观测到的物体(不是全部记忆), 供它当场核对
-  c.obs_echo[0] = 0;
-  echo_seg(rt, &seg_n, "delete", edel);
-  echo_seg(rt, &seg_n, "task_note", etnote);
-  echo_seg(rt, &seg_n, "tasks", etasks);
-  echo_seg(rt, &seg_n, "task_done", etdone);
-  echo_seg(rt, &seg_n, "task_goal", etgoal);
   if (seg_n == 0) rt.put(" 本轮无动作");
-  if (legacy[0]) { rt.put("; "); rt.put(legacy); }
-  if (c.obs_warn[0]) { rt.put("; "); rt.put(c.obs_warn); c.obs_warn[0] = 0; }   // 一次性: observe 没记成
-  if (c.stall_hint)
-    rt.put("; 连续几回合重复同一批动作、没有进展: 换个观察角度重认目标(抬/落机械臂、后退或环视), 或 finish 收尾");
-  if (c.wait_note[0]) { rt.put("; "); rt.put(c.wait_note); c.wait_note[0] = 0; }
   snprintf(out, out_cap, "%s", rt.p ? rt.p : "[执行结果] 本轮无动作");
 }
 
@@ -1046,19 +960,163 @@ static void do_say(RoundCtx& c, const char* args, char* out, size_t cap) {
   snprintf(out, cap, "say: 已发送给用户。");
 }
 
-// mem: 纯读 —— 小车全局位姿 + 朝向 + 各物体车头系坐标/屏幕位置/新鲜度(按需查询, 不再每回合推送)。
-static void do_mem(RoundCtx& c, char* out, size_t cap) {
-  int l = snprintf(out, cap, "mem: ");
-  if (l < 0) l = 0;
-  size_t rest = ((size_t)l + 8 < cap) ? cap - (size_t)l : 0;
-  if (rest < 1) rest = 1;        // mem_feed 至少要一个字节写结束符
-  ai::mem_feed(out + l, rest);
+// mem: 物体记忆与车姿态 —— observe 记录 / delete 删除 / 两者都不给 = 查询。
+// 观测必须用**那张图拍摄时**的车位姿换算(基准快照见 RoundCtx::sent_car_*); 查询则给出小车全局位姿与全部记忆。
+static void do_mem(RoundCtx& c, const char* args, char* out, size_t cap) {
+  JsonDocument cmdD(&g_js_alloc);
+  char verr[128];
+  const char* e = ai::validate_cmd(args[0] ? args : "{}", cmdD, verr, sizeof(verr));   // 空参数视作空对象(=查询)
+  if (e) { snprintf(out, cap, "mem: 参数未通过校验(%s), 未执行。", e); return; }
+  bool has_obs = cmdD["observe"].is<JsonArray>();
+  bool has_del = cmdD["delete"].is<JsonArray>();
+  if (!has_obs && !has_del) {   // 空 = 查询: 位姿 + 物体记忆
+    int l = snprintf(out, cap, "mem: ");
+    if (l < 0) l = 0;
+    size_t rest = ((size_t)l + 8 < cap) ? cap - (size_t)l : 1;
+    if (rest < 1) rest = 1;     // mem_feed 至少要一个字节写结束符
+    ai::mem_feed(out + l, rest);
+    return;
+  }
+  char edel[160] = {0};
+  if (has_obs)
+    for (JsonObjectConst ob : cmdD["observe"].as<JsonArrayConst>()) land_observe_one(c, ob);
+  if (has_del)
+    for (JsonVariantConst it : cmdD["delete"].as<JsonArrayConst>()) {
+      if (!it.is<const char*>()) continue;   // 只认字符串名字
+      const char* nm = it.as<const char*>();
+      if (!nm || !nm[0]) continue;
+      bool gone = ai::mem_forget(nm);
+      ai::logf("[ai] 删除物体记忆: %s%s", nm, gone ? "" : "(记忆里没有该物体)");
+      snprintf(edel + strlen(edel), sizeof(edel) - strlen(edel), "%s%s%s%s",
+               edel[0] ? ", " : "", gone ? "已删除" : "记忆里没有", nm, gone ? "的记忆" : "");
+    }
+  // AI 决策日志
+  {
+    char tob[160] = {0}; bool first = true;
+    if (has_obs) {
+      JsonArrayConst oa = cmdD["observe"].as<JsonArrayConst>();
+      JsonObjectConst ob = oa.size() > 0 ? oa[0].as<JsonObjectConst>() : JsonObjectConst();
+      char b1[96];
+      snprintf(b1, sizeof(b1), "observe(%s,px%.2f,py%.2f%s)", ob["name"] | "", ob["px"] | 0.0f, ob["py"] | 0.0f,
+               oa.size() > 1 ? ",..." : "");
+      ai::safe_append(tob, sizeof(tob), &first, b1);
+    }
+    if (has_del) {
+      char b2[24];
+      snprintf(b2, sizeof(b2), "delete(%u项)", (unsigned)cmdD["delete"].as<JsonArrayConst>().size());
+      ai::safe_append(tob, sizeof(tob), &first, b2);
+    }
+    ai::logf("[ai工具] mem: %s", tob[0] ? tob : "(查询)");
+  }
+  // 回执: 本轮观测到的读数 / 没记成的告警 / 删除结果(一次性, 用完即清)
+  PsaBuf rt;
+  rt.put("mem:");
+  int n = 0;
+  echo_seg(rt, &n, "observe", c.obs_echo);
+  echo_seg(rt, &n, "delete", edel);
+  if (c.obs_warn[0]) { rt.put(" | "); rt.put(c.obs_warn); n++; }
+  if (n == 0) rt.put(" 未记录任何内容");
+  c.obs_echo[0] = 0;
+  c.obs_warn[0] = 0;
+  snprintf(out, cap, "%s", rt.p ? rt.p : "mem: 未记录任何内容");
 }
 
-// car: 一批动作/元数据。沿用词表校验 + land_car 的全部落地逻辑(结果文本也由它写)。
+// task: 任务记账(纯记录, 不含动作) —— note 记要点 / todo 重写任务列表 / done 标记已完成项。
+static void do_task(RoundCtx& c, const char* args, char* out, size_t cap) {
+  JsonDocument cmdD(&g_js_alloc);
+  char verr[128];
+  const char* e = ai::validate_cmd(args[0] ? args : "{}", cmdD, verr, sizeof(verr));
+  if (e) { snprintf(out, cap, "task: 参数未通过校验(%s), 未记录。", e); return; }
+  char etnote[24] = {0}, etasks[40] = {0}, etdone[56] = {0};
+  const char* tn = cmdD["note"] | "";
+  if (tn[0]) {
+    if (strcmp(tn, c.task_note)) {
+      strncpy(c.task_note, tn, sizeof(c.task_note) - 1); c.task_note[sizeof(c.task_note) - 1] = 0;
+      utf8_clamp_tail(c.task_note);
+      ai::logf("[ai] 任务笔记: %s", c.task_note);
+      snprintf(etnote, sizeof(etnote), "已更新");
+    } else snprintf(etnote, sizeof(etnote), "无变化");
+  }
+  if (cmdD["todo"].is<JsonArray>()) {
+    // todo = "重写整个任务列表", 每项就是一个名字 ⇒ done 不从 JSON 读: 重写即从"全部未完成"重来。
+    JsonArrayConst ta = cmdD["todo"].as<JsonArrayConst>();
+    int n = 0;
+    for (JsonVariantConst it : ta) {
+      if (n >= 8) break;
+      if (!it.is<const char*>()) continue;   // 只认字符串项
+      const char* nm = it.as<const char*>();
+      if (!nm || !nm[0]) continue;
+      strncpy(c.s_tasks[n].name, nm, 47); c.s_tasks[n].name[47] = 0;
+      c.s_tasks[n].done = false;
+      n++;
+      utf8_clamp_tail(c.s_tasks[n - 1].name);
+    }
+    c.s_task_n = n;
+    ai::logf("[ai] 任务列表更新(%d项)", c.s_task_n);
+    snprintf(etasks, sizeof(etasks), "已重写(%d项)", c.s_task_n);
+  }
+  if (cmdD["done"].is<JsonArray>()) {
+    char idxs[32] = {0};   // 命中的编号列表: "1、3"
+    for (JsonVariantConst it : cmdD["done"].as<JsonArrayConst>()) {
+      int idx = (it | 0) - 1;
+      if (idx < 0 || idx >= c.s_task_n) continue;
+      if (!c.s_tasks[idx].done) ai::logf("[ai] 任务%d → 完成", idx + 1);
+      c.s_tasks[idx].done = true;
+      snprintf(idxs + strlen(idxs), sizeof(idxs) - strlen(idxs), "%s%d", idxs[0] ? "、" : "", idx + 1);
+    }
+    if (idxs[0]) snprintf(etdone, sizeof(etdone), "已完成第%s项", idxs);
+  }
+  {
+    char tob[128] = {0}; bool first = true;
+    if (etnote[0]) ai::safe_append(tob, sizeof(tob), &first, "note");
+    if (etasks[0]) ai::safe_append(tob, sizeof(tob), &first, "todo");
+    if (etdone[0]) ai::safe_append(tob, sizeof(tob), &first, "done");
+    ai::logf("[ai工具] task: %s", tob[0] ? tob : "(无有效键)");
+  }
+  PsaBuf rt;
+  rt.put("task:");
+  int n = 0;
+  echo_seg(rt, &n, "note", etnote);
+  echo_seg(rt, &n, "todo", etasks);
+  echo_seg(rt, &n, "done", etdone);
+  if (n == 0) rt.put(" 未记录任何内容");
+  snprintf(out, cap, "%s", rt.p ? rt.p : "task: 未记录任何内容");
+}
+
+// goal: set 更新最终目标 / finish 结束本次任务(结束语先用 say 发送)。同轮先 set 后 finish。
+static void do_goal(RoundCtx& c, const char* args, char* out, size_t cap) {
+  JsonDocument cmdD(&g_js_alloc);
+  char verr[128];
+  const char* e = ai::validate_cmd(args[0] ? args : "{}", cmdD, verr, sizeof(verr));
+  if (e) { snprintf(out, cap, "goal: 参数未通过校验(%s), 未执行。", e); return; }
+  char eset[24] = {0};
+  const char* g = cmdD["set"] | "";
+  if (g[0]) {
+    c.goal_explicit = true;   // ⚠️ 与文案是否变化无关: 原话常与用户发言一字不差, 用 strcmp 判会把它整段吞掉
+    if (strcmp(g, c.goal_now)) {
+      snprintf(c.goal_now, sizeof(c.goal_now), "%s", g);
+      utf8_clamp_tail(c.goal_now);
+      ai::logf("[ai] 目标更新: %s", c.goal_now);
+      snprintf(eset, sizeof(eset), "已更新");
+    } else snprintf(eset, sizeof(eset), "无变化");
+  }
+  const char* fin = cmdD["finish"] | "";
+  ai::logf("[ai工具] goal: %s%s", eset[0] ? "set" : "(无set)", fin[0] ? fin : "(未 finish)");
+  PsaBuf rt;
+  rt.put("goal:");
+  int n = 0;
+  echo_seg(rt, &n, "set", eset);
+  if (fin[0]) { rt.put(" | [finish] 已结束任务("); rt.put(fin); rt.put(")"); n++; }
+  if (n == 0) rt.put(" 未做任何变更");
+  snprintf(out, cap, "%s", rt.p ? rt.p : "goal: 未做任何变更");
+  if (fin[0]) apply_end(c, fin);
+}
+
+// car: 一批动作。沿用词表校验 + land_car 的全部落地逻辑(结果文本也由它写)。
 static void do_car(RoundCtx& c, const char* args, char* out, size_t cap) {
   JsonDocument cmdD(&g_js_alloc);
-  const char* e = ai::validate_cmd(args, cmdD, c.err_buf, sizeof(c.err_buf));
+  char verr[128];
+  const char* e = ai::validate_cmd(args[0] ? args : "{}", cmdD, verr, sizeof(verr));
   if (e) {
     snprintf(out, cap, "[执行结果] | [car] 参数未通过校验(%s) —— 本次调用没有执行任何动作, 请修正后重新调用 car。", e);
     return;
@@ -1066,40 +1124,59 @@ static void do_car(RoundCtx& c, const char* args, char* out, size_t cap) {
   land_car(c, cmdD, out, cap);
 }
 
-// look: 取 1~2 张画面回喂(看画面的唯一入口)。缺省(不给任何参数)=新拍一张当前画面; zoom=新拍的当前画面
-// 是否走高清中央放大; prev=N=另带上前看过的第 N 张实景做前后对比(1=上一张, 最多 AI_PREV_SLOTS 张; 也认旧的 true=1);
-// user=[N]=另带上用户发送的参考图(1~3, 可多张)。
-// 可组合, 清单最多 2 张(按 "新拍 → prev → user" 顺序取, 多的丢掉)。出图后把裁框写进 pend_* 供下一回合当
-// observe 基准 —— 只有**新拍的实景**才是基准, 纯对照图不动基准。字节归属记到本回合。
+// 渲染「当前可查看图片」一行: 实景帧环 + (本回合新拍、即将进环的 cur) + 用户参考图池, 按编号升序去重。
+// 模型据此挑 look(image=[...]) 的编号 —— 号写死, 不必自己数"还剩几张"。
+static void render_viewable(RoundCtx& c, PsaBuf& rt) {
+  uint32_t ids[AI_PREV_SLOTS + AI_EDITED_SLOTS + 1]; int n = 0;
+  for (int s = 0; s < AI_PREV_SLOTS; s++) if (c.prev_id[s] && c.prev_len[s] > 0) ids[n++] = c.prev_id[s];
+  if (c.look_live && c.cur_id) ids[n++] = c.cur_id;   // 本回合新拍的: 组包后会滚进环, 下回合起可回看
+  for (int s = 0; s < AI_EDITED_SLOTS; s++) if (c.ed_num[s] && c.ed_len[s] > 0) ids[n++] = c.ed_num[s];
+  for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++)
+    if (ids[j] < ids[i]) { uint32_t t = ids[i]; ids[i] = ids[j]; ids[j] = t; }
+  rt.put("当前可查看图片: [");
+  int w = 0;
+  for (int i = 0; i < n; i++) {
+    if (i && ids[i] == ids[i - 1]) continue;   // 排序后去重
+    char t[16];
+    snprintf(t, sizeof(t), "%sImage%u", w++ ? ", " : "", (unsigned)ids[i]);
+    rt.put(t);
+  }
+  rt.put("]");
+}
+
+// look: 取 1~2 张画面回喂(看画面的唯一入口)。缺省(不给任何参数)=新拍一张当前全幅; zoom=新拍是否走高清中央放大;
+// image=[N,...]=回看先前给过的画面(含用户发送的参考图), N 见上一次 look 结果里的「当前可查看图片」。
+// 可组合, 清单最多 2 张(按 "新拍 → image 顺序" 取, 多的丢掉)。出图后把裁框写进 pend_* 供下一回合当
+// observe 基准 —— 只有**新拍的实景**才是基准, 纯回看不动基准。字节归属记到本回合。
 static bool do_look(RoundCtx& c, const char* args, char* out, size_t cap) {
   JsonDocument d(&g_js_alloc);
   if (args[0] && deserializeJson(d, args)) {
-    snprintf(out, cap, "look: 参数不是合法 JSON, 未取画面(可用 {\"zoom\":bool,\"prev\":1~3,\"user\":[1~3]} 的组合)。");
+    snprintf(out, cap, "look: 参数不是合法 JSON, 未取画面(可用 {\"zoom\":bool,\"image\":[编号,...]} 的组合)。");
     return false;
   }
   bool has_zoom = !d["zoom"].isNull();
   bool zoom = d["zoom"] | false;
-  int prev_n = d["prev"].is<bool>() ? (d["prev"].as<bool>() ? 1 : 0) : (int)(d["prev"] | 0);
-  int users[2]; int un = 0;
-  JsonArrayConst ua = d["user"].as<JsonArrayConst>();
-  {
-    int ua_n = (int)ua.size();
-    for (int i = 0; i < ua_n; i++) {
-      int k = ua[i] | 0;
-      if (k >= 1 && k <= AI_EDITED_SLOTS && un < 2) users[un++] = k;
-    }
+  // 回看清单: 按给定顺序的全局编号(去重, 只认正整数)
+  uint32_t want[AI_PREV_SLOTS + AI_EDITED_SLOTS]; int wn = 0;
+  bool truncated = false;
+  JsonArrayConst ia = d["image"].as<JsonArrayConst>();
+  for (JsonVariantConst it : ia) {
+    uint32_t k = (uint32_t)(it | 0);
+    if (k == 0) continue;
+    bool dup = false;
+    for (int j = 0; j < wn; j++) if (want[j] == k) { dup = true; break; }
+    if (dup) continue;
+    if (wn >= (int)(sizeof(want) / sizeof(want[0]))) { truncated = true; break; }
+    want[wn++] = k;
   }
-  bool truncated = (int)ua.size() > un;             // 有图号越界/超量被丢
-  if (prev_n < 0) prev_n = 0;
-  if (prev_n > AI_PREV_SLOTS) { prev_n = AI_PREV_SLOTS; truncated = true; }
-  bool do_live = has_zoom || (!prev_n && un == 0);  // 没点名别的图源, 就默认新拍一张当前画面
+  if ((int)ia.size() > wn) truncated = true;   // 有重复/非法项被丢
+  bool do_live = has_zoom || wn == 0;          // 没点名要回看别的图, 就默认新拍一张当前画面
 
-  // 清单: 顺序 = 结果里的给图顺序(新拍 → prev → user), 最多 2 张。
+  // 清单: 顺序 = 结果里的给图顺序(新拍 → image), 最多 2 张。
   c.look_cnt = 0; c.look_live = false;
   c.look_ids[0] = 0; c.look_ids[1] = 0;
-  char dsc[2][48] = {};
+  char dsc[2][56] = {};
   bool zoomed = false;
-  bool prev_added = false;
   if (do_live) {
     char ln[48] = {0};
     if (!fetch_image(c, zoom, ln, sizeof(ln), &zoomed)) {
@@ -1107,45 +1184,33 @@ static bool do_look(RoundCtx& c, const char* args, char* out, size_t cap) {
       return false;
     }
     c.look_set[c.look_cnt] = RoundCtx::LookImg{ c.cur, c.cur_len };
-    c.look_ids[c.look_cnt] = c.cur_id;                 // 进环的序号在组包后定为 prev1, 记进历史供占位标注
+    c.look_ids[c.look_cnt] = c.cur_id;
     snprintf(dsc[c.look_cnt], sizeof(dsc[0]), "新拍的当前画面(%s)", ln);
     c.look_cnt++; c.look_live = true;
   }
-  if (prev_n && c.look_cnt < 2 && c.prev_len[prev_n - 1] > 0) {
-    c.look_set[c.look_cnt] = RoundCtx::LookImg{ c.prev[prev_n - 1], c.prev_len[prev_n - 1] };
-    c.look_ids[c.look_cnt] = c.prev_id[prev_n - 1];   // 与说明一样不写死编号: 编号随环滚动会变, 由占位现算
-    snprintf(dsc[c.look_cnt], sizeof(dsc[0]), "先前看过的实景");
-    c.look_cnt++; prev_added = true;
-  }
-  for (int i = 0; i < un && c.look_cnt < 2; i++) {
-    int k = users[i];
-    if (k > c.ed_n) { truncated = true; continue; }
-    int slot = c.ed_order[k - 1];
-    const uint8_t* p = (slot >= 0 && slot < AI_EDITED_SLOTS) ? c.ed_img[slot] : nullptr;
-    size_t n = p ? c.ed_len[slot] : 0;
-    if (!p || n == 0 || n > AI_EDITED_IMG_MAX) { truncated = true; continue; }
+  for (int i = 0; i < wn && c.look_cnt < 2; i++) {
+    uint32_t k = want[i];
+    const uint8_t* p = nullptr; size_t n = 0; const char* who = nullptr;
+    for (int s = 0; s < AI_PREV_SLOTS; s++)       // 实景帧环
+      if (c.prev_id[s] == k && c.prev_len[s] > 0) { p = c.prev[s]; n = c.prev_len[s]; who = "先前看过的实景"; break; }
+    if (!p)
+      for (int s = 0; s < AI_EDITED_SLOTS; s++)   // 用户参考图池
+        if (c.ed_num[s] == k && c.ed_len[s] > 0) { p = c.ed_img[s]; n = c.ed_len[s]; who = "用户发送的图片"; break; }
+    if (!p || n == 0 || n > AI_EDITED_IMG_MAX) { truncated = true; continue; }   // 号已超出保留范围
     c.look_set[c.look_cnt] = RoundCtx::LookImg{ p, n };
-    snprintf(dsc[c.look_cnt], sizeof(dsc[0]), "用户发送的第%d张参考图", k);
+    c.look_ids[c.look_cnt] = k;
+    snprintf(dsc[c.look_cnt], sizeof(dsc[0]), "%s", who);
     c.look_cnt++;
   }
   if (c.look_cnt == 0) {
-    snprintf(out, cap, "look: 没有可给的画面(指定的用户参考图不存在或不可用), 未取画面。");
+    snprintf(out, cap, "look: 没有可给的画面(指定编号不在保留范围), 未取画面。");
     return false;
   }
 
-  // 字节归属本回合: 下一回合组包时把清单里的图注入这条 tool 结果(老图只留占位说明)。
+  // 字节归属本回合: 下一回合组包时把清单里的图注入这条 tool 结果(老图只留占位文本)。
   c.img_owner = c.img_tag_n;
   c.img_sent = false;
-  // 整条图的说明(历史占位渲染用)
-  {
-    size_t w = 0;
-    for (int i = 0; i < c.look_cnt; i++) {
-      int m = snprintf(c.look_desc + w, sizeof(c.look_desc) - w, "%s%s", i ? " + " : "", dsc[i]);
-      if (m < 0 || (size_t)m >= sizeof(c.look_desc) - w) break;
-      w += (size_t)m;
-    }
-  }
-  // observe 基准: 只有"新拍的实景"才是基准; 纯对照图不更新(沿用上一次)
+  // observe 基准: 只有"新拍的实景"才是基准; 纯回看不更新(沿用上一次)
   if (c.look_live) {
     c.pend_valid = true;
     c.pend_zoomed = zoomed;
@@ -1165,7 +1230,7 @@ static bool do_look(RoundCtx& c, const char* args, char* out, size_t cap) {
     if (!strcmp(pose, c.zoom_pose)) { if (c.zoom_noop_n < 32000) c.zoom_noop_n++; }
     else { snprintf(c.zoom_pose, sizeof(c.zoom_pose), "%s", pose); c.zoom_noop_n = 1; }
   }
-  // 结果文本: 给了哪几张 + 拍新图时的车/臂状态 + 一次性提示
+  // 结果文本: 给了哪几张 + 拍新图时的提示 + 可回看的编号清单
   PsaBuf rt;
   {
     char t[12];
@@ -1177,40 +1242,17 @@ static bool do_look(RoundCtx& c, const char* args, char* out, size_t cap) {
     snprintf(t, sizeof(t), "第%d张=", i + 1);
     rt.put(t); rt.put(dsc[i]); rt.put("; ");
   }
-  if (truncated) rt.put("(最多 2 张, 多出的图没给); ");
-  if (prev_n && !prev_added) {
-    int avail = 0;
-    for (int i = 0; i < AI_PREV_SLOTS; i++) if (c.prev_len[i] > 0) avail++;
-    char t[72];
-    snprintf(t, sizeof(t), "(prev%d 不存在: 目前只留了最近 %d 张先前实景); ", prev_n, avail);
-    rt.put(t);
-  }
+  if (truncated) rt.put("(最多 2 张, 超出部分已忽略); ");
   if (c.frame_moving) { rt.put(AI_FRAME_MOVING_HINT); rt.put("; "); }
   if (zoomed && c.zoom_noop_n > AI_ZOOM_NOOP_MAX)
-    rt.put("车与机械臂都没动, 而你要的又是同一块放大画面: 画面里不会再出现新信息, 先动一下(转/走/升降臂)或改看全幅; ");
+    rt.put("车与机械臂都没动, 而你要的又是同一块放大画面: 画面里不会再出现新信息, 不妨试试转动一下视角; ");
   if (zoomed) { rt.put(AI_ZOOM_HINT); rt.put("; "); }
-  if (c.look_live) rt.put("新拍的当前画面就是你接下来 observe 报 px/py 的基准。");
-  else rt.put("这些是参照图不是实景: 别用它们报 observe 的 px/py, 要报坐标先新拍一张当前画面。");
+  if (c.look_live) rt.put("新拍的当前画面可以作为 observe 的基准。");
+  else rt.put("这些是参照图不是实景: 不可根据它们使用 observe。");
+  rt.put("\n");
+  render_viewable(c, rt);
   snprintf(out, cap, "%s", rt.p ? rt.p : "look: 已取画面");
   return true;
-}
-
-// finish: 收尾(结束语由 say 负责; result=done/fail/wait 对应旧的 finish/fail/abort)。
-// 本工具不自己推手机: 终态 done 由 round_task_finish 补发, fail 的 error 也走同一出口。
-static void do_finish(RoundCtx& c, const char* args, char* out, size_t cap) {
-  JsonDocument d(&g_js_alloc);
-  if (!args[0] || deserializeJson(d, args)) {
-    snprintf(out, cap, "finish: 参数不是合法 JSON(需要 result), 任务未结束, 请重新调用。");
-    return;
-  }
-  const char* result = d["result"] | "";
-  if (strcmp(result, "done") && strcmp(result, "fail") && strcmp(result, "wait")) {
-    snprintf(out, cap, "finish: result 必须是 done/fail/wait 之一(收到 \"%s\"), 任务未结束。", result);
-    return;
-  }
-  ai::logf("[ai工具] finish: 结果=%s", result);
-  snprintf(out, cap, "finish: 已结束任务(result=%s)。", result);
-  apply_end(c, !strcmp(result, "done") ? "finish" : (!strcmp(result, "fail") ? "fail" : "abort"));
 }
 
 // compact: 压缩历史上下文。此处只记摘要, 真正的清空在本回合的调用全部落地后统一做
@@ -1228,13 +1270,14 @@ static void do_compact(RoundCtx& c, const char* args, char* out, size_t cap) {
   blog::forward_text(blog::AI, sm);
   snprintf(c.compact_sum, sizeof(c.compact_sum), "%s", sm);
   utf8_clamp_tail(c.compact_sum);   // 定长缓冲截断可能切在汉字中间
-  snprintf(out, cap, "compact: 已记录摘要, 本回合结束后清空此前对话(目标/任务列表/笔记/记忆/位姿仍在)。");
+  snprintf(out, cap, "compact: 已记录摘要, 本回合结束后清空此前对话(目标/任务列表/笔记/记忆/位姿仍在; 可回看的旧画面将一并清空)。");
 }
 
 // ---------------- 本回合的工具分发 ----------------
-// 按固定次序 mem → say → car → look → compact → finish 落地(不信任模型给的顺序): mem 只读排最前; say 是纯输出
-// (先说后做, 手机上就是"话在前、动作回执在后"); car 里的 observe 必须用**动作前**的车位姿换算;
-// look 排在 car 之后是有意的(模型同回合要图是想看刚做完动作的效果); compact 收在动作之后、finish 之前。
+// 按固定次序 mem → task → say → car → look → compact → goal 落地(不信任模型给的顺序): mem 的 observe 必须用
+// **动作前**的车位姿换算, 故排最前; task 记账与 say 一样是纯文案(先说后做, 手机上就是"话在前、动作回执在后");
+// car 动作居中; look 排在 car 之后是有意的(模型同回合要图是想看刚做完动作的效果); compact 收在动作之后、
+// goal 之前(goal 的 finish 终结任务, 必须最后)。
 // ⚠️ 模型给出的**每个** tool_call 都必须在历史里留下一条对应结果 —— 少一条就是"孤儿调用"(配对断了), 云端会拒整个请求。
 static void dispatch_calls(RoundCtx& c) {
   JsonArrayConst arr = c.calls["calls"].as<JsonArrayConst>();
@@ -1247,7 +1290,7 @@ static void dispatch_calls(RoundCtx& c) {
     const char* rc = c.calls["reasoning"] | "";
     if (rc[0]) tn->reasoning = ps_dup(rc);
   } else ai::logf("[ai] 历史环不可用, 本回合的调用不记入历史");
-  static const char* kOrder[] = { "mem", "say", "car", "look", "compact", "finish" };
+  static const char* kOrder[] = { "mem", "task", "say", "car", "look", "compact", "goal" };
   const int kOrderN = (int)(sizeof(kOrder) / sizeof(kOrder[0]));
   const int cap_n = n < 16 ? n : 16;   // 超出部分直接不记(assistant 只列我们记下的, 不会产生孤儿)
   bool handled[16] = {false};
@@ -1266,14 +1309,15 @@ static void dispatch_calls(RoundCtx& c) {
     res[0] = 0;
     bool is_look = !strcmp(kOrder[oi], "look");
     bool ok = true;
-    if (!strcmp(kOrder[oi], "mem"))       do_mem(c, res, sizeof(res));
+    if (!strcmp(kOrder[oi], "mem"))       do_mem(c, args, res, sizeof(res));
+    else if (!strcmp(kOrder[oi], "task")) do_task(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "say"))  do_say(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "car"))  do_car(c, args, res, sizeof(res));
     else if (is_look)                     ok = do_look(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "compact")) do_compact(c, args, res, sizeof(res));
-    else                                  do_finish(c, args, res, sizeof(res));
-    hist_add_call(c, id, kOrder[oi], args, res, (is_look && ok) ? c.look_desc : nullptr);
-    if (is_look && ok) {   // 图信息补进刚追加的那条(张数/环序号); 字节下一回合组包时注入
+    else                                  do_goal(c, args, res, sizeof(res));
+    hist_add_call(c, id, kOrder[oi], args, res);
+    if (is_look && ok) {   // 图信息补进刚追加的那条(张数/全局编号); 字节下一回合组包时注入
       HistCall* hc = hist_last_call(c);
       if (hc) {
         hc->img_n = c.look_cnt ? c.look_cnt : 1;
@@ -1290,8 +1334,8 @@ static void dispatch_calls(RoundCtx& c) {
     bool known = false;
     for (int oi = 0; oi < kOrderN; oi++) if (!strcmp(nm, kOrder[oi])) known = true;
     if (known) snprintf(res, sizeof(res), "%s: 本回合重复调用了 %s, 只执行了第一条; 这一条已忽略。", nm, nm);
-    else snprintf(res, sizeof(res), "%s: 未知工具, 未执行(可用: mem/car/look/say/compact/finish)。", nm[0] ? nm : "(无名)");
-    hist_add_call(c, id, nm, args, res, nullptr);
+    else snprintf(res, sizeof(res), "%s: 未知工具, 未执行(可用: mem/task/say/car/look/compact/goal)。", nm[0] ? nm : "(无名)");
+    hist_add_call(c, id, nm, args, res);
   }
   // 压缩放在所有调用落地之后: 本回合的回合已完整记进历史, 才能安全清掉更早的。
   if (c.compact_sum[0] && !c.done) compact_history(c);
@@ -1326,7 +1370,7 @@ static RoundR round_step(RoundCtx& c) {
         if (c.ed_n > 1) {
           char eb[192];
           snprintf(eb, sizeof(eb),
-                   "用户这次共发了 %d 张参考图, 这里只注入最新的一张; 要看其中哪几张可调 look(user=[N])", c.ed_n);
+                   "用户这次共发了 %d 张参考图, 这里只注入最新的一张; 查看其余部分可用 look(image=[编号])", c.ed_n);
           hpush(c.pend_hint, sizeof(c.pend_hint), eb);
         }
       } else if (c.fail) {
@@ -1353,7 +1397,7 @@ static RoundR round_step(RoundCtx& c) {
       return RoundR::ExitTask;
     }
     if (++c.net_fail >= AI_MAX_NET_FAIL) {
-      const char* reason = "云端持续无响应(疑似限流), 任务已中止, 请稍后重试";
+      const char* reason = "云端持续请求失败, 任务已中止, 请稍后重试";
       JsonDocument e(&g_js_alloc);
       e["error"] = reason;
       e["done"] = true;   // 终结必带 done, 让手机端把「中止」复位为「发送」
@@ -1388,8 +1432,8 @@ static RoundR round_step(RoundCtx& c) {
   else if (++c.idle_rounds >= AI_IDLE_ROUNDS) {
     c.idle_rounds = 0;
     hpush(c.pend_hint, sizeof(c.pend_hint),
-          "连续多个回合没有实际动作了: 若画面里找不到目标, 先 fold 收臂, 再小幅 spin 环视(单步≤60°), 每转一次 look 一次; 也可 finish 收尾");
-    ai::logf("[ai] 连续 %d 回合无动作, 提示环视/收尾", AI_IDLE_ROUNDS);
+          "连续多个回合没有实际动作了: 若画面里找不到目标, 建议重新环视搜索");
+    ai::logf("[ai] 连续 %d 回合无动作, 提示环视", AI_IDLE_ROUNDS);
   }
   c.acted = false;
   ai::mem_tick_stale();   // 每回合结束: 未观测的物体过期轮数 +1

@@ -42,16 +42,15 @@ const char* ai::validate_cmd(const char* content, JsonDocument& out, char* err_b
     snprintf(err_buf, err_cap, "AI 返回非 JSON: %s", c.substring(0, 80).c_str());
     return err_buf;
   }
-  // 顶层出现旧单指令格式 type → 拒并给处方: 改用分组 JSON(move/arm/light/zoom 通道)。
+  // 顶层出现旧单指令格式 type → 拒并给处方: 改用分组 JSON(car 的 move/arm/light 通道)。
   if (doc["type"]) {
     snprintf(err_buf, err_cap,
-             "AI 输出了旧版单指令格式(type=%s); 请改用分组 JSON: move/arm/light/zoom 通道(缺席=不动)",
+             "AI 输出了旧版单指令格式(type=%s); 请改用分组 JSON: car 的 move/arm/light 通道(缺席=不动)",
              doc["type"].as<const char*>());
     return err_buf;
   }
-  // 分组通道校验: 出现=本轮该子系统动作, 缺席=不动; move/arm 内部单选, light/zoom 可任意组合。
-  // 逐项跑注册表, **表序 = 执行顺序**(见 tools/registry.cpp): 故同一次返回里有多个非法键时,
-  // 报出的是"最先会落地的那件事"的错 —— 这是本次改动唯一的行为差异, 且只影响报哪一条, 文本不变。
+  // 参数校验: 按工具表逐项跑(**表序 = 校验顺序**, 见 tools/registry.cpp)。car/mem/task/goal 的参数文档
+  // 都过一遍全表, 缺席的键各自的 parse 直接返回 nullptr。故同一次返回里有多个非法键时, 报出的是表里靠前的那个。
   JsonVariantConst root = doc;
   int tn = 0;
   const ai::ToolSpec* ts = ai::tools(&tn);
