@@ -66,22 +66,22 @@ static char b64_at(const uint8_t* in, size_t n, size_t oi) {
 // 严格时会 400。当前实测能过, 故先留着; 若哪天开始 400, 第一件事就是摘掉它。
 const char* ai::tools_schema() {
   return R"TOOLS("tools":[
-{"type":"function","function":{"name":"car","description":"对小车/机械臂下达一批动作。\n每轮至少调用一个工具, 同一种工具最多一次。\n一次 car 调用可同时给多个键(如 move + light 一起做); 各键都可不写, 只给本轮要用的即可。","parameters":{"type":"object","properties":{
-"move":{"type":"object","description":"轮子, 五选一且每次只用一个, 方向已含在 type 里: forward 前进 / backward 后退 → value 填距离 cm, 前进前先确保目标对准; spin_left 原地左转 / spin_right 原地右转 → value 填角度; 微调对准先用比较接近的角度, 如果过头再逐轮砍半角度反向转;\n approach 靠近 → target(物体记忆里的名字, 缺省=最近目标, 如果还未observe可以两个同时使用直接前往目标附近); 只在初次接近较远目标时用, 物体过近时用可能大幅转向","properties":{
+{"type":"function","function":{"name":"car","description":"对小车/机械臂下达一批动作。\n每轮至少调用一个工具, 同一种工具最多一次, 只写本轮要用的即可。","parameters":{"type":"object","properties":{
+"move":{"type":"object","description":"轮子, 五选一且每次只用一个, 方向已含在 type 里: forward 前进 / backward 后退 → value 填距离 cm, 前进前先确保目标对准; spin_left 原地左转 / spin_right 原地右转 → value 填角度;\n approach 靠近 → target(observe时使用的名字, 缺省=最近目标, 如果还未observe请先observe); 一般在初次靠近目标时使用, 会在适当距离自动停下, 目标过近时可能会大幅转向","properties":{
 "type":{"type":"string","enum":["forward","backward","spin_left","spin_right","approach"]},
 
 "value":{"type":"integer","description":"forward/backward: 移动距离, 单位cm(可省略, 默认8); spin_left/spin_right: 旋转角度(可省略, 默认30)"},
 "target":{"type":"string","description":"approach: 记忆里的目标名(可省略, 缺省=最近目标)"}}},
 
 "arm":{"type":"object","description":"机械臂/夹爪, 每次只用一个 type(x/h 仅 pose 有效, 其它时候不写):\nlow 夹爪降到贴地准备位; 目标在画面上不处于[左指]上方时需先后退, 避免压住目标\nraise 抬到高位; 压住物体或物体可能在车头近处时用, 找回目标后应先旋转对准\ngrasp 合爪并抬臂; 夹取目标时用, 之后记得 look 确认是否夹住\nclip / release 合上 / 松开夹爪; 需要手动控制夹取流程时用\nfold 收臂折叠, 避免遮挡; 疑似压住物体或机械臂遮挡视野时用\npose 移动夹爪到指定坐标","properties":{
-"type":{"type":"string","enum":["low","raise","fold","grasp","clip","release","pose"]},"x":{"type":"number","description":"pose: 轴前 cm(4~15)(可省略)"},"h":{"type":"number","description":"pose: 离地 cm(1~12)(可省略)"}}},
+"type":{"type":"string","enum":["low","raise","fold","grasp","clip","release","pose"]},"x":{"type":"number","description":"pose: 轴前 cm(7~13)(可省略)"},"h":{"type":"number","description":"pose: 离地 cm(1~12)(可省略)"}}},
 
 "light":{"type":"object","description":"车灯: front=前灯(白色, 照亮/判断颜色用它) / back=尾灯(红) / vibe=氛围灯(深蓝)","properties":{"kind":{"type":"string","enum":["front","back","vibe"]},"on":{"type":"boolean","description":"开启/关闭"}}}
 }}}},
 
 {"type":"function","function":{"name":"mem","description":"物体记忆与小车姿态: 记录(observe)/删除(delete)目标位置, 或查询当前记忆。\n只给 observe/delete 时按给的内容返回执行回执; 什么都不给(或空对象)=查询小车全局坐标/朝向与已记忆的物体坐标。","parameters":{"type":"object","properties":{
-"observe":{"type":"array","description":"记录/刷新物体记忆的位置(即查询结果里的物体位置), 查看新画面且目标可见时总是使用; px/py 统一填物体底部中心在最新画面上的屏幕坐标(放大图也照常填 0~1, 程序会自动换算); 请勿对着用户参考图或回看的旧图使用observe","items":{"type":"object","properties":{"name":{"type":"string"},"px":{"type":"number"},"py":{"type":"number"}}}},
-"delete":{"type":"array","description":"删除已记忆的物体; 发现重复记录同一物体、或记忆已无用时的清理","items":{"type":"string"}}
+"observe":{"type":"array","description":"记录/刷新物体记忆的位置(即查询结果里的物体位置), 查看新画面且目标可见时可用用于检查位置, 在检查物体记忆前建议先observe; px/py 统一填物体底部中心在最新画面上的屏幕坐标(放大图也照常填 0~1, 程序会自动换算); 请勿对着用户参考图或回看的旧图使用observe","items":{"type":"object","properties":{"name":{"type":"string"},"px":{"type":"number"},"py":{"type":"number"}}}},
+"delete":{"type":"array","description":"删除已记忆的物体; 发现重复记录同一物体或记忆已无用时可用","items":{"type":"string"}}
 }}}},
 
 {"type":"function","function":{"name":"task","description":"任务记账(纯记录, 不含动作): note 记要点 / todo 重写任务列表 / done 标记已完成项。","parameters":{"type":"object","properties":{
@@ -95,9 +95,9 @@ const char* ai::tools_schema() {
 "finish":{"type":"string","enum":["done","fail","wait"],"description":"结束本次任务: done=已完成 / fail=目标已不可能达成 / wait=中止并等待用户输入(用户未回复则继续原任务)"}
 }}}},
 
-{"type":"function","function":{"name":"look","description":"查看最多两个画面: 默认新拍一张当前全幅画面, 可叠加放大或回看先前给过的画面, 最多两张(超出的忽略); 可回看的图片会显示在结果里的「当前可查看图片」, 具体对应的什么时候的画面见工具调用的历史; 历史消息中的旧图会退化成占位符; 动作结果与预期一致时直接继续。查询记忆用 mem, 本工具只管取画面。","parameters":{"type":"object","properties":{
-"zoom":{"type":"boolean","description":"新拍一张当前实景画面, 并选择是否为放大版, 放大画面只能看见(0.25,0.25)至(0.75,0.75)的中央区域; 放大画面仅在检查[目标物体]是否可以被夹取时用, 普通的对准及其它场景用普通画面已足够; 目标不在夹爪附近时使用不放大的画面更合适"},
-"image":{"type":"array","description":"回看先前给过的画面(含用户发送的参考图), 填编号数组; 编号见上一次 look 结果里的「当前可查看图片」, 不要凭空写编号; 与新拍画面合计最多 2 张, 超出的会被忽略, 编号已超出保留范围的会被告知","items":{"type":"integer"}}
+{"type":"function","function":{"name":"look","description":"查看最多两个画面: 新拍一张当前全幅画面, 或回看先前给过的画面, 最多两张; 可回看的图片会显示在结果里的「当前可查看图片」编号与先前工具调用结果中的占位符对应; 历史消息中的旧图会退化成占位符","parameters":{"type":"object","properties":{
+"zoom":{"type":"boolean","description":"新拍一张当前实景画面, 并选择是否为放大版, 放大画面只能看见(0.25,0.25)至(0.75,0.75)的中央区域; 放大画面仅在检查[目标物体]是否可以被夹取时用; 一般情况下用全幅画面即可, 需要确认夹爪附近情况再放大"},
+"image":{"type":"array","description":"回看先前给过的画面(含用户发送的参考图), 填编号数组","items":{"type":"integer"}}
 }}}},
 
 {"type":"function","function":{"name":"compact","description":"压缩历史上下文: 对话轮数变多时(状态块会提醒)用一段摘要概括此前进展; 调用后更早的对话被清空, 只留这条摘要开始的后续部分。目标/任务列表/任务笔记/物体记忆/车位姿都不受影响, 但可回看的旧画面(含用户参考图)会一并清空, 要看东西需重新 look","parameters":{"type":"object","properties":{
@@ -174,24 +174,21 @@ static constexpr char kSysSrc[] = R"PROMPT(
 	- [左指]右边的纯黑色立方体是夹爪的舵机, 右指被其遮挡。左右指在松爪时两指间距宽约3cm, 同[夹爪]在画面上的宽度
 
 # 状态判定
-	- 物体对准及夹取判定
+	- 物体对准及夹取判定:
 		+ if (先前判定为[夹住] && 期间未松爪): 已[夹住]
 		+ elif (需要夹取目标 && 目标物体未进入[夹爪前端]): 若夹爪下没有其它物体可以先arm low方便对准
 		+ else:
 			* switch(目标在画面上处于[左指]的):
 				- case 正上方:
 					+ if (arm处于low姿态): 已[对准]
-					+ else: 未[对准]
+					+ else: 未[对准], 需要旋转对准
 				- case 水平正右方(需要重合部分接近左指一半高):
-					+ if ([目标物体]与左指接触或有重合部分 && 目标物体进入[夹爪前端]):
+					+ if ([目标物体]与左指接触 && 目标物体进入[夹爪前端]):
 						* if (夹爪高度与[目标物体]所在高度不匹配): 可以先arm low, 然后不断抬高夹爪高度并用一两厘米的前进量尝试宽度是否匹配, 比如从(8, 4)的夹爪高度不断试到(8, 10)
 						* elif (夹爪未合): 可以grasp夹取
 						* elif (夹爪已合 && (前后画面对比后, 确认物体跟随夹爪移动 || 旋转或抬落机械臂时仍处于当前状态)): 已[夹住][目标物体]
 				- case 正下方:
 					+ if (arm低于5): (夹爪是否已合)?夹爪[过低]:目标物体[过近]
-					+ else: 若已[夹住]物体, 且目标指的是放置点, 那么此时可以放下物体
-				- case 下方:
-					+ if (arm低于5): [过近]或夹爪[过低]
 					+ else: 若已[夹住]物体, 且目标指的是放置点, 那么此时可以放下物体
 				- default: 可能为 偏左/偏右/过近 , 需要先对准
 
@@ -199,10 +196,18 @@ static constexpr char kSysSrc[] = R"PROMPT(
 	- look的使用时机:
 		+ 在 grasp或者clip之前先检查物体是否在合适的位置, 同时夹取后也可以方便对比前后帧确认是否夹住, 其它单步动作通常情况下无需带上上一帧
 		+ 在观察完一次画面后, 下次查看可以在一系列动作结束后, 比如执行完 前进, 右转, 降臂 后再带上先前帧确认当前位置
-	- 需要夹取物体时: 如果夹爪高度大于2且[左指]正下方无其它物体, 那么可以先arm low方便对准和避免遮挡; 如果目标位置偏右或被机械臂遮挡, 可以考虑右转; 如果需要旋转且当前夹爪高度可能撞到物体, 那么建议先后退; 如果arm low之后物体被遮挡, 建议后退再重试
-	- 观察目标时: 如果机械臂高度较高造成遮挡可以先arm low或fold
-	- 未发现目标时, 可原地旋转搜索目标, 每步旋转不超过60度以免错过, 期间可以用observe标注一些开阔地带的位置, 旋转一周后仍未发现目标可前往开阔地带重新搜索
-	- 放置物体时: 可以在抬高物体的情况下, 到达放置点后再降臂、松爪以及后退收臂, 避免物体掉落后滚远, 同时后退方便确认结果; 如果放置点的大小距离和方向都不好准确确定, 那么可以不断小步靠近同时微调对准, 机械臂抬得够高的情况下只用考虑会不会撞到车头; 因为相机固定于小车左后方, 因此左侧近处视野较好, 近距离操作对准放置点时先右转将其转到左侧再调整可能会比较轻松; 一般情况下放置物体时使用zoom没什么用
+	- 观察或搜寻目标时: 
+		+ 如果机械臂高度较高造成遮挡可以先arm low或fold, 如果arm low之后物体被遮挡, 此时可能距离太近, 建议适当后退
+		+ 可原地旋转搜索目标, 每步旋转不超过60度以免错过, 期间可以用observe标注一些开阔地带的位置, 旋转一周后仍未发现目标可前往开阔地带重新搜索
+	- 需要夹取物体时:
+		+ 如果夹爪高度大于2且[左指]正下方无其它物体, 那么可以先arm low方便对准和避免遮挡
+		+ 如果上一轮执行了后退, 那么本轮应当旋转对准而不是重新前进, 重新前进不能帮助你对准
+		+ 微调对准先用比较接近的角度, 如果过头再逐轮砍半角度反向转
+	- 需要放置物体时:
+		+ 可以在抬高物体的情况下, 到达放置点后再降臂、松爪以及后退收臂, 避免物体掉落后滚远, 同时后退或者右转方便确认结果
+		+ 如果放置点的大小距离和方向都不好准确确定, 那么可以不断小步靠近同时微调对准, 机械臂抬得够高的情况下只用考虑会不会撞到车头
+		+ 因为相机固定于小车左后方, 因此左侧近处视野较好, 近距离操作对准放置点时先右转将其转到左侧再调整可能会比较轻松
+		+ 最好把目标放置区域的中心位置视为放置点, 避免对准边界时物体滚出区域
 	- 当用户发送图片时: 请注意及时查看, 需要的话注意更新任务备注, 避免图片在 compact 之后无法查看
 )PROMPT";
 static constexpr auto kSysEsc = esc_make(kSysSrc);
@@ -257,7 +262,7 @@ int PieceStream::read() {
 }
 
 int PieceStream::peek() {
-  if (done_ >= l_.total) return -1;
+  if (done_ >= l_.total || idx_ >= l_.n) return -1;   // idx_ 越界: 碎片数与 total 不一致时别读野指针
   const Piece& pc = l_.it[idx_];
   return pc.kind == Piece::TEXT ? (int)(uint8_t)pc.p[off_] : (int)(uint8_t)b64_at(pc.p, pc.n, off_);
 }
