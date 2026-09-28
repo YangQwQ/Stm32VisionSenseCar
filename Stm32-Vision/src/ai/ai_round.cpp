@@ -16,6 +16,8 @@
 #include "src/exec/direct_exec.h"
 #include "src/core/board_log.h"
 #include "src/core/heap_watch.h"   // 内部堆水位哨兵(诊断 WiFi 收发哑掉的第一现场)
+#include "src/core/utf8.h"         // utf8_clamp_tail: 定长缓冲按字节截断后的边界回退
+#include "src/core/psram.h"        // ps_dup/ps_set/ps_free/ps_str: 变长文本按实际长度分配
 
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
@@ -123,7 +125,7 @@ struct RoundCtx {
   bool frame_moving = false;        // 首帧抓取时车/臂仍在动 → 提示别硬信本帧
   const uint8_t* frame = nullptr;   // 本回合由程序注入尾部 user 的那张图(首轮; 发过一次即清)
   size_t frame_len = 0;
-  char frame_note[64] = {0};        // 尾部画面的文本前缀(空=本回合不注入尾部画面)
+  char frame_note[128] = {0};       // 尾部画面的文本前缀(空=本回合不注入尾部画面); 固定文案本身就 ~65B
   bool img_sent = false;            // 本回合 look 出的一组图是否已随请求发出去过(发过就只留占位文本)
   JsonDocument calls{&g_js_alloc};  // 本回合从响应里取出的工具调用(raw: id/name/args)
 
@@ -160,12 +162,14 @@ struct RoundCtx {
   bool wait_user = false;           // finish result="wait" 的等待态
   uint64_t wait_until = 0;          // 等待截止(ms, esp_timer)
 
-  // 备注/列表/目标
-  char task_note[192] = {0};        // AI 写入的任务笔记, 随 car 结果喂回
-  struct TaskItem { char name[48]; bool done; };
-  TaskItem s_tasks[8] = {};         // AI 维护的任务列表
+  // 备注/列表/目标 —— 这三段长度全是"写入那一刻才知道"(模型当场给), 所以一律按实际长度分配到
+  // PSRAM(见 src/core/psram.h), **不设字数上限**, 也就不存在切断残尾变 '?' 的问题;
+  // 收尾时在 round_task_finish 统一释放。RoundCtx 本身反而因此变小了(定长数组 → 指针)。
+  char* task_note = nullptr;        // AI 写入的任务笔记, 随 car 结果喂回
+  struct TaskItem { char* name; bool done; };
+  TaskItem* s_tasks = nullptr;      // 任务列表: 单块 PSRAM(数组 + 名字区), 每次 todo 重写整体替换
   int s_task_n = 0;
-  char goal_now[256] = {0};         // 当前任务目标(可被 goal.set 热替换)
+  char* goal_now = nullptr;         // 当前任务目标(可被 goal.set 热替换)
   bool goal_explicit = false;       // AI 是否已显式 goal.set 过(≠"文案变了": 它常把用户原话原样写回来)
   char compact_sum[512] = {0};      // compact 工具给的进展摘要: 本回合落地跑完后据此压缩历史(见 compact_history)
 
@@ -186,12 +190,52 @@ struct RoundCtx {
   float to_full_y(float py) const { return sent_zoomed ? sent_y0 + py * (sent_y1 - sent_y0) : py; }
 };
 
-// 拷贝到 PSRAM(历史条目用)
-static char* ps_dup(const char* s) {
-  size_t n = strlen(s);
-  char* p = (char*)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
-  if (p) memcpy(p, s, n + 1);
-  return p;
+// ps_dup / ps_set / ps_free / ps_str 见 src/core/psram.h(ai_mem 也要用同一套, 见那里的头注)。
+// 本文件的历史环、任务列表、笔记、目标都靠它按实际长度分配。
+
+// ---------------- 任务列表(PSRAM 单块) ----------------
+// 整块布局 = [TaskItem 数组][各名字的字符区], 一次 malloc / 一次 free。
+// 不按条分配: N 条 N 次小分配会把 PSRAM 也切碎(和内部堆一个道理)。
+static void task_list_free(RoundCtx& c) {
+  free(c.s_tasks);          // 名字就在同一块尾部, 一次放掉
+  c.s_tasks = nullptr;
+  c.s_task_n = 0;
+}
+
+// 用 todo 数组整份替换任务列表(空数组 = 清空)。**项数不设上限**。
+// 分配失败返回 false 且保留原列表 —— 调用方据此回一句"内存不足, 列表未更新", 让模型精简后重写;
+// 绝不能默默丢掉后半截(那会让模型以为自己写了 10 条、实际只跑 8 条)。
+static bool task_list_replace(RoundCtx& c, JsonArrayConst ta) {
+  int n = 0;
+  size_t names = 0;
+  for (JsonVariantConst it : ta) {
+    if (!it.is<const char*>()) continue;      // 只认字符串项
+    const char* nm = it.as<const char*>();
+    if (!nm || !nm[0]) continue;
+    n++;
+    names += strlen(nm) + 1;
+  }
+  if (n == 0) { task_list_free(c); return true; }   // 重写成空表: 合法
+  char* blob = (char*)heap_caps_malloc((size_t)n * sizeof(RoundCtx::TaskItem) + names, MALLOC_CAP_SPIRAM);
+  if (!blob) return false;
+  RoundCtx::TaskItem* arr = (RoundCtx::TaskItem*)blob;
+  char* pool = blob + (size_t)n * sizeof(RoundCtx::TaskItem);
+  int k = 0;
+  for (JsonVariantConst it : ta) {
+    if (!it.is<const char*>()) continue;
+    const char* nm = it.as<const char*>();
+    if (!nm || !nm[0]) continue;
+    size_t l = strlen(nm);
+    memcpy(pool, nm, l + 1);
+    arr[k].name = pool;
+    arr[k].done = false;
+    pool += l + 1;
+    k++;
+  }
+  task_list_free(c);   // 新的已建好, 再放旧的(失败时不动旧列表)
+  c.s_tasks = arr;
+  c.s_task_n = k;
+  return true;
 }
 
 // 释放一个回合里的所有字符串(淘汰/收尾共用)
@@ -209,9 +253,11 @@ static void hist_free_turn(HistTurn& tn) {
 static HistTurn* hist_new_turn(RoundCtx& c) {
   if (!c.hist) return nullptr;
   if (c.hist_n >= AI_HIST_MAX_TURNS) {   // 兜底淘汰最旧整回合(正常路径应由 compact 先清)
-    if (c.hist[0].chat && !c.hist[0].origin && c.hist[0].text)   // 任务起点的目标不提醒(原话常驻目标消息)
+    if (c.hist[0].chat && !c.hist[0].origin && c.hist[0].text) {  // 任务起点的目标不提醒(原话常驻目标消息)
       snprintf(c.task_remind, sizeof(c.task_remind),
                "较早的一条用户消息即将被历史丢弃; 若它表达了新任务/新目标而你还未用 goal 的 set 更新, 请现在更新。");
+      utf8_clamp_tail(c.task_remind);
+    }
     hist_free_turn(c.hist[0]);
     memmove(c.hist, c.hist + 1, (AI_HIST_MAX_TURNS - 1) * sizeof(HistTurn));
     memset(&c.hist[AI_HIST_MAX_TURNS - 1], 0, sizeof(HistTurn));
@@ -285,24 +331,8 @@ static void compact_history(RoundCtx& c) {
   ai::logf("[ai] 历史已压缩, 保留摘要与本回合共 2 条; 可回看画面已作废");
 }
 
-// 裁剪字符串尾部的残缺 UTF-8 序列: 固定缓冲截断常切在汉字中间, 残留半个字节会让云端判
-// "invalid unicode code point" 400。原地修改; 合法 UTF-8 输入不受影响。
-static void utf8_clamp_tail(char* buf) {
-  size_t n = strlen(buf), e = n, ncont = 0;
-  while (e > 0) {
-    unsigned char ch = (unsigned char)buf[e - 1];
-    if ((ch & 0xC0) == 0x80) { e--; ncont++; continue; }        // 续字节: 继续回退
-    int need;
-    if (ch < 0x80) break;                                       // ASCII 结尾: 完整
-    else if ((ch & 0xE0) == 0xC0) need = 1;
-    else if ((ch & 0xF0) == 0xE0) need = 2;
-    else if ((ch & 0xF8) == 0xF0) need = 3;
-    else break;                                                 // 非法引导字节: 不动
-    if (ncont < need) e--;                                      // 续字节不足: 连同引导字节一起删
-    break;
-  }
-  if (e != n) buf[e] = 0;
-}
+// utf8_clamp_tail 已提到 src/core/utf8.h(ai_client / ai_mem 也要用, 否则各写各的必漏 —— 插话缓冲与
+// 物体名两处就是这么漏掉 clamp 的)。这里只 include, 调用点写法不变。
 
 // 剥掉状态行里跟在 "cm" 后的舵机 PWM(如 "前10cm(200)" → "前10cm"): 这些 PWM 只给人工校准机械臂
 // 用, 对 AI 是纯噪声且紧挨真实距离易被误读。只认 "cm(" 前缀, 不碰诊断里的坐标括号。原地压缩。
@@ -324,6 +354,7 @@ static void hpush(char* buf, size_t cap, const char* s) {
   size_t l = strlen(buf);
   if (l) { if (l + 2 >= cap) return; buf[l++] = ';'; buf[l++] = ' '; }
   snprintf(buf + l, cap - l, "%s", s);
+  utf8_clamp_tail(buf);   // 放不下时 snprintf 会切在半个汉字上 → 回退到边界(否则喂给模型的是个 '?')
 }
 
 // ---------------- 结果文本构建 ----------------
@@ -366,6 +397,35 @@ static void notify_tool(RoundCtx& c, const char* text) {
   char buf[512];
   serializeJson(d, buf, sizeof(buf));
   ai::enqueue_result(buf, c.t.fn, c.t.ctx);
+}
+
+// 推一份「任务面板」快照给手机(聊天区顶部悬浮任务条的数据源):
+// {type:"ai_task",params:{state,round,goal?,note?,tasks:[{name,done}]}}。
+// 与 ai_tool 同一条结果队列, 但**只在列表/目标/终态变化时推** —— 任务列表只进过模型上下文和日志,
+// 手机端此前拿不到; 逐回合推则会把深度 8 的结果队列挤满, 也把面板刷成流水。
+// state: running | wait(等你输入) | done | fail | abort —— 手机端据此定标题色与"结束后是否保留"。
+// ⚠️ 纯 BLE(无 WS)时这条会撞 GATT 通知的长度上限被截断 —— 面板那时不更新, 任务本身照跑(与 ai_tool 同命)。
+static void notify_tasks(RoundCtx& c, const char* state) {
+  JsonDocument d(&g_js_alloc);
+  d["type"] = "ai_task";
+  d["params"]["state"] = state;
+  d["params"]["round"] = (long)c.steps;
+  if (ps_str(c.goal_now)[0]) d["params"]["goal"] = c.goal_now;
+  if (ps_str(c.task_note)[0]) d["params"]["note"] = c.task_note;
+  JsonArray ta = d["params"]["tasks"].to<JsonArray>();
+  for (int i = 0; i < c.s_task_n; i++) {
+    JsonObject it = ta.add<JsonObject>();
+    it["name"] = c.s_tasks[i].name;
+    it["done"] = c.s_tasks[i].done;
+  }
+  // 按实际长度在 PSRAM 上开临时块序列化, 不用定长栈缓冲: 长度随列表/笔记增长, 固定缓冲迟早会切在
+  // 半个字或半个 JSON 上(前者变 '?', 后者直接让手机端 **整条丢弃**, 表现为面板忽然不更新)。
+  // enqueue_result 内部立刻拷走一份, 所以这里序列化完就可以 free。
+  size_t need = measureJson(d) + 1;
+  char* buf = (char*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
+  if (!buf) return;
+  if (serializeJson(d, buf, need) > 0) ai::enqueue_result(buf, c.t.fn, c.t.ctx);
+  free(buf);
 }
 
 // 兜底 stop(任务终结出口统一解析一次)。stop_mode 由打断方写入: None=手动 move/stop 接管(不补停);
@@ -413,8 +473,10 @@ static void round_task_init(RoundCtx& c) {
   // 打印实际端点/模型, 便于排查 404/401 等云端拒绝(配错路径是常见原因)
   ai::logf("[ai] 端点=%s 模型=%s key=%s", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
                 cfg::ai_key().isEmpty() ? "空" : "已配置");
-  // 当前任务目标(独立 user 消息展示; 可被 goal.set 热替换)
-  snprintf(c.goal_now, sizeof(c.goal_now), "%s", c.t.text ? c.t.text : "");
+  // 当前任务目标(独立 user 消息展示; 可被 goal.set 热替换)。按原话长度分配, 不设上限;
+  // 分配失败就留空(手机端标题退化成"AI 任务"), 不影响任务本身继续跑。
+  if (!ps_set(c.goal_now, c.t.text))
+    ai::logf("[ai] 警告: 目标文本分配失败(PSRAM 不足), 状态块里将没有目标");
   // 历史环表(PSRAM): 一回合一条, 内含 1~AI_HIST_CALL_MAX 个工具调用。放 PSRAM 是因为它比 RoundCtx
   // 本身还大(数十回合 × 数个调用), 而 RoundCtx 按值建在 worker 那 16KB 栈上, 塞不下。
   c.hist = (HistTurn*)heap_caps_malloc(AI_HIST_MAX_TURNS * sizeof(HistTurn), MALLOC_CAP_SPIRAM);
@@ -429,6 +491,8 @@ static void round_task_init(RoundCtx& c) {
   // 副本, 并与实景帧统一编号(各槽 ed_num), 供 look 按编号回看。
   c.ed_n = ai::edited_snapshot(c.ed_img, c.ed_len, AI_EDITED_SLOTS);
   for (int i = 0; i < AI_EDITED_SLOTS; i++) if (c.ed_img[i] && c.ed_len[i]) c.ed_num[i] = img_next_id();
+  // 任务起点先挂一张空面板: 此刻只有目标(用户原话), 列表等 AI 调 task 补。手机端由此知道"有任务在跑"。
+  notify_tasks(c, "running");
 }
 
 // ---------------- 回合入口检查(中断 / 掉线 / 等待态) ----------------
@@ -440,6 +504,7 @@ static PrepR prep_gate(RoundCtx& c) {
 
   // finish result="wait" 的等待态: 不取帧、不发云端请求, 只等用户回复(→继续执行)或超时(→告知"未回复"再继续)。
   // 用户改发新目标 / 手动接管 / ai_cancel 都会换代际号, 由上面的中断检查与本块内的检查兜住。
+  bool was_wait = c.wait_user;
   while (c.wait_user) {
     if (c.t.generation != ai::generation()) { c.interrupted = true; break; }
     bool replied = ai::chat_pending();   // 只看不动: 回复留给正常流程消费成 user 消息
@@ -447,12 +512,15 @@ static PrepR prep_gate(RoundCtx& c) {
     if ((uint64_t)(esp_timer_get_time() / 1000) >= c.wait_until) {
       snprintf(c.wait_note, sizeof(c.wait_note),
                "你上回合请求中止并等待用户输入, 已超时(用户未回复); 请继续执行原任务");
+      utf8_clamp_tail(c.wait_note);
       blog::logf(blog::AI, "等待用户输入超时(用户未回复), 告知 AI 继续执行");
       c.wait_user = false;
       break;
     }
     vTaskDelay(pdMS_TO_TICKS(AI_WAIT_USER_POLL_MS));
   }
+  // 等待结束(用户回话 / 超时): 面板从"等你输入"回到"进行中" —— 否则它会一直挂着等你, 而 AI 其实已继续。
+  if (was_wait && !c.wait_user && !c.interrupted) notify_tasks(c, "running");
   if (c.interrupted) { blog::logf(blog::AI, "等待用户输入期间被新目标/手动中断"); return PrepR::Interrupted; }
   return PrepR::Ok;
 }
@@ -696,25 +764,34 @@ static void land_observe_one(RoundCtx& c, JsonObjectConst ob) {
     }
   } else {
     ai::logf("[ai] 观测「%s」未给 px/py, 未记录位置", nm);
-    if (!c.obs_warn[0])
+    if (!c.obs_warn[0]) {
       snprintf(c.obs_warn, sizeof(c.obs_warn),
                "上轮 observe 的「%s」没给 px/py, 位置未记录; px/py 填目标底部中心在画面上的坐标(0~1)后再对准",
                nm);
+      utf8_clamp_tail(c.obs_warn);   // 名字顶到上限时会把尾巴切在半个字上
+    }
   }
-  if (!rec && !c.obs_warn[0])   // 可见却没记成: 回告, 否则 AI 以为已锁定而实际记忆为空
+  if (!rec && !c.obs_warn[0]) {  // 可见却没记成: 回告, 否则 AI 以为已锁定而实际记忆为空
     snprintf(c.obs_warn, sizeof(c.obs_warn),
              "上轮 observe 的「%s」没记进记忆(px/py 越界或解算失败), 位置仍未知; 请据当前画面重新确认后再 observe",
              nm);
+    utf8_clamp_tail(c.obs_warn);
+  }
 }
 
-// 渲染任务列表一行: "任务列表: 1.出门[完成] 2.右转[未完成] " (空列表则空串)
-static void render_tasks(RoundCtx& c, char* buf, size_t cap) {
-  buf[0] = 0;
+// 渲染任务列表: "任务列表: 1.出门[完成] 2.右转[未完成] " (空列表则不写)。
+// 直接写进状态块缓冲, 不再过定长中转 —— 中转一满就会**静默丢掉后面的项**, 模型只看到自己列表的
+// 前半截, 却以为整份都在, 后面的步骤就不做了(名字本身在写入时已做过边界回退, 这里可整段直拼)。
+static void render_tasks(RoundCtx& c, PsaBuf& b) {
   if (c.s_task_n <= 0) return;
-  int tp2 = snprintf(buf, cap, "任务列表: ");
-  for (int ti = 0; ti < c.s_task_n && tp2 < (int)cap - 48; ti++)
-    tp2 += snprintf(buf + tp2, cap - tp2, "%d.%s[%s] ",
-                    ti + 1, c.s_tasks[ti].name, c.s_tasks[ti].done ? "完成" : "未完成");
+  b.put("任务列表: ");
+  for (int ti = 0; ti < c.s_task_n; ti++) {
+    char idx[8];
+    snprintf(idx, sizeof(idx), "%d.", ti + 1);
+    b.put(idx);
+    b.put(c.s_tasks[ti].name);
+    b.put(c.s_tasks[ti].done ? "[完成] " : "[未完成] ");
+  }
 }
 
 // 每轮现拼的"任务状态块"(车/臂基础状态 + 目标/列表/笔记/提醒): 组包时挂到本轮最后一条工具结果尾部。
@@ -731,11 +808,10 @@ static void build_state_block(RoundCtx& c, PsaBuf& b) {
   for (int i = 0; i < c.hist_n; i++) if (c.hist[i].origin) { has_origin = true; break; }
   b.put("\n任务目标: ");
   if (!c.goal_explicit && has_origin) b.put("暂未设置, 请根据用户发言更新");
-  else b.put(c.goal_now);
+  else b.put(ps_str(c.goal_now));
   if (c.t.ann && c.t.ann[0]) { b.put(" (操作者标注: "); b.put(c.t.ann); b.put(")"); }
-  char ts[320]; render_tasks(c, ts, sizeof(ts));
-  if (ts[0]) { b.put("\n"); b.put(ts); }
-  if (c.task_note[0]) { b.put("\n任务笔记: "); b.put(c.task_note); }
+  if (c.s_task_n > 0) { b.put("\n"); render_tasks(c, b); }
+  if (ps_str(c.task_note)[0]) { b.put("\n任务笔记: "); b.put(c.task_note); }
   if (c.task_remind[0]) { b.put("\n注意: "); b.put(c.task_remind); }
   // 提示与工具无关, 统一挂在这里(动作类工具的结果只讲"这次动作发生了什么")。
   if (c.stall_hint) {
@@ -776,6 +852,7 @@ static void apply_end(RoundCtx& c, const char* fin_v) {
     JsonDocument f(&g_js_alloc); f["reason"] = wt;
     String fb = build_feedback(c.t.id, f);
     ai::enqueue_result(fb.c_str(), c.t.fn, c.t.ctx);
+    notify_tasks(c, "wait");   // 面板转"等你输入": 不提示的话用户不知道 AI 在等他回话
   } else if (!strcmp(fin_v, "fail")) {
     c.fail = "AI 判定执行失败";
     c.done = true;
@@ -1075,30 +1152,20 @@ static void do_task(RoundCtx& c, const char* args, char* out, size_t cap) {
   char etnote[24] = {0}, etasks[40] = {0}, etdone[56] = {0};
   const char* tn = cmdD["note"] | "";
   if (tn[0]) {
-    if (strcmp(tn, c.task_note)) {
-      strncpy(c.task_note, tn, sizeof(c.task_note) - 1); c.task_note[sizeof(c.task_note) - 1] = 0;
-      utf8_clamp_tail(c.task_note);
-      ai::logf("[ai] 任务笔记: %s", c.task_note);
-      snprintf(etnote, sizeof(etnote), "已更新");
+    if (strcmp(tn, ps_str(c.task_note))) {
+      if (ps_set(c.task_note, tn)) {   // 按实际长度分配, 无上限
+        ai::logf("[ai] 任务笔记: %s", c.task_note);
+        snprintf(etnote, sizeof(etnote), "已更新");
+      } else snprintf(etnote, sizeof(etnote), "内存不足");   // 明说, 让模型精简后重写
     } else snprintf(etnote, sizeof(etnote), "无变化");
   }
   if (cmdD["todo"].is<JsonArray>()) {
     // todo = "重写整个任务列表", 每项就是一个名字 ⇒ done 不从 JSON 读: 重写即从"全部未完成"重来。
-    JsonArrayConst ta = cmdD["todo"].as<JsonArrayConst>();
-    int n = 0;
-    for (JsonVariantConst it : ta) {
-      if (n >= 8) break;
-      if (!it.is<const char*>()) continue;   // 只认字符串项
-      const char* nm = it.as<const char*>();
-      if (!nm || !nm[0]) continue;
-      strncpy(c.s_tasks[n].name, nm, 47); c.s_tasks[n].name[47] = 0;
-      c.s_tasks[n].done = false;
-      n++;
-      utf8_clamp_tail(c.s_tasks[n - 1].name);
-    }
-    c.s_task_n = n;
-    ai::logf("[ai] 任务列表更新(%d项)", c.s_task_n);
-    snprintf(etasks, sizeof(etasks), "已重写(%d项)", c.s_task_n);
+    // 项数与各项长度当场已知 ⇒ 一次分配到 PSRAM, 既无项数上限也无字数上限。
+    if (task_list_replace(c, cmdD["todo"].as<JsonArrayConst>())) {
+      ai::logf("[ai] 任务列表更新(%d项)", c.s_task_n);
+      snprintf(etasks, sizeof(etasks), "已重写(%d项)", c.s_task_n);
+    } else snprintf(etasks, sizeof(etasks), "内存不足, 未更新");
   }
   if (cmdD["done"].is<JsonArray>()) {
     char idxs[32] = {0};   // 命中的编号列表: "1、3"
@@ -1122,6 +1189,9 @@ static void do_task(RoundCtx& c, const char* args, char* out, size_t cap) {
       snprintf(nb, sizeof(nb), "task%s%s%s", etnote[0] ? " note" : "",
                etasks[0] ? " todo" : "", etdone[0] ? " done" : "");
       notify_tool(c, nb);
+      // 列表/笔记真变了才推快照: pure note 不重排列表, 但面板上笔记那行也要跟着换。
+      // 注意 todo 是"整段重写"(旧项全清、done 全清) —— 手机端会看到进度回退, 这是模型行为不是 bug。
+      notify_tasks(c, "running");
     }
   }
   PsaBuf rt;
@@ -1144,11 +1214,12 @@ static void do_goal(RoundCtx& c, const char* args, char* out, size_t cap) {
   const char* g = cmdD["set"] | "";
   if (g[0]) {
     c.goal_explicit = true;   // ⚠️ 与文案是否变化无关: 原话常与用户发言一字不差, 用 strcmp 判会把它整段吞掉
-    if (strcmp(g, c.goal_now)) {
-      snprintf(c.goal_now, sizeof(c.goal_now), "%s", g);
-      utf8_clamp_tail(c.goal_now);
-      ai::logf("[ai] 目标更新: %s", c.goal_now);
-      snprintf(eset, sizeof(eset), "已更新");
+    if (strcmp(g, ps_str(c.goal_now))) {
+      if (ps_set(c.goal_now, g)) {   // 按实际长度分配, 无上限
+        ai::logf("[ai] 目标更新: %s", c.goal_now);
+        snprintf(eset, sizeof(eset), "已更新");
+        notify_tasks(c, "running");   // 目标被改写: 面板标题跟着变(AI 常把用户原话重述成更具体的目标)
+      } else snprintf(eset, sizeof(eset), "内存不足");
     } else snprintf(eset, sizeof(eset), "无变化");
   }
   const char* fin = cmdD["finish"] | "";
@@ -1532,6 +1603,9 @@ static RoundR round_step(RoundCtx& c) {
 
 // ---------------- 任务收尾 ----------------
 static void round_task_finish(RoundCtx& c) {
+  // 终态快照: 面板定格成"已完成/失败/已中止"(不再随时间变化), 手机端据此保留列表供回看。
+  // 中断(abort)也发: 手机端点「中止」时本地已乐观置灰, 这条是板端的确认。
+  notify_tasks(c, c.interrupted ? "abort" : (c.fail ? "fail" : "done"));
   // 任务终结补发 done: 覆盖失败/掉线等"只报 error 不带 done"的终态, 让手机端把「中止」复位为
   // 「发送」。被中断时跳过(避免误复位下一任务); 已置 sent_done 的不再补发。
   if (!c.interrupted && !c.sent_done) {
@@ -1542,6 +1616,9 @@ static void round_task_finish(RoundCtx& c) {
     ai::enqueue_result(s.c_str(), c.t.fn, c.t.ctx);
   }
 
+  task_list_free(c);               // 任务列表(单块 PSRAM)
+  ps_free(c.task_note);            // 变长文本: 收尾统一放掉(与 hist/cur/prev 同一条出口)
+  ps_free(c.goal_now);
   for (int i = 0; i < AI_EDITED_SLOTS; i++) if (c.ed_img[i]) free(c.ed_img[i]);  // 用户编辑图快照
   if (c.cur) free(c.cur);          // 最近一张帧 PSRAM 副本
   for (int i = 0; i < AI_PREV_SLOTS; i++) if (c.prev[i]) free(c.prev[i]);   // 先前帧环各槽副本

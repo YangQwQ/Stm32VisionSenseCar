@@ -2,17 +2,24 @@
 #include "src/ai/ai_client.h"      // ai::logf(AI 调试日志)
 #include "src/ai/ground_proj.h"    // ground::screen_to_world(mem_observe_xy 用)
 #include "src/core/board_log.h"    // blog 类别(AI 日志经 ai::logf 内部使用)
+#include "src/core/utf8.h"         // utf8_clamp_tail(唯一还在用的地方: mem_feed 头一句被截断时)
+#include "src/core/psram.h"        // ps_dup/ps_free/ps_str: 物体名按实际长度分配
 #include "Calibration.h"           // SPIN_PIVOT_BEHIND_CM(原地旋转车头位移折算)
 
 #include <math.h>        // cosf/sinf/fmodf/fabsf
-#include <string.h>      // memset/strncpy/memcpy/strlen
+#include <string.h>      // memset/memcpy/strlen/strcmp/memcmp
 
 // 物体记忆表(通用)。程序存全局坐标, 喂给 AI 时换算成车头局部系, AI 零换算。stale 每轮未观测 +1。
-#define AI_MEM_MAX 8
+// 记忆表条数(小车最多同时记住几个物体; 满了覆盖最旧的, 见 mem_store)。
+// ⚠️ 这**不是**文本长度限制, 是记忆模型的设计值: 多一条 = 每轮多渲染一行喂给模型(mem_feed) + 多一个
+// 同名匹配的候选。长度限制的问题在下面的 name 上, 那个已经改成按实际长度分配了。
+#define AI_MEM_MAX 16
 // 记忆行里"未更新"提醒的轮数: 到这一轮补一次"看到就更新"的提醒(只此一次, stale 再涨不再重复)。
 #define AI_MEM_REMIND_STALE 5
 static struct {
-  char name[16];
+  // 物体名: PSRAM 上按**实际长度**分配(名字是 observe/mem_find 的匹配键, 也是喂回模型的记忆行内容,
+  // 写死长度就会认错物体、还会让模型看到被切断的残字)。换物体/遗忘/重置时释放, 见 mem_store 等。
+  char* name;
   float gx, gy;        // 全局坐标 cm(每次观测直接覆盖)
   uint32_t t_ms;       // 最近观测时刻
   int16_t stale;       // 0=新鲜; 每轮未观测 +1(喂回时按它排新鲜度、报"N轮未更新")
@@ -38,16 +45,21 @@ static bool name_same_obj(const char* a, const char* b) {
 // 把一次"车头系坐标"观测写入物体记忆表: 用**拍那张图时**的车位姿转成全局坐标, 每次观测无条件覆盖。
 // ⚠️ 位姿必须取自观测所依据的那张图(调用方传快照), 不能用当前实时位姿 —— 车在"看图"与"报坐标"之间
 // 动过时, 用实时位姿解算会把这条记忆整体平移一个位移量。
-static void mem_store(const char* name, float wx, float wy, const CarPose& pose) {
+// 返回 false = 这条没记进去(名字分配失败): 调用方须据此回告 AI, 不能报成"已记录"。
+static bool mem_store(const char* name, float wx, float wy, const CarPose& pose) {
   int slot = -1, oldest = 0;
   for (int i = 0; i < AI_MEM_MAX; i++) {
-    if (g_mem[i].valid && g_mem[i].name[0] && name_same_obj(g_mem[i].name, name)) { slot = i; break; }
+    if (g_mem[i].valid && ps_str(g_mem[i].name)[0] && name_same_obj(g_mem[i].name, name)) { slot = i; break; }
     if (!g_mem[i].valid) { slot = i; break; }
     if (g_mem[i].t_ms < g_mem[oldest].t_ms) oldest = i;
   }
   if (slot < 0) slot = oldest;                        // 满: 覆盖最旧
-  // 非按名命中(空槽/复用最旧槽)说明内容属于别的物体: 当新条目用, 下面各字段整体覆盖。
-  strncpy(g_mem[slot].name, name, 15); g_mem[slot].name[15] = 0;
+  // 名字按实际长度分配(无上限)。**先分配再释放旧的**: 分配失败就整条不记(明说), 不要把旧名字弄没 ——
+  // 名字空着会被后续 mem_find 当成"未命名槽"误用, 比不记更糟。
+  char* nn = ps_dup(name);
+  if (!nn) { ai::logf("[ai] 观测 %s 未记入: 名字分配失败(PSRAM 不足)", name); return false; }
+  ps_free(g_mem[slot].name);                       // 非按名命中的槽(空槽/复用最旧)名字属于别的物体, 放掉
+  g_mem[slot].name = nn;
   // 车头系 (wx右+, wy前+) → 全局: heading 逆时针正(左转+), 前=(-sin,cos)、右=(cos,sin)
   float h = pose.hd * AI_PI / 180.0f, ch = cosf(h), sh = sinf(h);
   float gx0 = pose.x + wx * ch - wy * sh;
@@ -60,6 +72,7 @@ static void mem_store(const char* name, float wx, float wy, const CarPose& pose)
   g_mem[slot].valid = true;
   ai::logf("[ai] 观测 %s 车头系(%.0f,%.0f) → 全局(%.0f,%.0f) [车位姿%d,%d@%d°]", name, wx, wy,
            g_mem[slot].gx, g_mem[slot].gy, (int)pose.x, (int)pose.y, (int)pose.hd);
+  return true;
 }
 
 // AI 每步 move/spin 后调用: 按定距/定角近似累积车姿态; 无定距/定角的持续移动位移未知, 不改姿态。
@@ -110,8 +123,7 @@ bool mem_observe_xy(const char* name, bool visible, float px, float py,
   if (out_right) *out_right = wx;   // 本文件口径: wx=右+左-, wy=前+后-
   if (out_fwd) *out_fwd = wy;
   CarPose live{ s_car_x, s_car_y, s_car_heading };
-  mem_store(name, wx, wy, pose ? *pose : live);
-  return true;
+  return mem_store(name, wx, wy, pose ? *pose : live);   // 记不进去要如实回 false(调用方会回告 AI)
 }
 
 // 每轮结束: 所有物体未观测则过期轮数 +1(过期不清空, 仅标记)。
@@ -130,16 +142,21 @@ void mem_feed(char* buf, size_t cap) {
                     : snprintf(buf, cap, "小车 (%.0f, %.0f) 朝向: 相对初始时%s%d°",
                                s_car_x, s_car_y, hd > 0 ? "左转" : "右转", hd > 0 ? hd : -hd);
   if (n < 0) n = 0;
-  if (n > (int)cap - 1) n = (int)cap - 1;      // 头一句就被截断(缓冲过小): 别让下面的写入越界
+  if (n > (int)cap - 1) {                      // 头一句就被截断(缓冲过小): 别让下面的写入越界
+    buf[cap - 1] = 0;
+    utf8_clamp_tail(buf);                      // 截断处回退到字符边界, 免得中间留半个汉字变 '?'
+    n = (int)strlen(buf);
+  }
   // 每条先写进本地缓冲, 整条装得下才收: 半句会切掉末尾的"未更新轮数", 甚至切在多字节字符中间。
-  // rec 容量须容下最长一条; 栈上这点开销无妨(调用方 ai_worker 栈 16384)。
-  char rec[320];
+  // rec 要容下一条(名字无长度上限了, 见 g_mem 声明): 512 ≈ 名字 130 汉字 + 坐标 + 未更新提醒。
+  // 再长的条目直接跳过不列(下一行会打日志), 且调用方缓冲本来也装不下 —— 不在这里切半条。
+  char rec[512];
   bool used[AI_MEM_MAX] = {false};
   bool first = true;
   for (int pass = 0; pass < AI_MEM_MAX; pass++) {
     int i = -1;                                // 每趟挑最"新鲜"的一条: 未观测轮数最少者在前
     for (int k = 0; k < AI_MEM_MAX; k++) {
-      if (!g_mem[k].valid || used[k]) continue;
+      if (!g_mem[k].valid || !ps_str(g_mem[k].name)[0] || used[k]) continue;   // 空槽/无名不参与渲染
       if (i < 0 || g_mem[k].stale < g_mem[i].stale) i = k;
     }
     if (i < 0) break;
@@ -159,9 +176,14 @@ void mem_feed(char* buf, size_t cap) {
         snprintf(tail, sizeof(tail), " (%d轮未更新)", (int)g_mem[i].stale);
     }
     int rl = snprintf(rec, sizeof(rec), "%s%s: %s%s; ",
-                      first ? " | " : "", g_mem[i].name, pos, tail);
+                      first ? " | " : "", ps_str(g_mem[i].name), pos, tail);
     if (rl <= 0) continue;                     // 没写出东西, 不必占位
-    if (rl > (int)sizeof(rec) - 1) rl = sizeof(rec) - 1;
+    // 单条自己就超了 rec: 整条跳过, 不要"截半条"—— 半条不仅会切掉末尾的未更新轮数, 还会切在
+    // 多字节字符中间(残尾会被出口消毒变成 '?')。留一条日志, 别让"某个物体莫名不在列表里"。
+    if (rl >= (int)sizeof(rec)) {
+      ai::logf("[ai] 记忆条目过长未列出(%d 字节约): %s", rl, ps_str(g_mem[i].name));
+      continue;
+    }
     if (n + rl >= (int)cap - 1) {              // 装不下: 明说后面还有, 而不是把某条切成半句
       const char* more = " | (空间不足, 后面还有物体记忆未列出)";
       int ml = (int)strlen(more);
@@ -182,7 +204,7 @@ bool mem_find(const char* name, float* tx, float* ty) {
   for (int i = 0; i < AI_MEM_MAX; i++) {
     if (!g_mem[i].valid) continue;
     if (name && name[0]) {
-      if (name_same_obj(g_mem[i].name, name)) { *tx = g_mem[i].gx; *ty = g_mem[i].gy; return true; }
+      if (name_same_obj(ps_str(g_mem[i].name), name)) { *tx = g_mem[i].gx; *ty = g_mem[i].gy; return true; }
       continue;
     }
     float dx = g_mem[i].gx - s_car_x, dy = g_mem[i].gy - s_car_y;
@@ -202,10 +224,10 @@ bool mem_forget(const char* name) {
   if (!name || !name[0]) return false;
   bool any = false;
   for (int i = 0; i < AI_MEM_MAX; i++) {
-    if (!g_mem[i].valid || !g_mem[i].name[0]) continue;
+    if (!g_mem[i].valid || !ps_str(g_mem[i].name)[0]) continue;
     if (!name_same_obj(g_mem[i].name, name)) continue;
     g_mem[i].valid = false;                 // 槽位就此空闲(各读口都先看 valid), 留给 mem_store 复用
-    g_mem[i].name[0] = 0;
+    ps_free(g_mem[i].name);                 // 名字在 PSRAM 上, 必须显式放(不是数组了)
     g_mem[i].stale = 0;
     g_mem[i].gx = 0; g_mem[i].gy = 0;
     any = true;
@@ -216,6 +238,7 @@ bool mem_forget(const char* name) {
 // 新任务起点: 车位置=原点、车头=0°, 清空上一任务的物体记忆。
 void mem_reset() {
   s_car_x = 0; s_car_y = 0; s_car_heading = 0;
+  for (int i = 0; i < AI_MEM_MAX; i++) ps_free(g_mem[i].name);   // 名字在 PSRAM: 先逐个放掉再清零
   memset(g_mem, 0, sizeof(g_mem));
 }
 

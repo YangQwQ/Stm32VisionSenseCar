@@ -30,6 +30,8 @@ const _IMAGE_AREA_H := 310.0
 	$ChatLog/BottomPanl/ImageList/Image2,
 	$ChatLog/BottomPanl/ImageList/Image3,
 ]
+## 悬浮在聊天区顶部的 AI 任务面板（TaskPanel）：未收到过 ai_task 时一直隐藏。
+@onready var _task_panel = $ChatLog/TaskPanl
 
 ## AI 任务执行中：发送按钮切换为「中止」（急停），按下打断任务并停车。
 var _ai_running := false
@@ -108,6 +110,11 @@ func show_ai_result(data: Dictionary) -> void:
 	if line == "":
 		line = "已收到 AI 输出"
 	chat("AI", line)
+
+## 更新顶部悬浮任务面板：板端 ai_task 上行（params:{state,goal?,note?,tasks:[{name,done}]}）。
+## 面板自己渲染，不往聊天流里写 —— 任务进度若混进流水，每回合一条会把自己淹掉。
+func show_task(params: Variant) -> void:
+	_task_panel.apply(params)
 
 func _cmd_text(cmd: Dictionary) -> String:
 	var t: String = str(cmd.get("type", ""))
@@ -260,6 +267,10 @@ func _send_during_ai(text: String) -> void:
 ## 切换 AI 执行中状态：Main 摇杆手动接管 / 板端 done / get_state.ai_busy 同步都会调用。
 func set_ai_running(run: bool) -> void:
 	_ai_running = run
+	# 复位即"任务不在跑了"（手动接管 / 中止 / 掉线 / 板端 done）：面板跟着收尾，
+	# 免得板端还没来得及回终态时，它还挂着"进行中"。
+	if not run:
+		_task_panel.mark_abort_if_live()
 	_refresh_send_btn()
 
 ## 刷新发送按钮形态：

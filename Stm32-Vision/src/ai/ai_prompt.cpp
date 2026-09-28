@@ -104,8 +104,8 @@ const char* ai::tools_schema() {
 "summary":{"type":"string","description":"用中文写给之后的自己看: 摘要只写已确认事实、后续步骤、需要注意的事或总结出的经验, 不写未证实的猜测; 清空后你只能靠这段文字回忆之前做过什么"}},
 "required":["summary"]}}},
 
-{"type":"function","function":{"name":"say","description":"对用户说话, 也可用来回答用户的提问; 有值得汇报的进展、结论或要解释的事时使用; 没什么可说可以不使用, 认为没有必要的话允许不说话, 但是建议在每个任务阶段, 或者执行一定次数后说话一下","parameters":{"type":"object","properties":{
-"text":{"type":"string","description":"要说的话, 一句话, 用户可见; 执行任务时用于写接下来准备干什么等; 结束时可以用来总结、回答用户问题或向用户提问"}},
+{"type":"function","function":{"name":"say","description":"对用户说话, 也可用来回答用户的提问; 有值得汇报的进展、结论或要解释的事时使用; 没什么可说可以不使用, 认为没有必要的话允许不说话, 但是建议在每个任务阶段, 或者执行一定次数后说话一下; 执行finish前必须调用, 可以总结也可以回复用户","parameters":{"type":"object","properties":{
+"text":{"type":"string","description":"要说的话, 一句话, 用户可见; 执行任务时用于写接下来准备干什么等"}},
 "required":["text"]}}}
 ],"tool_choice":"auto")TOOLS";
 }

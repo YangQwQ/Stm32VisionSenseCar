@@ -14,6 +14,7 @@
 [ext_resource type="Texture2D" uid="uid://216chvs4p2dt" path="res://res/control.png" id="8_5vvyt"]
 [ext_resource type="Texture2D" uid="uid://bg3hhwm1rvnco" path="res://res/control_a.png" id="9_j4qnp"]
 [ext_resource type="Texture2D" uid="uid://b23cof1akfklg" path="res://res/YP.jpg" id="9_kjvhd"]
+[ext_resource type="Script" uid="uid://dt2r5lajk5y2n" path="res://ui/chat/TaskPanel.gd" id="9_task"]
 [ext_resource type="Texture2D" uid="uid://dni0iuv07coxu" path="res://res/SYF.jpg" id="10_5tuhn"]
 [ext_resource type="Texture2D" uid="uid://ck1coptjcgrlb" path="res://res/settings_a.png" id="11_fpfj3"]
 [ext_resource type="Texture2D" uid="uid://1uxvy1j5nvue" path="res://res/settings.png" id="12_sc1dx"]
@@ -301,6 +302,19 @@ content_margin_bottom = 15.0
 bg_color = Color(0.4793434, 0.054537505, 0.047085457, 0.9098039)
 corner_radius_bottom_left = 35
 corner_detail = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_76dum"]
+content_margin_left = 25.0
+content_margin_top = 15.0
+content_margin_right = 25.0
+content_margin_bottom = 20.0
+bg_color = Color(0.06100855, 0.06100855, 0.06100855, 0.62)
+corner_radius_top_left = 15
+corner_radius_top_right = 15
+corner_radius_bottom_right = 15
+corner_radius_bottom_left = 15
+shadow_color = Color(0, 0, 0, 0.45000002)
+shadow_size = 8
 
 [sub_resource type="StyleBoxEmpty" id="StyleBoxEmpty_3y6u5"]
 
@@ -1201,6 +1215,49 @@ icon = ExtResource("6_sc1dx")
 icon_alignment = 1
 expand_icon = true
 
+[node name="TaskPanl" type="PanelContainer" parent="BodyControl/ChatPanel/ChatLog" unique_id=1061712589]
+visible = false
+layout_mode = 1
+anchors_preset = -1
+anchor_right = 1.0
+offset_left = 25.0
+offset_top = 20.0
+offset_right = -25.0
+offset_bottom = 72.0
+grow_horizontal = 2
+mouse_filter = 1
+theme_override_styles/panel = SubResource("StyleBoxFlat_76dum")
+script = ExtResource("9_task")
+
+[node name="VBox" type="VBoxContainer" parent="BodyControl/ChatPanel/ChatLog/TaskPanl" unique_id=958566045]
+layout_mode = 2
+
+[node name="Head" type="Button" parent="BodyControl/ChatPanel/ChatLog/TaskPanl/VBox" unique_id=1836356754]
+custom_minimum_size = Vector2(0, 56)
+layout_mode = 2
+theme_override_font_sizes/font_size = 40
+flat = true
+alignment = 0
+
+[node name="Body" type="ScrollContainer" parent="BodyControl/ChatPanel/ChatLog/TaskPanl/VBox" unique_id=952026277]
+visible = false
+layout_mode = 2
+horizontal_scroll_mode = 0
+
+[node name="Inner" type="VBoxContainer" parent="BodyControl/ChatPanel/ChatLog/TaskPanl/VBox/Body" unique_id=428313963]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="Note" type="Label" parent="BodyControl/ChatPanel/ChatLog/TaskPanl/VBox/Body/Inner" unique_id=534900876]
+custom_minimum_size = Vector2(0, 40)
+layout_mode = 2
+theme_override_colors/font_color = Color(0.6039216, 0.8156863, 1, 1)
+theme_override_font_sizes/font_size = 32
+autowrap_mode = 1
+
+[node name="Todos" type="VBoxContainer" parent="BodyControl/ChatPanel/ChatLog/TaskPanl/VBox/Body/Inner" unique_id=428313962]
+layout_mode = 2
+
 [node name="InputRow" type="HBoxContainer" parent="BodyControl/ChatPanel" unique_id=1129907710]
 layout_mode = 2
 theme_override_constants/separation = 10
@@ -1695,6 +1752,7 @@ text = "连接"
 [connection signal="toggled" from="BodyControl/VidControls/AnnotateBtn" to="." method="_on_annotate_toggled"]
 [connection signal="grid_requested" from="BodyControl/ChatPanel" to="." method="_on_chat_grid_requested"]
 [connection signal="stream_requested" from="BodyControl/ChatPanel" to="." method="_on_chat_stream_requested"]
+[connection signal="pressed" from="BodyControl/ChatPanel/ChatLog/TaskPanl/VBox/Head" to="BodyControl/ChatPanel/ChatLog/TaskPanl" method="_on_head_pressed"]
 [connection signal="text_changed" from="BodyControl/ChatPanel/InputRow/MessageInput" to="BodyControl/ChatPanel" method="_on_input_text_changed"]
 [connection signal="text_submitted" from="BodyControl/ChatPanel/InputRow/MessageInput" to="BodyControl/ChatPanel" method="_on_send_pressed"]
 [connection signal="pressed" from="BodyControl/ChatPanel/InputRow/SendBtn" to="BodyControl/ChatPanel" method="_on_send_pressed"]
