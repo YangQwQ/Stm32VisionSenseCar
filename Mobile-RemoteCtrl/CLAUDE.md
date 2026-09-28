@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本文档基准：仓库 HEAD `0a3e8e1`（2026-09-25）。只覆盖已提交内容；未提交改动不收录。
+> 本文档基准：仓库 HEAD `18ef9c1`（2026-09-29）。只覆盖已提交内容；未提交改动不收录。
 
 本项目维护指南，供后续编码助手 / 会话快速对齐上下文。
 
@@ -19,12 +19,14 @@
 | 通道 | 用途 | 实现状态 |
 |---|---|---|
 | BLE（GATT） | 配网 + 兜底控制 + status | GDBLE 接通（`BLEClient.gd` → `addons/gdble` + 协议表 `BleProfile.gd`）；板侧 GATT Server VisionS3 已烧录（联调中） |
-| WiFi WebSocket（端口 81） | 指令 / 状态 / 消息 / `ai_result`（**文本 JSON**） | 真实（`WSCarClient.gd`；图传已不走 WS） |
+| WiFi WebSocket（端口 81） | 指令 / 状态 / 消息 / `ai_result` / `ai_tool` / `ai_task`（**文本 JSON**） | 真实（`WSCarClient.gd`；图传已不走 WS） |
 | WiFi UDP | 图传 JPEG 分片（低延迟；缺片/超时自愈） | 真实（`UDPVideoClient.gd`，分片协议与板侧 `udp_send_frame` 对齐） |
 | 云端多模态 AI | DIRECT：板子直调云端，手机只下发 `ai_goal` | DIRECT（不经手机侧） |
 
-- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `low` 低姿夹取准备位、`fold` 收臂折叠回平台）/ `spin`（原地旋转，可带 `angle_deg` 定角或 `ms` 直给通电毫秒）/ `light` / `reset` / `stream` / `log`（`cat=exec|ai|all`,`on` 统一日志转发）/ `get_state`（回 `bits` 位图）/ `config` / `ping` / `pong`（板端保活应答，**带 `bits`**）/ `ai_goal` / `ai_oneshot` / `ai_cancel` / `ai_chat`（`message` 插话）/ `goto`（`x`/`y`，可选 `frame`）/ `nz_read`，另含调试直驱 `servo / motor / drive / arm_pose`。
+- **统一命令词表** `CommandProto`：摇杆 / 指令 / 图传三入口共用（DIRECT），固件只解析这一份。现行词表：`move`（可带 `distance_cm` 定距）/ `stop`（scope=all/wheels/arm）/ `arm`（act 含 `low` 低姿夹取准备位、`grasp` 合爪+定量抬臂、`fold` 收臂折叠回平台；可选 `dist_cm` 近似拍数）/ `spin`（原地旋转，可带 `angle_deg` 定角或 `ms` 直给通电毫秒）/ `light` / `reset` / `stream` / `log`（`cat=exec|ai|all`,`on` 统一日志转发）/ `get_state`（回 `bits` 位图）/ `config` / `ping` / `pong`（板端保活应答，**带 `bits`**）/ `ai_goal` / `ai_oneshot` / `ai_cancel` / `ai_chat`（`message` 插话）/ `goto`（`x`/`y`，可选 `frame`）/ `nz_read` / `reboot`（远程重启板子），另含调试直驱 `servo / motor / drive / arm_pose`。
 - **AI 链路**：DIRECT（手机下发 `ai_goal` 文字/区域目标 → 板子 `ai_client` 执行闭环并回 `ai_result`）。`ai_oneshot` = 只执行一轮决策即收尾。AI 运行中发送键变「中止」：空文本走 `ai_cancel`，非空文本走 `ai_chat` 插话（补充要求、不打断闭环）。
+- **AI 任务面板（`ai_task` 上行）**：板端推 `{state,round,goal?,note?,tasks:[{name,done}]}`（`state` = `running|wait|done|fail|abort`，与 `ai_result` 同一条结果队列）。`Main.gd` 的 `ai_task` 分支 → `ChatPanel.show_task` → 顶部悬浮面板；面板**只渲染最新快照**，不写聊天流、不下发指令。`wait`（AI 在等你回话）与收尾态由面板自己上色，用户点中止 / 掉线时按本地乐观态收尾（`mark_abort_if_live`）。
+- **AI 工具进度（`ai_tool` 上行）**：板端每个工具落地后推 `{text}`（**不走 `/log` 开关**），`Main.gd` 转 `ChatPanel.chat("AI工具", …)`，不开日志也能看见执行轨迹。
 - **定距 / 定角**：`move` 的 `distance_cm`、`spin` 的 `angle_deg` 由板端按**时长近似**到点自停（无里程计，靠实测标定表插值），非闭环，供微操与标定粗用；不带则持续动作，靠 `stop` 收尾。`spin` 另有 `ms`（直接给通电毫秒，绕开角度换算与滑行补偿）——**板端 `ms` 优先于 `angle_deg`**，但 `CommandProto.spin` 是 `angle_deg` 优先、`ms` 走 `elif`，故两侧实际只会发其中一个。
 - **调试与本地指令**：移动/直驱按族收敛——`/move rotate|spin|spin_ms|fore|back|to|arm`（转向舵三档 / 原地旋转 / **`spin_ms <毫秒>`** 直接指定通电毫秒、绕开角度换算（标定"真实每度 ms"用）/ 定距前进后退 / `to <x> <y> [global]` 移动到指定坐标 → `goto` / 机械臂位姿，`arm` 含 `reset|fold|low`）与 `/drive motor|servo`（单轮电机或 n=0 全车 / 直驱舵机）经词表下发；`/log <exec|ai|all> [on|off]`（旧 `/exec_log`、`/ai_log` 为别名）与 `/nz_read`（哪吒 I2C 探测）同理；`/grid [on|off]` 只在本机图传上叠加标定网格（`ui/video/GridOverlay.gd`，不下发板子），配合板端单应标定读 (u,v) 取标定点；`/clear` 除清聊天区外**同时截断重写本地日志文件**（`AppLog.clear()`）。
 - **重连同步**：WS 连上后主动发一次 `get_state`，板端回 `type:"state"`，`Main.gd._apply_state` → `DirectControl.sync_state` 同步灯光/夹爪按钮（`set_pressed_no_signal`，不回灌指令）。
@@ -35,14 +37,14 @@
 
 ```
 res://
-  Main.tscn / Main.gd          # App 壳：连接编排、页面切换（含左右滑动切页）、摇杆映射、连接状态；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）；**图传开关与直控面板开关在控制页 `BodyControl/VidControls`（`StreamToggle`/`DirectCtrlToggle`），不在「关于」页**；**图片标注（ImageEditor）节点内联于本场景**
+  Main.tscn / Main.gd          # App 壳：连接编排、页面切换（含左右滑动切页）、摇杆映射、连接状态；「关于」页设置项（自连 / 禁用自动 WS / 原地旋转模式）；**图传开关、直控面板开关、标注入口在控制页 `BodyControl/VidControls`（`StreamToggle`/`DirectCtrlToggle`/`AnnotateBtn`），不在「关于」页**；图片标注的**工具条**（`BodyControl/ImgEditToolbar`：矩形/椭圆/撤销/清除/取消/采用）内联于本场景，标注画布由 `ui/editor/ImageEditor.gd` 运行时挂到 `BodyControl/Video` 上
   state/LocalStore.gd          # autoload 本地持久化（last_device / wifi / ai 配置 / 设置项 / `input_history` 输入历史）
   state/AppLog.gd              # autoload 本地日志落盘：每次启动截断重写 user://logs/app.log，聊天区每行统一写入；`clear()` 供 `/clear` 截断
   animation/AnimationManager.gd # autoload 通用动画（淡入+缩放滑入/滑出、上下浮动）
   net/
     DeviceConn.gd              # 统一连接层（单一事实源）：持有 BLE/WS/UDP、send_command 统一出口、最新帧 current_image
     proto/CommandProto.gd      # 统一命令词表（static）
-    ws/WSCarClient.gd          # WS 传输（文本 JSON：指令/状态/ai_result）
+    ws/WSCarClient.gd          # WS 传输（文本 JSON：指令/状态/ai_result/ai_tool/ai_task）
     ble/BLEClient.gd           # BLE GATT 客户端（GDBLE 运行时：扫描/连接/读写/配网/status）
     ble/BleProfile.gd          # 协议常量表（UUID/广播名/BLE 黑名单 BLOCKED_TYPES，与固件 ble.cpp 逐字 mirror）
     video/UDPVideoClient.gd    # UDP 图传接收：JPEG 分片重组 → frame_received
@@ -52,11 +54,13 @@ res://
   ui/
     control/Joystick.gd + DirectControl.gd  # 复用虚拟摇杆 / 直控面板（脚本建树，无 tscn）
     video/VideoView.gd         # 图传显示（脚本建树）；子节点 Overlay = GridOverlay.gd（/grid 标定网格）
-    chat/ChatPanel.gd          # 聊天区视图（脚本建树）；指令解析收口在 SlashCommands.gd
+    BgDimSharder.gd            # 弹窗背景遮罩（节点挂 Main 根 `BGDimSharder`，脚本在本目录）：mouse_filter=STOP 吃掉下层触控（翻页手势/摇杆/按钮），点空白处关闭弹窗；显隐跟随配网弹窗
+    chat/ChatPanel.gd          # 聊天区视图；消息类含「AI」（`ai_result` 的 reason）/「AI工具」（`ai_tool` 轨迹）/「状态」/日志；指令解析收口在 SlashCommands.gd
     chat/SlashCommands.gd      # /指令 解析器（文本 → 词表指令/本地动作，纯解析，无副作用）
+    chat/TaskPanel.gd          # AI 任务面板：悬浮在 ChatLog 顶部（节点树在 Main.tscn：`ChatPanel/ChatLog/TaskPanl`，`VBox/Head` + `VBox/Body(ScrollContainer)/Inner/{Note,Todos}`），折叠一行、点击展开；数据源 `ai_task`。⚠️ 展开区高度由脚本按字体实测折行数自算（面板是浮层，不走容器测量），按聊天区高度封顶、超出交给滚动条 —— 板端任务项数不封顶，别改回"一项一行"
     bluetooth/BTDeviceListItem.tscn+.gd  # 蓝牙设备列表项
     bluetooth/ScanPanel.gd     # 蓝牙扫描页（设备列表/刷新动画/空提示，挂 BodyBTScan 节点）
-    editor/ImageEditor.gd + EditorCanvas.gd  # 图片标注（框/箭头/文字）；节点整块内联在 `Main.tscn`（`Main.tscn:1662` 起，含 SubViewport），两个脚本在本目录
+    editor/ImageEditor.gd + EditorCanvas.gd  # 图传画面上的标注：工具条在 `Main.tscn`（`BodyControl/ImgEditToolbar`），标注画布 `EditorCanvas` 由 ImageEditor 运行时创建并挂到 `BodyControl/Video`（**无 SubViewport**）；矩形 + 椭圆两种图形，「采用」后作为附件随 `ai_goal`/`ai_oneshot` 上行
     provision/WifiConfigPopup.gd  # 配网弹窗（脚本建树）
 ```
 
