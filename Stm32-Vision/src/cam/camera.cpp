@@ -228,13 +228,24 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
   // ② 无论成败，回 VGA 常态。★ fb 若指向快照(非驱动帧)，不能 return_all —— 那会连快照一起放不到，
   // 且 restore 的 deinit 还会把驱动缓冲池释放；快照是独立 PSRAM，安全。
   restore:
-  esp_camera_return_all();
-  e_de = esp_camera_deinit();
-  vTaskDelay(pdMS_TO_TICKS(50));
   {
+    // 回 VGA 也是一次"重开相机"：deinit 后 init。cam_hal 的重开全程走 MALLOC_CAP_DMA
+    // (cam_obj / lldesc 描述符)，另有 frames 数组走内部堆；内部 DMA 块被切碎时 init 会失败并
+    // 返回 ESP_FAIL(日志里的 -1)。失败后直接收手会把相机永久留在 deinit 态 —— 之后每次取帧都失败，
+    // AI 空转多轮后任务夭折。故重试若干次：每次前先 deinit 回干净态(库对 cam_obj==NULL 安全)，
+    // 并打出具体 esp_err 便于分诊。
     camera_config_t vc = make_config(FRAMESIZE_VGA);
-    esp_err_t e_lo_init = esp_camera_init(&vc);
-    blog::logf(blog::CAM, "[cam] reconfig 回VGA: deinit=%d init=%d", (int)e_de, (int)e_lo_init);
+    esp_err_t e_lo_init = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      esp_camera_return_all();
+      e_de = esp_camera_deinit();
+      vTaskDelay(pdMS_TO_TICKS(50));     // 等 SCCB 总线释放、XCLK 停稳（同高清段）
+      e_lo_init = esp_camera_init(&vc);
+      blog::logf(blog::CAM, "[cam] reconfig 回VGA: 第%d次 deinit=%d init=%d(%s)", attempt,
+                 (int)e_de, (int)e_lo_init, esp_err_to_name(e_lo_init));
+      if (e_lo_init == ESP_OK) break;
+      vTaskDelay(pdMS_TO_TICKS(200));    // 给刚释放的内部 DMA 块回收/合并留窗口，再试
+    }
     if (e_lo_init == ESP_OK) {
       apply_sensor_calib();
       // 回 VGA 同样是"重开相机"：AWB/AEC 又被重置，立即放行会让 zoom 之后的整幅帧头几帧偏绿。
@@ -244,6 +255,8 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
         if (!w) break;
         esp_camera_fb_return(w);
       }
+    } else {
+      blog::logf(blog::CAM, "[cam] 回VGA 连续失败, 相机停在 deinit 态: 后续取帧会一直失败");
     }
   }
   s_reconfig = false;
