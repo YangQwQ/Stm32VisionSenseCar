@@ -17,8 +17,8 @@ void enqueue_result(const char* text, cmd::ReplyFn fn, void* ctx);
 #define AI_EDITED_IMG_MAX (128 * 1024)
 #define AI_EDITED_IMG_TTL_MS 60000
 
-// 取"最近 ≤3 张未过期编辑图"快照: 各拷独立 PSRAM 副本, 槽位按"新→旧"记入 order(order[0]=最新)。
-// imgs/lens 按槽位下标填(未命中为 nullptr/0), order 未填置 -1; maxn=数组容量; 调用方负责 free。
-int edited_snapshot(uint8_t** imgs, size_t* lens, int* order, int maxn);
+// 取"最近 ≤3 张未过期编辑图"快照: 各拷独立 PSRAM 副本, 按槽位下标填(未命中为 nullptr/0);
+// maxn=数组容量; 调用方负责 free。返回有效张数。
+int edited_snapshot(uint8_t** imgs, size_t* lens, int maxn);
 
 }  // namespace ai

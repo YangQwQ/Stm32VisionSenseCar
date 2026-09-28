@@ -42,6 +42,14 @@ const char* ai::validate_cmd(const char* content, JsonDocument& out, char* err_b
     snprintf(err_buf, err_cap, "AI 返回非 JSON: %s", c.substring(0, 80).c_str());
     return err_buf;
   }
+  // 顶层必须是 JSON 对象: 模型偶尔给出裸数组/字符串/数字(如 "[]" 或 "ok")。非对象时 `doc["type"]`
+  // 恒空、全表 parse 也都查无此键 → 会被当成"空动作"静默放过, 让 AI 以为指令生效而空转。
+  // 用 Const 形式判定(理由见 tool.h: `JsonVariantConst::is<JsonObject>()` 恒 false 且照样编译过)。
+  JsonVariantConst root = doc;
+  if (!root.is<JsonObjectConst>()) {
+    snprintf(err_buf, err_cap, "AI 返回的 JSON 不是对象(应为 {\"工具名\":{...}}): %s", c.substring(0, 80).c_str());
+    return err_buf;
+  }
   // 顶层出现旧单指令格式 type → 拒并给处方: 改用分组 JSON(car 的 move/arm/light 通道)。
   if (doc["type"]) {
     snprintf(err_buf, err_cap,
@@ -51,7 +59,6 @@ const char* ai::validate_cmd(const char* content, JsonDocument& out, char* err_b
   }
   // 参数校验: 按工具表逐项跑(**表序 = 校验顺序**, 见 tools/registry.cpp)。car/mem/task/goal 的参数文档
   // 都过一遍全表, 缺席的键各自的 parse 直接返回 nullptr。故同一次返回里有多个非法键时, 报出的是表里靠前的那个。
-  JsonVariantConst root = doc;
   int tn = 0;
   const ai::ToolSpec* ts = ai::tools(&tn);
   for (int i = 0; i < tn; i++) {

@@ -33,13 +33,6 @@ const ai::ToolSpec* ai::tools(int* n) {
   return kTools;
 }
 
-const ai::ToolSpec* ai::tool_by_key(const char* key) {
-  if (!key) return nullptr;
-  for (int i = 0; i < kToolN; i++)
-    if (kTools[i].key && !strcmp(kTools[i].key, key)) return &kTools[i];
-  return nullptr;
-}
-
 // 表完整性自检(启动时一次): key 非空且唯一、parse 非空。
 // **故意只打日志、不 assert** —— 这是编译期常量表, 出错只可能是手误; 让板子照常起来能刷 OTA,
 // 比 panic 在车里强(板子固定在车上、串口够不着, 见 CLAUDE.md 的"PC 侧工具")。

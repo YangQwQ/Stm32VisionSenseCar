@@ -80,8 +80,6 @@ const ToolSpec* tools(int* n);
 // 请求体尾部的工具声明原文: `"tools":[...],"tool_choice":"auto"`(ai_prompt.cpp, 静态只读字面量)。
 // agent 循环的七个工具(car/mem/task/goal/look/say/compact)在这里对模型声明; 行为与判据仍在系统提示词里。
 const char* tools_schema();
-// 按键查表; 未登记返回 nullptr。
-const ToolSpec* tool_by_key(const char* key);
 // 表完整性自检: key 非空且唯一、parse 非空。异常打一条日志(廉价保险, 不做断言)。init 时调一次。
 void tools_selfcheck();
 

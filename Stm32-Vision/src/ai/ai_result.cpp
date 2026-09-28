@@ -121,12 +121,11 @@ void ai::set_edited_image(const uint8_t* data, size_t len) {
   blog::logf(blog::AI, "收到编辑图 %u B (槽%d)", (unsigned)len, w);
 }
 
-int ai::edited_snapshot(uint8_t** imgs, size_t* lens, int* order, int maxn) {
+int ai::edited_snapshot(uint8_t** imgs, size_t* lens, int maxn) {
   if (maxn > AI_EDITED_SLOTS) maxn = AI_EDITED_SLOTS;
-  for (int i = 0; i < maxn; i++) { imgs[i] = nullptr; lens[i] = 0; order[i] = -1; }
+  for (int i = 0; i < maxn; i++) { imgs[i] = nullptr; lens[i] = 0; }
   int vn = 0;
   ScopedLock lk(g_img_mtx);   // 整段持锁到函数出口(内含多处 continue 跳过)
-  struct { int idx; uint32_t seq; } vt[AI_EDITED_SLOTS];
   uint64_t now = esp_timer_get_time();
   for (int i = 0; i < AI_EDITED_SLOTS; i++) {
     if (!g_edited[i] || g_edited_len[i] == 0) continue;
@@ -135,12 +134,7 @@ int ai::edited_snapshot(uint8_t** imgs, size_t* lens, int* order, int maxn) {
     if (!b) continue;
     memcpy(b, g_edited[i], g_edited_len[i]);
     imgs[i] = b; lens[i] = g_edited_len[i];
-    vt[vn].idx = i; vt[vn].seq = g_edited_seq[i]; vn++;
-  }
-  for (int k = 0; k < vn; k++) {   // 选择排序: 新→旧
-    int m = -1; uint32_t ms = 0;
-    for (int j = 0; j < vn; j++) if (vt[j].seq > ms) { ms = vt[j].seq; m = j; }
-    order[k] = vt[m].idx; vt[m].seq = 0;
+    vn++;
   }
   return vn;
 }

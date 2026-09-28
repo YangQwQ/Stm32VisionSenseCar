@@ -594,6 +594,14 @@ func _handle_board_msg(data: Dictionary) -> bool:
 					_apply_state_bits(int(pb), true)
 		"ai_result":
 			_chat_panel.show_ai_result(data)
+		"ai_tool":
+			# 板端每个工具落地后即时回推的执行轨迹（{type:"ai_tool", params:{text}}），**不走 /log 开关**：
+			# AI 倾向"做完再 say"，不开日志时整段执行过程是黑的；这条补上"正在用什么工具"的可见性。
+			var tp: Variant = data.get("params")
+			if tp is Dictionary:
+				var ttv: Variant = (tp as Dictionary).get("text")
+				if ttv is String and not (ttv as String).is_empty():
+					_chat_panel.chat("AI工具", ttv as String)
 		"log":
 			# 板端统一日志模块回推（/log <exec|ai|all> on 开启）：来源+文本，展示并落盘。
 			# 板端发 {type:"log", params:{src:"exec|ai|...", text:"..."}}。
