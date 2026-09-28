@@ -8,8 +8,8 @@ const CP := preload("res://net/proto/CommandProto.gd")
 @onready var _video: Control = $BodyControl/Video
 @onready var _joystick: VirtualJoystick = $BodyControl/CtrlArea/Joystick
 @onready var _wifi_popup: PanelContainer = $WifiPopup
-@onready var _editor: Control = $ImageEditor
-@onready var _editor_panel: Control = $ImageEditor/Panel
+@onready var _editor: Control = $BodyControl/ImgEditToolbar
+@onready var _annotate_btn: Button = $BodyControl/VidControls/AnnotateBtn
 @onready var _dim: ColorRect = $BGDimSharder
 var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 
@@ -92,9 +92,12 @@ func _ready() -> void:
 	_scan_panel.device_selected.connect(_on_device_item_selected)
 	# /append：聊天区发起的"从图库选图"由 Main 弹出系统文件选择器并打开标注编辑器。
 	_chat_panel.image_pick_requested.connect(_on_chat_image_pick_requested)
-	# 两个模态弹窗（配网 / 标注）共用背景遮罩：谁显隐就同步一次。
+	# 标注工具条（非模态，浮在图传上方）：采用/取消由编辑器回抛，Main 统一收尾（解冻 + 复位开关）。
+	_editor.connect("image_sent", _on_editor_image_sent)
+	_editor.connect("cancelled", _on_editor_cancelled)
+	# 配网弹窗仍为模态：背景遮罩随其显隐同步；点遮罩空白处（弹窗之外）由遮罩自己上报。
 	_wifi_popup.visibility_changed.connect(_sync_modal_dim)
-	_editor.visibility_changed.connect(_sync_modal_dim)
+	_dim.connect("tapped", _on_dim_tapped)
 	_sync_modal_dim()
 
 	# 用 toggled + bind 页码；按钮同属一个 ButtonGroup，互斥单选。
@@ -179,13 +182,11 @@ func _sync_nav(page: int) -> void:
 	_nav_ctrl.set_pressed_no_signal(page == 1)
 	_nav_about.set_pressed_no_signal(page == 2)
 
-## 画面上左右滑动切页：直接在 _input 里全量处理（不依赖 unhandled 传播，保证任何位置都响应）。
-## 横移超过阈值且横向占主导才切页；落在摇杆区内整段跳过，避免和转向拖动冲突。
-func _input(event: InputEvent) -> void:
-	# 弹窗期间不翻页：只处理"点遮罩关弹窗"，其余交给弹窗自己（遮罩已挡住下层）。
-	if _modal_open():
-		_modal_input(event)
-		return
+## 画面上左右滑动切页：走 _gui_input（Godot 的 GUI 派发，谁挡住谁消费）。
+## 背景遮罩与标注画布都是 mouse_filter=STOP 且盖在上层，触点被它们吃掉，这里自然收不到，
+## 故不必再自行判断"是否模态 / 是否标注中"。横移超过阈值且横向占主导才切页；
+## 落在摇杆区内整段跳过，避免和转向拖动冲突。
+func _gui_input(event: InputEvent) -> void:
 	if event is InputEventScreenTouch:
 		var t := event as InputEventScreenTouch
 		if t.pressed:
@@ -277,61 +278,22 @@ func _track_velocity(px: float) -> void:
 		_last_sample = _drag_accum
 		_last_sample_tick = now
 
-# ============================== 模态弹窗（配网 / 图片标注） ==============================
-# 两个弹窗共用 Main 根下这层背景遮罩 BGDimSharder（原 ImageEditor 自带的 Dim 提取而来）：
-# 显隐跟随弹窗的 visibility_changed，各条关闭路径（确认/取消/采用）都不用单独通知，淡出期间也保持。
-# 遮罩自身 mouse_filter 为 STOP，挡住下层的翻页手势与摇杆/按钮。
-
-const _MODAL_TAP_SLOP := 20.0   # 按下到抬起的位移超过它就不算"点"，按拖动忽略
-
-var _modal_tap_pos := Vector2.ZERO
-var _modal_tap_armed := false
+# ============================== 模态弹窗（配网） ==============================
+# 背景遮罩 BGDimSharder 挂在 Main 根下：显隐跟随配网弹窗的 visibility_changed，
+# 各条关闭路径（确认/取消）都不用单独通知，淡出期间也保持。
+# 遮罩自身 mouse_filter 为 STOP，吃掉下层的翻页手势与摇杆/按钮；"点遮罩关闭"也交给遮罩自己。
 
 func _modal_open() -> bool:
-	return _wifi_popup.visible or _editor.visible
+	return _wifi_popup.visible
 
 ## 弹窗显隐变化时同步遮罩（信号驱动，不必每帧轮询；淡出到真正隐藏前遮罩都保持）。
 func _sync_modal_dim() -> void:
 	_dim.visible = _modal_open()
 
-## 弹窗期间的输入：按下与抬起都在遮罩空白处、且几乎没移动 → 关弹窗；
-## 落在弹窗内容上的点击、以及任何拖动都不响应（也不翻页）。
-func _modal_input(event: InputEvent) -> void:
-	var pos := Vector2.INF
-	var down := false
-	if event is InputEventScreenTouch:
-		var t := event as InputEventScreenTouch
-		pos = t.position
-		down = t.pressed
-	elif event is InputEventMouseButton \
-			and (event as InputEventMouseButton).button_index == MOUSE_BUTTON_LEFT:
-		var mb := event as InputEventMouseButton
-		pos = mb.position
-		down = mb.pressed
-	else:
-		return
-	if down:
-		_modal_tap_pos = pos
-		_modal_tap_armed = not _modal_panel_rect().has_point(pos)
-		return
-	if not _modal_tap_armed:
-		return
-	_modal_tap_armed = false
-	if pos.distance_to(_modal_tap_pos) <= _MODAL_TAP_SLOP and not _modal_panel_rect().has_point(pos):
-		_dismiss_modal()
-
-## 当前弹窗的内容区（配网弹窗本体 / 标注面板）：其中的输入归弹窗，不触发遮罩关闭。
-func _modal_panel_rect() -> Rect2:
-	if _editor.visible:
-		return _editor_panel.get_global_rect()
-	return _wifi_popup.get_global_rect()
-
-## 点遮罩关闭：配网弹窗等同取消，标注面板等同放弃这张图。
-func _dismiss_modal() -> void:
-	if _editor.visible:
-		_editor.call("close_modal")
-	elif _wifi_popup.visible:
-		_wifi_popup.call("close")
+## 点遮罩空白处关闭：配网弹窗等同取消。遮罩只露在弹窗之外（弹窗在其上层、自己消费触点），
+## 故遮罩上报的点击必在空白处，不必再判断是否落在弹窗本体上。
+func _on_dim_tapped() -> void:
+	_wifi_popup.call("close")
 
 # ============================== BLE ==============================
 
@@ -570,6 +532,8 @@ func _on_ws_disconnected(reason: String) -> void:
 	_chat_panel.chat("板", "WS 已断开:%s" % r)
 
 func _on_frame(img: Image) -> void:
+	if _editing:
+		return  # 标注中：画面冻结在进入标注时的那一帧（_video / current_image 都保持不动）
 	_video.call("set_frame", img)
 	DeviceConn.current_image = img
 
@@ -697,16 +661,44 @@ func _same_subnet(a: String, b: String) -> bool:
 
 # ============================== 框选（编辑器） ==============================
 
-func _on_annotate_pressed() -> void:
-	# _video 以基类 Control 持有，脚本成员只能动态取
-	var tex: Variant = _video.get("current_texture")
-	if tex == null:
-		_chat_panel.chat("提示", "先开启图传、等画面出现再框选目标")
+var _editing := false   # 标注中：图传冻结（_on_frame 丢帧），画面停在最后一帧供标注
+
+## 「框选目标」开关：开 → 冻结图传取当前帧进标注；关 → 关闭工具条并收尾。
+func _on_annotate_toggled(on: bool) -> void:
+	if not on:
+		_editor.call("close")
+		_end_edit()
 		return
-	_editor.call("open", tex)
+	var img: Image = DeviceConn.current_image
+	if img == null or img.is_empty():
+		_chat_panel.chat("提示", "先开启图传、等画面出现再框选目标")
+		_annotate_btn.set_pressed_no_signal(false)
+		return
+	_begin_edit(img)
+
+## 进入标注：图传区临时可见（图传关着时也能在冻结帧上标注），冻结帧交给画布。
+## 图传开关一并禁用：编辑中关掉图传会让画面连同画布一起消失，只剩工具条。
+func _begin_edit(img: Image) -> void:
+	_editing = true
+	_video.visible = true
+	_stream_toggle.disabled = true
+	_annotate_btn.set_pressed_no_signal(true)
+	_editor.call("open", img)
+
+## 退出标注：解冻图传、图传区还原到开关状态、复位「框选目标」按钮、放开图传开关。
+func _end_edit() -> void:
+	_editing = false
+	_video.visible = _stream_toggle.button_pressed
+	_stream_toggle.disabled = false
+	_annotate_btn.set_pressed_no_signal(false)
+
+## 编辑器「采用」：编辑图进聊天区附件列表，然后收尾。
+func _on_editor_image_sent(img: Image, annotation: Dictionary) -> void:
+	_end_edit()
+	_chat_panel.call("_on_image_sent", img, annotation)
 
 ## /append：打开系统文件选择器选一张图片（懒建 FileDialog）。
-## 选择后压缩到目标大小、用现有标注编辑器标注，采用后进入附件列表（Main.tscn 已连 image_sent）。
+## 选择后压缩到目标大小、走同一套标注编辑器，采用后进入附件列表。
 func _on_chat_image_pick_requested() -> void:
 	if _pick_dialog == null:
 		_pick_dialog = FileDialog.new()
@@ -731,7 +723,7 @@ func _on_pick_file(path: String) -> void:
 	if img == null:
 		_chat_panel.chat("提示", "图片压缩失败（未能压到目标大小内）")
 		return
-	_editor.call("open", ImageTexture.create_from_image(img))
+	_begin_edit(img)
 
 ## 把图压到 ≤ max_bytes（JPEG）：先降质量，仍超则等比缩宽后再降质，返回压缩后 Image。
 ## 0=用原宽（仅降质）；宽度从大到小、质量从高到低，命中即返回（尽量清晰）。
@@ -752,7 +744,7 @@ func _compress_to_target(img: Image, max_bytes: int) -> Image:
 	return null
 
 func _on_editor_cancelled() -> void:
-	pass  # 取消 = 放弃这张图，不影响输入框与已附图
+	_end_edit()  # 取消 = 放弃这张图，不影响输入框与已附图
 
 ## 聊天区「图传」旁路请求（/stream 由 ChatPanel 解析后交给 Main 统一起停 UDP 接收）。
 func _on_chat_stream_requested(on: bool) -> void:
