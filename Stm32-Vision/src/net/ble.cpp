@@ -4,6 +4,7 @@
 #include "src/net/config.h"
 #include "src/net/wifi_net.h"
 #include "src/ai/ai_client.h"
+#include "src/ai/ai_alloc.h"    // g_js_alloc(共享 PSRAM JSON 池)
 
 #include <ArduinoJson.h>
 
@@ -61,8 +62,10 @@ static void enqueue(const char* text) {
 // 用 ArduinoJson 构造，自动转义 reply（内含引号/反斜杠的 JSON 字符串）。先前手拼 String
 // 原样拼接 reply 导致其内双引号破坏最外层 JSON，手机端 parse 失败 → 纯蓝牙下所有经 reply
 // 回执的指令（config/exec_log/light/reset/ai_cancel…）都"没有反馈"。
-static String build_status(const char* reply) {
-  JsonDocument d;
+// 写进调用方缓冲并返回长度（不返回 String）：status 通知在日志转发开时每秒几十次，
+// 每次一份内部堆 String 既是占用也是碎片源。容量按 ip/ssid/reply 都取最长估，见调用点。
+static size_t build_status(const char* reply, char* buf, size_t cap) {
+  JsonDocument d(&g_js_alloc);   // PSRAM 池
   d["ip"] = net::is_connected() ? net::local_ip().toString().c_str() : "";
   d["wifi_ssid"] = cfg::wifi_ssid();
   d["ws"] = g_ws_connected;
@@ -71,10 +74,13 @@ static String build_status(const char* reply) {
   // 手机端与 WS 走同一套 _apply_state_bits 同步按钮(否则纯蓝牙下灯等按钮永不更新)。
   d["bits"] = cmd::state_bits();
   if (reply && reply[0]) d["reply"] = reply;
-  String s;
-  serializeJson(d, s);
-  return s;
+  return serializeJson(d, buf, cap);
 }
+
+// status JSON = ip + ssid(≤32) + 若干布尔/整数 + 可选 reply。reply 可能是 AI 的完整回执
+// (ble::reply 接的是 ai::enqueue_result 的文本)，长度不定 ⇒ 不能用定长栈缓冲：截出半个 JSON
+// 会让手机端 parse 失败。改用 PSRAM: 反正这条路径每秒可能几十次, 关键是不碰内部堆。
+#define BLE_STATUS_BUF 2048
 
 // 按 ≤MTU 的片多次 notify（手机端按"能解析出完整 JSON"拼接）。NimBLE 单包 notify 只发
 // MTU-3 字节，超长会截断导致手机 Parse JSON failed。配合 ble_att_set_preferred_mtu(256)
@@ -94,8 +100,11 @@ static void notify_raw(const char* s) {
 }
 
 static void notify_status(const char* reply) {
-  String s = build_status(reply);
-  notify_raw(s.c_str());
+  char* buf = (char*)heap_caps_malloc(BLE_STATUS_BUF, MALLOC_CAP_SPIRAM);
+  if (!buf) return;                       // PSRAM 都没了: 丢这一条, 别去挤内部堆
+  build_status(reply, buf, BLE_STATUS_BUF);
+  notify_raw(buf);
+  heap_caps_free(buf);
 }
 
 // ---------------- GATT 回调 ----------------
@@ -145,8 +154,11 @@ class CharCB : public BLECharacteristicCallbacks {
   }
   void onRead(BLECharacteristic* c) override {
     if (BLEUUID(c->getUUID()).equals(BLEUUID(k_status))) {
-      String s = build_status("");
-      c->setValue((uint8_t*)s.c_str(), s.length());
+      char* buf = (char*)heap_caps_malloc(BLE_STATUS_BUF, MALLOC_CAP_SPIRAM);
+      if (!buf) { c->setValue((uint8_t*)"{}", 2); return; }
+      size_t n = build_status("", buf, BLE_STATUS_BUF);
+      c->setValue((uint8_t*)buf, n);
+      heap_caps_free(buf);
     }
   }
 };

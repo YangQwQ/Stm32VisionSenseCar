@@ -1,4 +1,5 @@
 #include "src/net/ping_svc.h"
+#include "src/ai/ai_alloc.h"    // g_js_alloc(共享 PSRAM JSON 池)
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <stdlib.h>        // calloc/free
@@ -84,13 +85,13 @@ static void on_end(esp_ping_handle_t hdl, void* args) {
 // 回执（status 帧）只发给发起方那一个 fd —— 手机发的 /ping，电脑那侧永远看不到。
 // 排查时这等于没有观察窗口，故每条结果额外走一遍 blog 转发（cat=all 时 WS+BLE 都能收到）。
 static void send_status(cmd::ReplyFn fn, void* ctx, const char* reason) {
-  JsonDocument out;
+  JsonDocument out(&g_js_alloc);
   out["type"] = "status";
   out["params"]["reason"] = reason;
-  String s;
-  serializeJson(out, s);
+  char buf[256];
+  serializeJson(out, buf, sizeof(buf));
   blog::logf(blog::CMD, "%s", reason);
-  if (fn) fn(ctx, s.c_str());
+  if (fn) fn(ctx, buf);
 }
 
 // 会话任务的每条出口都要清 s_busy（否则后续 ping 全被判"上一个还在进行"）。

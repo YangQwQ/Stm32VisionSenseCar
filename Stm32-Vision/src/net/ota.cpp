@@ -76,6 +76,8 @@ static const esp_partition_t* s_target = nullptr;
 static void ota_quiesce() {
   ai::cancel(ai::StopMode::All);  // 打断 AI 闭环，并中止在途 TLS 请求
   cmd::set_streaming(false);      // 停 UDP 图传（ws_stream_task 随即释放帧缓冲副本）
+  // 这里刻意留在内部堆(不挂 g_js_alloc): OTA 写入 flash 期间另一核会被短暂挂起, PSRAM 侧
+  // 的分配路径更长; 这份文档只有两个键, 用内部堆反而稳。
   JsonDocument doc;
   doc["scope"] = "all";
   // 停四轮 + 清机械臂连续动作。

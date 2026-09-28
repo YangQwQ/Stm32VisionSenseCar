@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <Stream.h>      // PieceStream: 喂给 HTTPClient::sendRequest
 #include <stdio.h>
 #include <stdlib.h>      // free
 #include <string.h>      // strlen/memcpy
@@ -13,14 +14,19 @@ struct PsaBuf {
   ~PsaBuf() { if (p) free(p); }
   bool ensure(size_t need) {
     if (len + need + 1 <= cap) return true;
-    size_t nc = cap ? cap * 2 : 1024 * 1024;
+    size_t nc = cap ? cap * 2 : 16 * 1024;
     while (nc < len + need + 1) nc *= 2;
     char* np = (char*)heap_caps_realloc(p, nc, MALLOC_CAP_SPIRAM);
     if (!np) { ok = false; return false; }
     p = np; cap = nc; return true;
   }
-  void put(const char* s) { if (!ok || !ensure(strlen(s)) ) { ok = false; return; } memcpy(p + len, s, strlen(s)); len += strlen(s); p[len] = 0; }
+  void put(const char* s) { size_t n = strlen(s); if (!ok || !ensure(n)) { ok = false; return; } memcpy(p + len, s, n); len += n; p[len] = 0; }
   void put(char c) { if (!ok || !ensure(1)) { ok = false; return; } p[len++] = c; p[len] = 0; }
+  // 批量追加原始字节(响应正文收包用): 长度显式给出, 不按 C 串处理。
+  void append(const uint8_t* d, size_t n) { if (!ok || !ensure(n)) { ok = false; return; } memcpy(p + len, d, n); len += n; p[len] = 0; }
+  // 清空但**保留容量**: 每轮响应都从零开始, 复用同一块可彻底免掉反复 realloc。
+  void clear() { len = 0; if (p) p[0] = 0; }
+  const char* c_str() const { return p ? p : ""; }
 };
 
 // 帧字节引用: JPEG(指针, 长度)必须成对传递, 拆成两个位置参数极易调错
@@ -39,6 +45,7 @@ struct ImgRef {
 #define AI_PREV_SLOTS 3
 
 struct HistCall {
+  char* strbuf = nullptr;    // id/name/args/result 四段字符串同块 PSRAM 分配, 一次释放; 下列指针指入其中
   char* id = nullptr;        // tool_call id(assistant 与 tool 配对)
   char* name = nullptr;      // 工具名(car/mem/task/goal/look/say/compact)
   char* args = nullptr;      // 模型给的参数原文(回喂 = AI 的实际输出)
@@ -69,5 +76,56 @@ struct BodyReq {
   const char* frame_note = nullptr;  // 画面文本前缀(无画面时也用它给出警告文案)
 };
 
-// 系统提示词(角色+规则+标定) + 历史回合 + 尾部(状态块/画面), 组进 PSRAM。
-void build_body(PsaBuf& b, const BodyReq& r);
+// ================ 请求体碎片流 ================
+// 请求体不再整块拼接, 而是"碎片序列": 固定部分(系统提示词/tools 声明)直接引用静态字节, JPEG 走 B64
+// 边发边编码。total = 各碎片输出字节之和 = Content-Length, 直接交给 HTTPClient::sendRequest。
+struct Piece {
+  enum Kind : uint8_t { TEXT, B64 };
+  Kind kind = TEXT;
+  const uint8_t* p = nullptr;   // TEXT: 文本字节; B64: JPEG 原始字节
+  size_t n = 0;                 // 原始字节数(TEXT=文本长; B64=JPEG 长)
+  size_t out_n = 0;             // 输出字节数(TEXT=n; B64=4*((n+2)/3))
+  bool own = false;             // p 由本列表分配(渲染出来的文本), 析构时释放
+};
+
+struct PieceList {
+  Piece* it = nullptr;
+  int n = 0, cap = 0;
+  size_t total = 0;             // 输出字节总数(= Content-Length)
+  bool ok = true;
+
+  PieceList() = default;
+  PieceList(const PieceList&) = delete;
+  PieceList& operator=(const PieceList&) = delete;
+  ~PieceList();
+
+  void add_text(const char* s, size_t len);      // 借用静态/外部缓冲(须活到发送完成)
+  void add_b64(const uint8_t* jpg, size_t len);  // JPEG 原始字节, 发送时编码
+  void take(PsaBuf& b);                          // 接管 b 的缓冲作为 TEXT 碎片, 并把 b 置空
+
+private:
+  Piece& push();
+  Piece scratch;                // push 失败时的占位返回
+};
+
+// 把碎片序列喂给 HTTPClient: readBytes 逐碎片取, B64 碎片当场编码。
+// rewind() 可重播(pass1 重连后重发同一 body), 因每个碎片的输出都由固定的 (指针, 偏移) 决定, 字节必然一致。
+class PieceStream : public Stream {
+public:
+  explicit PieceStream(PieceList& l) : l_(l) { rewind(); }
+  void rewind() { idx_ = 0; off_ = 0; done_ = 0; }
+  int available() override { return (int)(l_.total - done_); }
+  int read() override;
+  int peek() override;
+  size_t readBytes(char* buf, size_t len) override;
+  size_t write(uint8_t) override { return 0; }   // 只读流: 不实现写入
+
+private:
+  PieceList& l_;
+  int idx_ = 0;        // 当前碎片
+  size_t off_ = 0;     // 当前碎片已产出的输出字节
+  size_t done_ = 0;    // 已产出的总输出字节(available 用)
+};
+
+// 系统提示词(角色+规则+标定) + 历史回合 + 尾部(状态块/画面), 组进碎片列表。
+void build_body(PieceList& l, const BodyReq& r);

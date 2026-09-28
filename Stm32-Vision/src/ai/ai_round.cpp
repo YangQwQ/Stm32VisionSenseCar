@@ -1,7 +1,7 @@
 #include "src/ai/ai_round.h"
 #include "src/ai/ai_client.h"   // ai::logf / enqueue_result 等协作入口 + ai::generation
 #include "src/ai/ai_result.h"   // AI_EDITED_* + edited_snapshot
-#include "src/ai/ai_prompt.h"   // PsaBuf + build_body
+#include "src/ai/ai_prompt.h"   // PsaBuf/PieceList + build_body
 #include "src/ai/ai_mem.h"      // 空间记忆/车姿态: mem_reset/mem_feed/mem_find/...
 #include "src/ai/ai_http.h"     // http_post/http_last_status/http_stop/extract_tool_calls
 #include "src/ai/ai_validate.h" // validate_cmd/safe_append
@@ -49,7 +49,6 @@
 // ---------------- 放大镜(look(zoom=true)) ----------------
 // 放大镜: 把 AI 的"眼睛"凑近(裁块放大回喂), 让它在放大图里跟**看得见的夹爪**比相对位置; 裁框由程序记账 ⇒ 换回全幅是精确算术。
 #define AI_ZOOM_QUALITY 80          // 比图传略高(这是用来看细节的), 一帧几十 KB
-#define AI_ZOOM_JPG_MAX (128 * 1024) // 放大图单帧上限: 640×480 高清近景高熵 JPEG 可超 48K, 抬到 128K; 超了弃用回全幅
 // 放大镜=切高清真拍(request_hires): 切 SVGA 抓一帧, TJpgDec 部分解码只裁中央 (0.25,0.25)-(0.75,0.75),
 // 中央 1/4 源 1:1 回喂。⚠️ 只用 SVGA: SXGA 的 reconfigure 重建会卡死驱动。
 #define AI_HIRES_FRAME   FRAMESIZE_SVGA   // 高清目标分辨率（800×600）
@@ -121,7 +120,6 @@ struct RoundCtx {
   size_t prev_len[AI_PREV_SLOTS] = {};
   uint32_t prev_id[AI_PREV_SLOTS] = {};   // 各槽全局图片编号(0=空槽); 与 prev/prev_len 同生同灭
   uint32_t look_ids[2] = {};        // 本条 look 清单里各图的全局编号(与 look_cnt 配对)
-  uint8_t* zoom_jpg = nullptr;      // 放大图缓冲(首次用到时分配; 出图后拷进 cur)
   bool frame_moving = false;        // 首帧抓取时车/臂仍在动 → 提示别硬信本帧
   const uint8_t* frame = nullptr;   // 本回合由程序注入尾部 user 的那张图(首轮; 发过一次即清)
   size_t frame_len = 0;
@@ -201,7 +199,7 @@ static void hist_free_turn(HistTurn& tn) {
   free(tn.reasoning); tn.reasoning = nullptr;   // 两条路径共用(free(nullptr) 安全)
   if (tn.chat) { free(tn.text); tn.text = nullptr; return; }
   for (int i = 0; i < tn.ncall; i++) {
-    free(tn.calls[i].id); free(tn.calls[i].name); free(tn.calls[i].args); free(tn.calls[i].result);
+    free(tn.calls[i].strbuf);   // id/name/args/result 同块分配, 一次释放
     tn.calls[i] = HistCall();
   }
   tn.ncall = 0;
@@ -235,17 +233,27 @@ static void hist_add_chat(RoundCtx& c, const char* text, bool origin = false) {
   tn->text = ps_dup(text);
 }
 
-// 向当前回合追加一次工具调用(id/name/args/result 字符串拷进 PSRAM; 图只存指针与张数)
+// 向当前回合追加一次工具调用(id/name/args/result 拷进**同一块** PSRAM; 图只存指针与张数)
 static void hist_add_call(RoundCtx& c, const char* id, const char* name, const char* args,
                           const char* result) {
   if (!c.hist || c.hist_n <= 0) return;
   HistTurn& tn = c.hist[c.hist_n - 1];
   if (tn.chat || tn.ncall >= AI_HIST_CALL_MAX) return;
-  HistCall& hc = tn.calls[tn.ncall++];
-  hc.id = ps_dup(id ? id : "");
-  hc.name = ps_dup(name ? name : "");
-  hc.args = ps_dup(args ? args : "{}");
-  hc.result = ps_dup(result ? result : "");
+  const char* s0 = id ? id : "";
+  const char* s1 = name ? name : "";
+  const char* s2 = args ? args : "{}";
+  const char* s3 = result ? result : "";
+  size_t n0 = strlen(s0) + 1, n1 = strlen(s1) + 1, n2 = strlen(s2) + 1, n3 = strlen(s3) + 1;
+  char* buf = (char*)heap_caps_malloc(n0 + n1 + n2 + n3, MALLOC_CAP_SPIRAM);
+  if (!buf) return;   // 分配失败: 不记这次调用(与 ps_dup 失败时留空指针的既有行为一致)
+  HistCall& hc = tn.calls[tn.ncall];
+  char* w = buf;
+  hc.id = w;     memcpy(w, s0, n0); w += n0;
+  hc.name = w;   memcpy(w, s1, n1); w += n1;
+  hc.args = w;   memcpy(w, s2, n2); w += n2;
+  hc.result = w; memcpy(w, s3, n3);
+  hc.strbuf = buf;
+  tn.ncall++;
 }
 
 // compact 落地: 释放除"本回合"外的全部回合, 在最前插一条 AI 自述的进展摘要。
@@ -353,9 +361,11 @@ static void notify_tool(RoundCtx& c, const char* text) {
   JsonDocument d(&g_js_alloc);
   d["type"] = "ai_tool";
   d["params"]["text"] = text;
-  String s;
-  serializeJson(d, s);
-  ai::enqueue_result(s.c_str(), c.t.fn, c.t.ctx);
+  // 栈缓冲序列化: text 是 ≤200B 的进度行(见各调用点的 char nb[80..200]), 512B 含转义有充分余量。
+  // 免掉 String 那次内部堆分配 —— enqueue_result 反正立刻把文本拷进自己的那一块里。
+  char buf[512];
+  serializeJson(d, buf, sizeof(buf));
+  ai::enqueue_result(buf, c.t.fn, c.t.ctx);
 }
 
 // 兜底 stop(任务终结出口统一解析一次)。stop_mode 由打断方写入: None=手动 move/stop 接管(不补停);
@@ -365,7 +375,7 @@ static void resolve_stop() {
   if (!g_last_continuous) return;
   // Wheels 模式只对轮子持续残留停轮子; 臂持续残留(或未知)必须全停。
   const char* scope = (ai::stop_mode() == (int)ai::StopMode::Wheels && g_last_cont_type == 1) ? "wheels" : "all";
-  JsonDocument d; d["scope"] = scope;   // d 即 stop 的 params 对象
+  JsonDocument d(&g_js_alloc); d["scope"] = scope;   // d 即 stop 的 params 对象
   exec::act("stop", d.as<JsonObjectConst>());
   blog::logf(blog::AI, "兜底 stop scope=%s", scope);
   g_last_continuous = false;
@@ -464,18 +474,18 @@ static bool fetch_image(RoundCtx& c, bool zoom, char* note, size_t note_cap, boo
   if (zoom) {
     int hok = 0;
     camera_fb_t* hfb = cam::request_hires(AI_HIRES_FRAME, &hok);
-    if (!c.zoom_jpg) c.zoom_jpg = (uint8_t*)heap_caps_malloc(AI_ZOOM_JPG_MAX, MALLOC_CAP_SPIRAM);
+    if (!c.cur) c.cur = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
     size_t zl = 0;
-    // 用 TJpgDec 部分解码裁中央的 crop_center_jpg（固定 (0.25,0.25)-(0.75,0.75)）：
+    // 用 TJpgDec 部分解码裁中央的 crop_center_jpg（固定 (0.25,0.25)-(0.75,0.75)），直接输出到 cur
+    // （统一由 cur 承载"最近一张图", 环做回看）：
     // workbuf/RGB 全走 PSRAM，不碰内部堆/DMA —— 内部堆被软解吃穿会导致整板卡死。
-    bool ok = hfb && hok && c.zoom_jpg &&
+    bool ok = hfb && hok && c.cur &&
               magnify::crop_center_jpg(hfb->buf, cam::jpeg_len(hfb), hfb->width, hfb->height,
-                                       c.zoom_jpg, AI_ZOOM_JPG_MAX, &zl,
+                                       c.cur, AI_EDITED_IMG_MAX, &zl,
                                        AI_HIRES_OUT_W, AI_HIRES_OUT_H, AI_ZOOM_QUALITY) && zl > 0;
     if (hfb) cam::return_frame(hfb);   // 高清帧用完归还（request_hires 内部已切回 VGA 放锁）
-    if (!c.cur) c.cur = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
-    if (ok && c.cur && zl <= AI_EDITED_IMG_MAX) {
-      memcpy(c.cur, c.zoom_jpg, zl); c.cur_len = zl;   // 统一由 cur 承载"最近一张图"(环做回看)
+    if (ok) {
+      c.cur_len = zl;
       c.cur_id = img_next_id();
       if (note && note_cap) snprintf(note, note_cap, "放大%.1f× 全幅(0.25,0.25)-(0.75,0.75)", (double)AI_ZOOM_DEF);
       if (out_zoomed) *out_zoomed = true;
@@ -583,7 +593,7 @@ static AttR round_attempt(RoundCtx& c) {
   }
   if (c.frame && c.frame_len > 0) carried = true;   // 尾部 user 画面(首轮)也算"发出去一张"
 
-  PsaBuf body;
+  PieceList body;
   PsaBuf state;
   build_state_block(c, state);   // 目标/列表/笔记: 每轮现拼, 挂最新一条工具结果尾部(不落历史)
   BodyReq br;
@@ -599,10 +609,10 @@ static AttR round_attempt(RoundCtx& c) {
   c.task_remind[0] = 0; // 已随状态块挂出
   if (!body.ok) { c.fail = "组装请求 body 失败"; return AttR::Break; }
 
-  String resp;
+  PsaBuf resp;   // 响应正文收进 PSRAM(内部堆才是瓶颈; 见 ai_http.h 的说明)
   bool http_ok = false;
   for (int nr = 0; nr < 3 && !http_ok; nr++) {   // 网络失败指数退避重试(任务串行, 代价可控)
-    if (ai::http_post(cfg::ai_url().c_str(), cfg::ai_key().c_str(), body.p, resp, c.t.generation)) { http_ok = true; break; }
+    if (ai::http_post(cfg::ai_url().c_str(), cfg::ai_key().c_str(), body, resp, c.t.generation)) { http_ok = true; break; }
     if (c.t.generation != ai::generation()) { c.done = true; c.interrupted = true; break; }  // 被中止, 静默作废
     if (ai::http_last_status() >= 400 && ai::http_last_status() < 500) {  // 4xx 重发同 body 必然再拒, 快速失败
       int st = ai::http_last_status();
@@ -633,7 +643,7 @@ static AttR round_attempt(RoundCtx& c) {
   int nc = ai::extract_tool_calls(resp, c.calls, &body_broken);
   if (nc <= 0) {
     // 无工具调用: 模型只回了文本 / 思考把预算吃光被 length 截断 / 传输层截断。打原始片段便于定位。
-    blog::logf(blog::AI, "无工具调用, 原始(前120B): %s", resp.substring(0, 120).c_str());
+    blog::logf(blog::AI, "无工具调用, 原始(前120B): %.120s", resp.c_str());
     c.fail = "AI 未调用工具(只回了文本或被 length 截断)";
     if (body_broken) ai::http_stop();  // 传输层截断/残留: 弃用复用连接, 下次全新握手防污染
     return AttR::Retry;
@@ -1535,7 +1545,6 @@ static void round_task_finish(RoundCtx& c) {
   for (int i = 0; i < AI_EDITED_SLOTS; i++) if (c.ed_img[i]) free(c.ed_img[i]);  // 用户编辑图快照
   if (c.cur) free(c.cur);          // 最近一张帧 PSRAM 副本
   for (int i = 0; i < AI_PREV_SLOTS; i++) if (c.prev[i]) free(c.prev[i]);   // 先前帧环各槽副本
-  if (c.zoom_jpg) free(c.zoom_jpg);   // 放大图缓冲(任务期复用, 不跨任务留着占 PSRAM)
   if (c.hist) {                    // 历史环: 逐回合放掉各调用的字符串, 再放表本身
     for (int i = 0; i < c.hist_n; i++) hist_free_turn(c.hist[i]);
     free(c.hist);

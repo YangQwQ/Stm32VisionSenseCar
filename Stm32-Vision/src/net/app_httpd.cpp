@@ -35,6 +35,7 @@
 #include "src/ai/ai_dump.h"   // AI 抓帧留档清单/取图（/ai_dump, /ai_frame 调试用）
 #include "src/ai/magnify.h"   // /zoomshot：手动对当帧裁出中央放大图（等价于 AI 的 zoom）
 #include "src/ai/ai_client.h"   // ai::busy()：AI 任务进行中时图传 FPS 降半，让 CPU 与内部 DMA 池给 AI 让路
+#include "src/ai/ai_alloc.h"    // g_js_alloc(共享 PSRAM JSON 池)
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -332,6 +333,22 @@ static esp_err_t ws_send_text(int fd, const char *text)
     return r;
 }
 
+// 发送一条**已消毒**的文本（不再拷贝/再消毒）：仅供 blog 转发路径用——enqueue_line 已在
+// 手拼 JSON 时完成转义与 UTF-8 清洗，这里直接引用其缓冲（httpd async 发送内部会同步拷贝载荷，
+// 故调用方可立即释放源缓冲）。省掉通用出口那次多余拷贝 + 扫描。
+static esp_err_t ws_send_text_raw(int fd, const char *text, size_t len)
+{
+    httpd_ws_frame_t frame = {0};
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    frame.payload = (uint8_t *)text;
+    frame.len = len;
+    if (s_ws_tx_mtx && xSemaphoreTake(s_ws_tx_mtx, pdMS_TO_TICKS(WS_TX_LOCK_TIMEOUT_MS)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t r = httpd_ws_send_frame_async(stream_httpd, fd, &frame);
+    if (s_ws_tx_mtx) xSemaphoreGive(s_ws_tx_mtx);
+    return r;
+}
+
 static esp_err_t ws_send_jpeg(int fd, camera_fb_t *fb)
 {
     httpd_ws_frame_t frame = {0};
@@ -363,7 +380,7 @@ static void ws_cmd_reply(void *ctx, const char *text)
 // 文本帧 = 指令 JSON；stream 就地建/拆 UDP 会话，其余统一移交 command 模块
 static void ws_handle_text(const char *json, int fd)
 {
-    JsonDocument doc;
+    JsonDocument doc(&g_js_alloc);   // PSRAM 池: 每条 WS 指令一份(摇杆每秒几十条), 别碎内部堆
     if (deserializeJson(doc, json)) {
         log_w("[ws] bad json: %s", json);
         return;
@@ -445,28 +462,32 @@ static esp_err_t ws_handler(httpd_req_t *req)
     // 二进制帧 = 编辑图（裸 JPEG，手机→板）：覆盖暂存供 ai_goal{use_image}消费。
     if (pkt.type == HTTPD_WS_TYPE_BINARY) {
         if (pkt.len > WS_EDIT_IMG_MAX) return ESP_FAIL;  // 超大帧，断开
-        char *ibuf = (char *)malloc(pkt.len);
+        // ⚠️ 必须放 PSRAM: 这份缓冲只是"过路"——收完下一行就被 memcpy 进 PSRAM 槽, 内部堆
+        // 上白占最大 128KB。这个瞬时大块正是把「最大连续空闲块」打到几百字节的元凶(内部堆
+        // 一紧 httpd 就分配不出东西, 表现为 WS 反复断链 / UDP 成片弃帧 errno=12)。
+        // httpd_ws_recv_frame 是普通 memcpy, 不涉及 DMA, 放 PSRAM 无碍。
+        char *ibuf = (char *)heap_caps_malloc(pkt.len, MALLOC_CAP_SPIRAM);
         if (!ibuf) return ESP_ERR_NO_MEM;
         pkt.payload = (uint8_t *)ibuf;
         ret = httpd_ws_recv_frame(req, &pkt, pkt.len);
         if (ret == ESP_OK && pkt.type == HTTPD_WS_TYPE_BINARY) {
             ai::set_edited_image((uint8_t *)ibuf, pkt.len);
         }
-        free(ibuf);
+        heap_caps_free(ibuf);
         return ret;
     }
 
     // 文本帧 = 指令 JSON（≤512B，异常长帧断开）
     if (pkt.len > 512) return ESP_FAIL;
-    char *buf = (char *)malloc(pkt.len + 1);
-    if (!buf) return ESP_ERR_NO_MEM;
+    // 栈上定长: 每条 WS 指令(摇杆每秒几十条)都去 malloc 一块 ≤513B 的内部堆, 是典型的碎片源。
+    // httpd 会话栈已调到 8192(见 startCameraServer), 513B 无压力。
+    char buf[513];
     pkt.payload = (uint8_t *)buf;
     ret = httpd_ws_recv_frame(req, &pkt, pkt.len);
     if (ret == ESP_OK && pkt.type == HTTPD_WS_TYPE_TEXT) {
         buf[pkt.len] = 0;
         ws_handle_text(buf, httpd_req_to_sockfd(req));
     }
-    free(buf);
     return ret;
 }
 
@@ -504,10 +525,19 @@ static void ws_send_text_to_ws_clients(const char *text)
 // 由 startCameraServer 注册，供 blog::logf 排队后统一发手机。
 static void send_log_to_phone(const char *json)
 {
-    ws_send_text_to_ws_clients(json);
+    // 直发：enqueue_line 已在手拼 JSON 时消毒，省掉通用出口(ws_send_text)那条多余的拷 + 扫描。
+    size_t len = strlen(json);
+    int fds[WS_MAX_CLIENTS];
+    size_t n = WS_MAX_CLIENTS;
+    if (httpd_get_client_list(stream_httpd, &n, fds) == ESP_OK) {
+        for (size_t i = 0; i < n; i++) {
+            if (httpd_ws_get_fd_info(stream_httpd, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) continue;
+            ws_send_text_raw(fds[i], json, len);
+        }
+    }
     // 长文本(如 AI 思考转发)单一 JSON 可达几十 KB, BLE 分片 notify 无意义且阻塞转发任务,
     // 只在短文本(常规日志/状态)时走 BLE 兜底。
-    if (strlen(json) <= 512) ble::send_status(json);
+    if (len <= 512) ble::send_status(json);
 }
 
 // 图传推流任务：stream 开启时按帧率向所有 WS 客户端推 JPEG 帧；
@@ -630,14 +660,15 @@ static void ws_stream_task(void *arg)
             if (exec::read_state(st, sizeof(st)) && strcmp(st, s_last_state)) {
                 strncpy(s_last_state, st, sizeof(s_last_state) - 1);
                 s_last_state[sizeof(s_last_state) - 1] = 0;
-                JsonDocument sdoc;
+                // PSRAM 池 + 栈缓冲序列化: 这条每 400ms 一次, 别每回都去内部堆要两块(String 文档 + String 副本)。
+                JsonDocument sdoc(&g_js_alloc);
                 sdoc["type"] = "exec_status";
                 JsonObject sp = sdoc["params"].to<JsonObject>();
                 sp["text"] = st;
-                String js;
-                serializeJson(sdoc, js);
-                if (has_client) ws_send_text_to_ws_clients(js.c_str());
-                ble::send_status(js.c_str());
+                char js[768];   // st 上限 256B, 最坏全部转义 = 512B, 留足余量
+                serializeJson(sdoc, js, sizeof(js));
+                if (has_client) ws_send_text_to_ws_clients(js);
+                ble::send_status(js);
             }
         }
         // 图传已改走 UDP：WS 客户端在位仅作指令/状态通道，几乎不占射频；

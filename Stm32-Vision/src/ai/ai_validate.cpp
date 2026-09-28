@@ -39,7 +39,8 @@ const char* ai::validate_cmd(const char* content, JsonDocument& out, char* err_b
 
   JsonDocument doc(&g_js_alloc);  // PSRAM 池, 避免内部堆碎片
   if (deserializeJson(doc, c)) {
-    snprintf(err_buf, err_cap, "AI 返回非 JSON: %s", c.substring(0, 80).c_str());
+    // 不再 c.substring(0,80) 出第二份副本: err_buf 本身就截断, 交给 snprintf 的精度即可。
+    snprintf(err_buf, err_cap, "AI 返回非 JSON: %.80s", c.c_str());
     return err_buf;
   }
   // 顶层必须是 JSON 对象: 模型偶尔给出裸数组/字符串/数字(如 "[]" 或 "ok")。非对象时 `doc["type"]`
@@ -47,7 +48,7 @@ const char* ai::validate_cmd(const char* content, JsonDocument& out, char* err_b
   // 用 Const 形式判定(理由见 tool.h: `JsonVariantConst::is<JsonObject>()` 恒 false 且照样编译过)。
   JsonVariantConst root = doc;
   if (!root.is<JsonObjectConst>()) {
-    snprintf(err_buf, err_cap, "AI 返回的 JSON 不是对象(应为 {\"工具名\":{...}}): %s", c.substring(0, 80).c_str());
+    snprintf(err_buf, err_cap, "AI 返回的 JSON 不是对象(应为 {\"工具名\":{...}}): %.80s", c.c_str());
     return err_buf;
   }
   // 顶层出现旧单指令格式 type → 拒并给处方: 改用分组 JSON(car 的 move/arm/light 通道)。

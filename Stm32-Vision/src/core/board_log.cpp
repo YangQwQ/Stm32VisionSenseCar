@@ -1,7 +1,6 @@
 #include "src/core/board_log.h"
-#include <ArduinoJson.h>
 #include <stdio.h>     // snprintf（state_text）
-#include <string.h>    // strdup/memcpy
+#include <string.h>    // memcpy/strlen
 #include <stdlib.h>    // free
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -15,7 +14,7 @@
 
 namespace blog {
 
-static void sanitize_utf8(char* s);   // 前置声明（定义在 logf 之后）
+static void enqueue_line(Cat c, const char* text);   // 前置声明（定义在 logf 之后）
 
 static bool g_en[CAT_MAX] = {false};
 static bool g_all = false;
@@ -69,6 +68,12 @@ void state_text(char* buf, size_t n) {
 
 void set_forwarder(SendFn fn) { g_sender = fn; }
 
+void log_line(Cat c, const char* text) {
+  if (c >= CAT_MAX || !text) return;
+  if (g_all || g_en[c]) enqueue_line(c, text);   // 转义 + 清洗 + 入队一趟在手拼缓冲里完成
+  Serial.printf("[%s] %s\n", k_name[c], text);
+}
+
 void logf(Cat c, const char* fmt, ...) {
   if (c >= CAT_MAX) return;             // 非法类别：静默丢弃，防 k_name 越界
   char buf[256];
@@ -77,35 +82,15 @@ void logf(Cat c, const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, ap);
   buf[sizeof(buf) - 1] = 0;  // 截断防越界
   va_end(ap);
-
-  if (g_all || g_en[c]) {
-    // 转发副本做 WS 消毒（残缺 UTF-8 → '?'，1:1），串口仍留原始便于排查。
-    char scr[256];
-    memcpy(scr, buf, sizeof(scr));
-    scr[sizeof(scr) - 1] = 0;
-    sanitize_utf8(scr);
-    // 组 {type:"log", params:{src, text}}，挤出阻塞式入队（满则丢，自带 free，无 UAF/泄漏）。
-    JsonDocument d;
-    d["type"] = "log";
-    d["params"]["src"] = k_name[c];
-    d["params"]["text"] = scr;
-    String s;
-    serializeJson(d, s);
-    if (g_q) {
-      char* copy = strdup(s.c_str());
-      if (copy && xQueueSend(g_q, &copy, 0) != pdTRUE) free(copy);
-    }
-  }
-  Serial.printf("[%s] %s\n", k_name[c], buf);
+  log_line(c, buf);
 }
 
-// 转发一条任意长度文本（AI 思考等）为 {type:"log",params:{src,text}}。
-// 手工拼接 JSON（含必做的转义），副本整体放 PSRAM——不用 ArduinoJson：大文本逐字符
-// 转义会先落到内部堆，几十 KB 思考直接威胁 DMA 块红线。转发开关同 logf；不打串口。
-void forward_text(Cat c, const char* text) {
-  if (c >= CAT_MAX) return;
-  if (!(g_all || g_en[c])) return;      // 与 logf 同一开关
-  if (!text) return;
+// 手拼一条 {type:"log",params:{src,text}} 并整块入队（跨线程副本，所有权交给转发任务）。
+// 转义与 UTF-8 清洗一趟完成：引号/反斜杠/控制符按 JSON 规则转义或替换为 '?'，非法/残缺字节→'?'
+// （RFC6455 TEXT 帧必须为合法 UTF-8，否则手机端以 1007 断链）。副本整体放 PSRAM——不用 ArduinoJson：
+// 大文本逐字符转义会先落到内部堆，几十 KB 思考直接威胁 DMA 块红线。
+static void enqueue_line(Cat c, const char* text) {
+  if (c >= CAT_MAX || !text) return;
   const char* sc = k_name[c];
   // 前缀 {"type":"log","params":{"src":" + src + 常量 + 转义后的 text + "}}
   const char* pre = "{\"type\":\"log\",\"params\":{\"src\":\"";
@@ -124,7 +109,7 @@ void forward_text(Cat c, const char* text) {
     if (cc == '\t')                        { body += 2; p++; continue; }   // \t
     if (cc < 0x20 || cc == 0x7f)           { body += 1; p++; continue; }   // 其余控制符→'?'
     if (cc < 0x80)                         { body += 1; p++; continue; }   // 普通 ASCII(数字/英文/标点)原样
-    // 多字节 UTF-8：校验引导符 + 续字节，合法整段原样，非法首字节→'?'（同 sanitize_utf8 策略）
+    // 多字节 UTF-8：校验引导符 + 续字节，合法整段原样，非法首字节→'?'
     int need = 0;
     if (cc >= 0xC2 && cc <= 0xDF) need = 1;
     else if (cc >= 0xE0 && cc <= 0xEF) need = 2;
@@ -174,30 +159,12 @@ void forward_text(Cat c, const char* text) {
   }
 }
 
-// 就地把一条待发文本转为合法 UTF-8（RFC6455 TEXT 帧必须为 UTF-8）。
-// 云端 AI 响应被日志原样嵌入（如 "HTTP %s body=%s" / "原始读取"）时，偶发残缺 UTF-8
-// 或非法字节；若原样送进 WS TEXT 帧，手机 Godot 会以关闭码 1007 断链。与 ai_client 的
-// sanitize_ws_utf8 同一策略：1:1 替换（不扩容），仅改待发副本，串口仍留原始便于排查。
-static void sanitize_utf8(char* s) {
-  char* w = s;
-  const unsigned char* p = (const unsigned char*)s;
-  while (*p) {
-    unsigned char c = *p;
-    int need = 0;
-    if (c < 0x20 || c == 0x7f) { *w++ = '?'; p++; continue; }   // 控制字符
-    if (c < 0x80) { *w++ = (char)c; p++; continue; }             // 合法 ASCII
-    if (c >= 0xC2 && c <= 0xDF) need = 1;                        // 二/三/四字节引导（续字节非法→整体替换）
-    else if (c >= 0xE0 && c <= 0xEF) need = 2;
-    else if (c >= 0xF0 && c <= 0xF4) need = 3;                   // 其余首字节非法
-    bool ok = need > 0;
-    for (int i = 1; ok && i <= need; i++) {
-      unsigned char cc = p[i];
-      if (!cc || !(cc >= 0x80 && cc <= 0xBF)) ok = false;        // 续字节缺失/越界（含被截断串尾）
-    }
-    if (ok) { for (int i = 0; i <= need; i++) *w++ = (char)p[i]; p += need + 1; }
-    else { *w++ = '?'; p += 1; }                                 // 非法/残缺：单字节替换
-  }
-  *w = 0;
+// 转发一条**任意长度**文本（如 AI 思考 reasoning，常超 logf 的 256B 栈缓冲）。
+// 转发开关同 logf；串口打印由调用方负责（本函数不打串口）。
+void forward_text(Cat c, const char* text) {
+  if (c >= CAT_MAX) return;
+  if (!(g_all || g_en[c])) return;      // 与 logf 同一开关
+  enqueue_line(c, text);
 }
 
 // 转发任务：阻塞在队列上，取出带发送器发给手机（WS 广播 + BLE 通知）。

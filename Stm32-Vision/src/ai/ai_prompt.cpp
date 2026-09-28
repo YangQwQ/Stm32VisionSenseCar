@@ -1,6 +1,7 @@
 #include "src/ai/ai_prompt.h"
 #include "src/net/config.h"      // cfg::ai_model
 #include "src/ai/tools/tool.h"   // ai::tools_schema(请求尾的工具声明)
+#include <array>                 // 编译期转义(std::array)
 
 // ---------------- AI 请求构建 ----------------
 
@@ -34,27 +35,22 @@ static void esc_append(PsaBuf& b, const char* s) {
   b.put('"');
 }
 
-static void b64_append(PsaBuf& b, const uint8_t* in, size_t inlen) {
-  static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  size_t i = 0;
-  while (i + 2 < inlen) {
-    uint32_t v = (in[i] << 16) | (in[i+1] << 8) | in[i+2];
-    b.put(T[(v >> 18) & 63]); b.put(T[(v >> 12) & 63]); b.put(T[(v >> 6) & 63]); b.put(T[v & 63]);
-    i += 3;
-  }
-  if (i + 1 == inlen) {
-    uint32_t v = in[i] << 16;
-    b.put(T[(v >> 18) & 63]); b.put(T[(v >> 12) & 63]); b.put('='); b.put('=');
-  } else if (i + 2 == inlen) {
-    uint32_t v = (in[i] << 16) | (in[i+1] << 8);
-    b.put(T[(v >> 18) & 63]); b.put(T[(v >> 12) & 63]); b.put(T[(v >> 6) & 63]); b.put('=');
-  }
-}
+// 图块前缀/后缀: base64 数据夹在中间, 故拆成两段静态文本, 数据由 PieceStream 边发边编码。
+static const char IMG_PRE[] = "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
+static const char IMG_SUF[] = "\",\"detail\":\"high\"}}";   // DeepSeek 只认 low/high/original/auto, medium 会被 422 拒
 
-static void img_block(PsaBuf& b, const uint8_t* data, size_t len) {
-  b.put("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,");
-  b64_append(b, data, len);
-  b.put("\",\"detail\":\"high\"}}");   // DeepSeek 只认 low/high/original/auto; medium 会被 422 拒
+// base64 第 oi 个输出字符。无状态: 由输入直接算出, 故 rewind 重播的字节必然一致(不需要留编码状态)。
+static char b64_at(const uint8_t* in, size_t n, size_t oi) {
+  static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t i = (oi >> 2) * 3, k = oi & 3;
+  uint8_t a = i < n ? in[i] : 0;
+  uint8_t b = (i + 1) < n ? in[i + 1] : 0;
+  uint8_t c = (i + 2) < n ? in[i + 2] : 0;
+  uint32_t v = ((uint32_t)a << 16) | ((uint32_t)b << 8) | c;
+  if (k == 0) return T[(v >> 18) & 63];
+  if (k == 1) return T[(v >> 12) & 63];
+  if (k == 2) return (i + 1) < n ? T[(v >> 6) & 63] : '=';
+  return (i + 2) < n ? T[v & 63] : '=';
 }
 
 // 屏幕像素 → 地面坐标(单应投影)由独立模块 ground_proj 负责: ground::screen_to_world。
@@ -114,10 +110,28 @@ const char* ai::tools_schema() {
 ],"tool_choice":"auto")TOOLS";
 }
 
-// 构建请求 body(入参见 BodyReq)。消息通道: system(规则) → 历史环 → 尾部(状态块挂最新工具结果 / user 画面)。
-void build_body(PsaBuf& b, const BodyReq& r) {
-  PsaBuf sys;
-sys.put(R"PROMPT(
+// ---------------- 编译期 JSON 转义(静态文本如系统提示词) ----------------
+// 返回内容字节(不含外层引号); a 按最坏 2 倍预留(每个字符都需转义), len 为实际长度。
+// 只覆盖 " \ \n \r \t 五个字符(提示词无其它控制符), 与 esc_append 的处理保持一致。
+template <size_t N>
+struct Esc { std::array<char, 2 * N> a{}; size_t len = 0; };
+
+template <size_t N>
+constexpr Esc<N> esc_make(const char (&s)[N]) {
+  Esc<N> e{};
+  for (size_t i = 0; s[i]; i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { e.a[e.len++] = '\\'; e.a[e.len++] = c; }
+    else if (c == '\n') { e.a[e.len++] = '\\'; e.a[e.len++] = 'n'; }
+    else if (c == '\r') { e.a[e.len++] = '\\'; e.a[e.len++] = 'r'; }
+    else if (c == '\t') { e.a[e.len++] = '\\'; e.a[e.len++] = 't'; }
+    else e.a[e.len++] = c;
+  }
+  return e;
+}
+
+// 系统提示词原文 —— 编译期转义成可直接上线的字节, 省掉每轮全量转义(~2.5KB 的重复工作)。
+static constexpr char kSysSrc[] = R"PROMPT(
 你是Caris, 一个带猫娘气质的小车驾驶助手。你的首要目标是准确、高效地帮助用户, 猫娘语气只是轻微调味, 不能影响信息传达
 
 # 人设
@@ -190,15 +204,96 @@ sys.put(R"PROMPT(
 	- 未发现目标时, 可原地旋转搜索目标, 每步旋转不超过60度以免错过, 期间可以用observe标注一些开阔地带的位置, 旋转一周后仍未发现目标可前往开阔地带重新搜索
 	- 放置物体时: 可以在抬高物体的情况下, 到达放置点后再降臂、松爪以及后退收臂, 避免物体掉落后滚远, 同时后退方便确认结果; 如果放置点的大小距离和方向都不好准确确定, 那么可以不断小步靠近同时微调对准, 机械臂抬得够高的情况下只用考虑会不会撞到车头; 因为相机固定于小车左后方, 因此左侧近处视野较好, 近距离操作对准放置点时先右转将其转到左侧再调整可能会比较轻松; 一般情况下放置物体时使用zoom没什么用
 	- 当用户发送图片时: 请注意及时查看, 需要的话注意更新任务备注, 避免图片在 compact 之后无法查看
-)PROMPT");
+)PROMPT";
+static constexpr auto kSysEsc = esc_make(kSysSrc);
 
-b.put("{\"model\":");
-  esc_append(b, cfg::ai_model().c_str());
-  b.put(",\"messages\":[{\"role\":\"system\",\"content\":");
-  esc_append(b, sys.p ? sys.p : "");
-  
-  // 任务目标/列表/笔记不单独成消息: 由 state_block 每轮现拼后挂到最新一条工具结果尾部(不落历史, 不重复)。
-  b.put("}");
+// ---------------- 碎片流实现 ----------------
+Piece& PieceList::push() {
+  if (n == cap) {
+    int nc = cap ? cap * 2 : 32;
+    Piece* np = (Piece*)heap_caps_realloc(it, (size_t)nc * sizeof(Piece), MALLOC_CAP_SPIRAM);
+    if (!np) { ok = false; return scratch; }
+    it = np; cap = nc;
+  }
+  Piece& pc = it[n++];
+  pc.kind = Piece::TEXT; pc.p = nullptr; pc.n = 0; pc.out_n = 0; pc.own = false;
+  return pc;
+}
+
+void PieceList::add_text(const char* s, size_t len) {
+  Piece& pc = push();
+  if (!ok) return;
+  pc.p = (const uint8_t*)s; pc.n = len; pc.out_n = len;
+  total += len;
+}
+
+void PieceList::add_b64(const uint8_t* jpg, size_t len) {
+  Piece& pc = push();
+  if (!ok) return;
+  pc.kind = Piece::B64; pc.p = jpg; pc.n = len;
+  pc.out_n = ((len + 2) / 3) * 4;
+  total += pc.out_n;
+}
+
+// 接管 b 的缓冲: 免掉一次拷贝。b 置空后其析构不再释放(否则 double free)。
+void PieceList::take(PsaBuf& b) {
+  if (!b.ok) { ok = false; return; }
+  if (!b.p) return;
+  Piece& pc = push();
+  if (!ok) return;
+  pc.p = (const uint8_t*)b.p; pc.n = b.len; pc.out_n = b.len; pc.own = true;
+  total += b.len;
+  b.p = nullptr; b.len = 0; b.cap = 0;
+}
+
+PieceList::~PieceList() {
+  for (int i = 0; i < n; i++) if (it[i].own) free((void*)it[i].p);
+  free(it);
+}
+
+int PieceStream::read() {
+  uint8_t c;
+  return readBytes((char*)&c, 1) == 1 ? (int)c : -1;
+}
+
+int PieceStream::peek() {
+  if (done_ >= l_.total) return -1;
+  const Piece& pc = l_.it[idx_];
+  return pc.kind == Piece::TEXT ? (int)(uint8_t)pc.p[off_] : (int)(uint8_t)b64_at(pc.p, pc.n, off_);
+}
+
+size_t PieceStream::readBytes(char* buf, size_t len) {
+  size_t got = 0;
+  while (got < len && idx_ < l_.n) {
+    const Piece& pc = l_.it[idx_];
+    size_t avail = pc.out_n - off_;
+    size_t k = (len - got < avail) ? (len - got) : avail;
+    if (pc.kind == Piece::TEXT) {
+      memcpy(buf + got, pc.p + off_, k);
+    } else {
+      for (size_t j = 0; j < k; j++) buf[got + j] = b64_at(pc.p, pc.n, off_ + j);
+    }
+    got += k; off_ += k; done_ += k;
+    if (off_ == pc.out_n) { idx_++; off_ = 0; }
+  }
+  return got;
+}
+
+// 请求尾(静态字面量, 直接引用)。
+static const char TAIL_CFG[] = R"CFG(],"max_tokens":8192,"reasoning_effort":"low",)CFG";
+
+// 组请求碎片(入参见 BodyReq)。消息通道: system(规则) → 历史环 → 尾部(状态块挂最新工具结果 / user 画面)。
+// 一条 JSON message 一块 TEXT 碎片(元素之间夹 "," 分隔碎片); 带图的消息在 base64 处插入 B64 碎片。
+// 任务目标/列表/笔记不单独成消息: 由 state_block 每轮现拼后挂到最新一条工具结果尾部(不落历史, 不重复)。
+void build_body(PieceList& l, const BodyReq& r) {
+  // 头部: 模型名 + messages 开头 + system 消息(提示词直接引用编译期转义好的静态字节)
+  PsaBuf head;
+  head.put("{\"model\":");
+  esc_append(head, cfg::ai_model().c_str());
+  head.put(",\"messages\":[{\"role\":\"system\",\"content\":\"");
+  l.take(head);
+  l.add_text(kSysEsc.a.data(), kSysEsc.len);
+  l.add_text("\"}", 2);
   // ---- 历史回合(tool 协议): 每回合 1 条 assistant(tool_calls) + 每个调用 1 条 tool 结果; 用户发言是 user ----
   // "一次性提示"要挂在本回合**最新一条 tool 结果**尾部: 先定位它(没有 tool 结果时才落到尾部画面文本)。
   const HistCall* last_tc = nullptr;
@@ -210,9 +305,11 @@ b.put("{\"model\":");
   for (int ti = 0; ti < r.turn_n; ti++) {
     const HistTurn& tn = r.turns[ti];
     if (tn.chat) {   // 用户消息: 独立 user 文本消息, 不参与 tool 配对
-      b.put(",{\"role\":\"user\",\"content\":");
-      esc_append(b, tn.text ? tn.text : "");
-      b.put("}");
+      PsaBuf msg;
+      msg.put(",{\"role\":\"user\",\"content\":");
+      esc_append(msg, tn.text ? tn.text : "");
+      msg.put("}");
+      l.take(msg);
       continue;
     }
     if (tn.ncall <= 0) continue;
@@ -222,19 +319,23 @@ b.put("{\"model\":");
     // reasoning_content 必须原样回传(DeepSeek thinking 模式带 tools 时的要求): 缺了模型就看不到自己
     // 上轮怎么想的, 只能每轮从工具结果重新起推。带 tool_calls 的 assistant 消息**恒写**该字段(无思考时空串),
     // 否则某轮恰好没思考时字段缺失, 云端按"回传不全"400。
-    b.put(",{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":");
-    esc_append(b, tn.reasoning ? tn.reasoning : "");
-    b.put(",\"tool_calls\":[");
-    for (int ci = 0; ci < tn.ncall; ci++) {
-      const HistCall& hc = tn.calls[ci];
-      if (ci) b.put(',');
-      b.put("{\"id\":"); esc_append(b, hc.id ? hc.id : "");
-      b.put(",\"type\":\"function\",\"function\":{\"name\":"); esc_append(b, hc.name ? hc.name : "");
-      b.put(",\"arguments\":");
-      esc_append(b, hc.args ? hc.args : "{}");
-      b.put("}}");
+    {
+      PsaBuf msg;
+      msg.put(",{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":");
+      esc_append(msg, tn.reasoning ? tn.reasoning : "");
+      msg.put(",\"tool_calls\":[");
+      for (int ci = 0; ci < tn.ncall; ci++) {
+        const HistCall& hc = tn.calls[ci];
+        if (ci) msg.put(',');
+        msg.put("{\"id\":"); esc_append(msg, hc.id ? hc.id : "");
+        msg.put(",\"type\":\"function\",\"function\":{\"name\":"); esc_append(msg, hc.name ? hc.name : "");
+        msg.put(",\"arguments\":");
+        esc_append(msg, hc.args ? hc.args : "{}");
+        msg.put("}}");
+      }
+      msg.put("]}");
+      l.take(msg);
     }
-    b.put("]}");
     // 每个调用一条 tool 结果。图只对"最新一张实图"注入字节, 更早的按全局编号渲染成占位说明。
     for (int ci = 0; ci < tn.ncall; ci++) {
       const HistCall& hc = tn.calls[ci];
@@ -260,42 +361,66 @@ b.put("{\"model\":");
       if (hc.result && hc.result[0]) tt.put(hc.result);
       if (is_last && r.state_block && r.state_block[0]) tt.put(r.state_block);
       if (is_last && r.tail_hint && r.tail_hint[0]) { tt.put(" 注意: "); tt.put(r.tail_hint); }
-      b.put(",{\"role\":\"tool\",\"tool_call_id\":");
-      esc_append(b, hc.id ? hc.id : "");
-      if (hc.img_n > 0 && hc.imgs[0].p) {   // 带图: content 走内容块数组(text + 1~2 张图)
-        b.put(",\"content\":[{\"type\":\"text\",\"text\":");
-        esc_append(b, tt.p ? tt.p : "");
-        b.put("}");
-        for (int k = 0; k < (int)hc.img_n && k < 2; k++) {
-          if (!hc.imgs[k].p || hc.imgs[k].n == 0) continue;
-          b.put(",");
-          img_block(b, hc.imgs[k].p, hc.imgs[k].n);
+      // 有效图列表(最多两张)
+      const ImgRef* vis[2]; int nv = 0;
+      for (int k = 0; k < (int)hc.img_n && k < 2; k++)
+        if (hc.imgs[k].p && hc.imgs[k].n) vis[nv++] = &hc.imgs[k];
+      if (nv == 0) {   // 无图: content 是纯字符串
+        PsaBuf msg;
+        msg.put(",{\"role\":\"tool\",\"tool_call_id\":");
+        esc_append(msg, hc.id ? hc.id : "");
+        msg.put(",\"content\":");
+        esc_append(msg, tt.p ? tt.p : "");
+        msg.put("}");
+        l.take(msg);
+      } else {         // 带图: content 走内容块数组, 图块在 base64 处切开插入 B64 碎片
+        PsaBuf pre;
+        pre.put(",{\"role\":\"tool\",\"tool_call_id\":");
+        esc_append(pre, hc.id ? hc.id : "");
+        pre.put(",\"content\":[{\"type\":\"text\",\"text\":");
+        esc_append(pre, tt.p ? tt.p : "");
+        pre.put("},");
+        pre.put(IMG_PRE);
+        l.take(pre);
+        for (int k = 0; k < nv; k++) {
+          l.add_b64(vis[k]->p, vis[k]->n);
+          PsaBuf sep;
+          sep.put(IMG_SUF);
+          if (k + 1 < nv) { sep.put(","); sep.put(IMG_PRE); }   // 后面还有图
+          else sep.put("]}");                                   // 收掉 content 数组与消息对象
+          l.take(sep);
         }
-        b.put("]}");
-      } else {
-        b.put(",\"content\":");
-        esc_append(b, tt.p ? tt.p : "");
-        b.put("}");
       }
     }
   }
   // 尾部 user 画面: 首轮/本回合没有 look 时才由程序注入(有 look 的回合图在那条 tool 结果里)。
   if (r.use_frame) {
-    b.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
     PsaBuf ut;
     if (r.frame_note && r.frame_note[0]) ut.put(r.frame_note);
     ut.put(" ");   // 与图块之间留一个空格, 读起来不粘连
     // 首轮没有 tool 结果: 状态块与一次性提示只能挂在这条画面文本上, 否则会丢
     if (!last_tc && r.state_block && r.state_block[0]) ut.put(r.state_block);
     if (!last_tc && r.tail_hint && r.tail_hint[0]) { ut.put(" 注意: "); ut.put(r.tail_hint); }
-    esc_append(b, ut.p ? ut.p : "");
-    b.put("}");
-    if (r.frame.p && r.frame.n > 0) { b.put(","); img_block(b, r.frame.p, r.frame.n); }
-    b.put("]}");
+    PsaBuf pre;
+    pre.put(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    esc_append(pre, ut.p ? ut.p : "");
+    pre.put("}");
+    if (r.frame.p && r.frame.n > 0) {
+      pre.put(",");
+      pre.put(IMG_PRE);
+      l.take(pre);
+      l.add_b64(r.frame.p, r.frame.n);
+      PsaBuf suf;
+      suf.put(IMG_SUF);
+      suf.put("]}");
+      l.take(suf);
+    } else {
+      pre.put("]}");
+      l.take(pre);
+    }
   }
-  // 请求尾: max_tokens/思考档 + 工具声明(放 messages 之后, 不破坏前缀缓存)
-  // 这里只需**关掉 messages 数组**(尾部那条 user 消息的 content 数组与 message 对象已在上面 use_frame 块里关过)。
-  b.put(R"CFG(],"max_tokens":8192,"reasoning_effort":"low",)CFG");
-  b.put(ai::tools_schema());
-  b.put("}");
+  // 请求尾: 关掉 messages 数组 + max_tokens/思考档 + 工具声明(messages 之后, 不破坏前缀缓存)。
+  l.add_text(TAIL_CFG, sizeof(TAIL_CFG) - 1);
+  l.add_text(ai::tools_schema(), strlen(ai::tools_schema()));
+  l.add_text("}", 1);
 }

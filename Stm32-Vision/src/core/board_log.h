@@ -38,6 +38,9 @@ void state_text(char* buf, size_t n);
 // 统一日志输出：始终写串口（带 [类] 前缀）；enabled(c) 时同步转发手机。
 void logf(Cat c, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 
+// 输出**已格式化**的一整行（省去调用方再走一次 vsnprintf）：串口 + 转发同 logf。
+void log_line(Cat c, const char* text);
+
 // 转发一条**任意长度**的文本（如 AI 思考 reasoning，常超 logf 的 256B 栈缓冲）为
 // {type:"log",params:{src,text}} 给手机。文本副本用 PSRAM 构造（不挤内部堆/DMA 块），
 // 与 logf 同一转发开关（enabled(c) 才转）；串口打印由调用方负责（本函数不打串口）。

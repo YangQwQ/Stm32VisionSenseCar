@@ -7,6 +7,7 @@
 #include "src/exec/nezha_direct.h"
 #include "src/core/board_log.h"
 #include "src/core/heap_watch.h"   // 体征行里的 DMA 块最低水位（见 heap_watch.h）
+#include "src/ai/ai_alloc.h"       // g_js_alloc(共享 PSRAM JSON 池)
 #include "src/net/ota.h"
 #include <esp_heap_caps.h>   // /mem：内部堆各 region 的空闲/最大连续块（定位碎片来源）
 
@@ -79,15 +80,16 @@ static void reply_status(JsonDocument& src, cmd::ReplyFn reply, void* ctx,
     blog::logf(blog::CMD, "(无回复通道) %s", reason);
     return;
   }
-  JsonDocument out;
+  JsonDocument out(&g_js_alloc);   // PSRAM 池: 这是最高频的应答路径(摇杆每秒几十条), 别碎内部堆
   out["type"] = "status";
   JsonObject params = out["params"].to<JsonObject>();
   params["reason"] = reason;
   params["bits"] = cmd::state_bits();  // 附带状态位，让"会触发动作重置"的回执驱动手机端自动同步按钮
   if (has_id(src)) out["id"] = src["id"].as<long>();
-  String s;
-  serializeJson(out, s);
-  reply(ctx, s.c_str());
+  // 直接序列化进栈缓冲: 免去 String 那次内部堆分配。容量按已知最长 reason 留足(见下方各调用点)。
+  char buf[512];
+  serializeJson(out, buf, sizeof(buf));
+  reply(ctx, buf);
 }
 
 // 与手机 /ping 对齐：回 {type:pong}（手机 WSCarClient 对 pong 直接读文本）。
@@ -98,14 +100,14 @@ static void reply_status(JsonDocument& src, cmd::ReplyFn reply, void* ctx,
 // 不是某条陈旧的回执，所以手机端可以放心用它覆盖本地 AI 运行态。
 static void reply_pong(JsonDocument& src, cmd::ReplyFn reply, void* ctx) {
   if (!reply) return;
-  JsonDocument out;
+  JsonDocument out(&g_js_alloc);
   out["type"] = "pong";
   JsonObject params = out["params"].to<JsonObject>();
   params["bits"] = cmd::state_bits();
   if (has_id(src)) out["id"] = src["id"].as<long>();
-  String s;
-  serializeJson(out, s);
-  reply(ctx, s.c_str());
+  char buf[256];
+  serializeJson(out, buf, sizeof(buf));
+  reply(ctx, buf);
 }
 
 // 手动指令串口日志：只有指令类型切换时才打一行当作"确认收到"；
@@ -134,7 +136,7 @@ static bool ota_gate_blocks(const char* type, JsonObject params) {
 }
 
 void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_ctx) {
-  JsonDocument doc;
+  JsonDocument doc(&g_js_alloc);   // PSRAM 池: 每条 WS 指令一份, 内部堆扛不住这个频率
   if (deserializeJson(doc, json)) {
     blog::logf(blog::CMD, "bad json: %s", json);
     return;
@@ -331,14 +333,14 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
 
   if (!strcmp(type, "get_state")) {
     // 主动查询当前状态（供手机重连后同步控制按钮）：回状态位字节，手机端按位解析灯/夹爪/AI 运行态。
-    JsonDocument out;
+    JsonDocument out(&g_js_alloc);
     out["type"] = "state";
     JsonObject params = out["params"].to<JsonObject>();
     params["bits"] = cmd::state_bits();
     if (has_id(doc)) out["id"] = doc["id"].as<long>();
-    String s;
-    serializeJson(out, s);
-    if (reply) { reply(reply_ctx, s.c_str()); }
+    char buf[256];
+    serializeJson(out, buf, sizeof(buf));
+    if (reply) { reply(reply_ctx, buf); }
     return;
   }
 
@@ -354,17 +356,17 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
       o["min"] = (uint32_t)hi.minimum_free_bytes;
       o["blocks"] = (uint32_t)hi.free_blocks;
     };
-    JsonDocument out;
+    JsonDocument out(&g_js_alloc);
     out["type"] = "mem";
     JsonObject params = out["params"].to<JsonObject>();
     { JsonObject o = params["internal"].to<JsonObject>();        fill(o, MALLOC_CAP_INTERNAL); }
     { JsonObject o = params["dma_internal"].to<JsonObject>();    fill(o, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA); }
     { JsonObject o = params["psram"].to<JsonObject>();           fill(o, MALLOC_CAP_SPIRAM); }
     { JsonObject o = params["dma_external"].to<JsonObject>();    fill(o, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA); }
-    String s;
-    serializeJson(out, s);
-    blog::logf(blog::NET, "mem: %s", s.c_str());
-    if (reply) { reply(reply_ctx, s.c_str()); }
+    char buf[512];
+    serializeJson(out, buf, sizeof(buf));
+    blog::logf(blog::NET, "mem: %s", buf);   // 串口这行会被 logf 自己的 256B 截断, 无所谓
+    if (reply) { reply(reply_ctx, buf); }
     return;
   }
 

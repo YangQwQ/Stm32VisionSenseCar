@@ -11,11 +11,13 @@
 #include <string.h>
 #include <stdarg.h>
 
-// 结果队列项: 每项独立持有消息文本与恢复用的(fn, 本次堆拷贝 ctx)。
+// 结果队列项: 文本本体放进尾部弹性数组, 一次 malloc 到手(省下独立 text 分配)。
 struct ResultItem {
-  char* text = nullptr;
-  cmd::ReplyFn fn = nullptr;
-  void* ctx = nullptr;    // 每次入队新建的 int*(WS); BLE nullptr
+  cmd::ReplyFn fn;
+  // WS 的目标 fd 直接内联在本块里(原来每次入队还要 new 一个 int —— 一条消息多一个 4B 的独立
+  // 内部堆块, 而内部堆最缺的就是"最大连续块", 这种碎渣正是碎片化的主要来源)。-1 = 走 BLE(无 fd)。
+  int fd;
+  char text[];           // 消息文本(已消毒), 与结构体同一块分配
 };
 
 static QueueHandle_t g_result_q = nullptr;
@@ -59,17 +61,14 @@ static void sanitize_ws_utf8(char* s) {
 }
 
 void ai::enqueue_result(const char* text, cmd::ReplyFn fn, void* ctx) {
-  ResultItem* it = (ResultItem*)malloc(sizeof(ResultItem));
-  if (!it) return;
   size_t n = strlen(text);
-  it->text = (char*)malloc(n + 1);
-  if (!it->text) { free(it); return; }
+  ResultItem* it = (ResultItem*)malloc(sizeof(ResultItem) + n + 1);   // 结构体 + 文本一块分配
+  if (!it) return;
   memcpy(it->text, text, n + 1);
   sanitize_ws_utf8(it->text);   // 统一 WS 文本消毒: 任何 enqueue 出口都走这里, 防 1007 断链
-  // WS: 为本次结果单独堆拷贝 fd(loop 发送后释放); BLE ctx 已为 nullptr。
   it->fn = fn;
-  it->ctx = ctx ? new int(*(int*)ctx) : nullptr;
-  if (xQueueSend(g_result_q, &it, 0) != pdTRUE) { free(it->text); free(it->ctx); free(it); }
+  it->fd = ctx ? *(int*)ctx : -1;   // WS: 本次结果的 fd 拷贝(loop 发送后随整块释放); BLE 无 fd
+  if (xQueueSend(g_result_q, &it, 0) != pdTRUE) free(it);
 }
 
 // AI 调试日志: 经 board_log(blog::AI)统一输出; /log ai(或 all)时转发手机。
@@ -84,16 +83,14 @@ void ai::logf(const char* fmt, ...) {
   // 消息内统一以 "[ai] " 开头, 与 blog::logf 的类别前缀重合 → 剥掉一段防显示成 "[ai] [ai]"。
   const char* p = buf;
   if (strncmp(p, "[ai] ", 5) == 0) p += 5;
-  blog::logf(blog::AI, "%s", p);
+  blog::log_line(blog::AI, p);   // 已格式化, 直接输出(免二次 vsnprintf)
 }
 
 void ai::update() {
   ResultItem* it = nullptr;
   while (g_result_q && xQueueReceive(g_result_q, &it, 0) == pdTRUE) {
     if (it) {
-      if (it->fn) it->fn(it->ctx, it->text);
-      free(it->text);
-      if (it->ctx) delete (int*)it->ctx;
+      if (it->fn) it->fn(it->fd >= 0 ? (void*)&it->fd : nullptr, it->text);
       free(it);
     }
   }
