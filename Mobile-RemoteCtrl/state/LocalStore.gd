@@ -12,7 +12,7 @@ var _data: Dictionary = {
 	"ai": {"url": "", "key": "", "model": ""},
 	"settings": {
 		"auto_conn": false, "disable_auto_ws": false, "spin_mode": false,
-		"stream_on": false, "direct_ctrl_on": true,
+		"stream_on": false, "ai_mode": false,
 	},
 	"input_history": [],
 }
@@ -43,9 +43,9 @@ func get_spin_mode() -> bool:
 func get_stream_on() -> bool:
 	return bool(_data.get("settings", {}).get("stream_on", false))
 
-## 虚拟摇杆区默认可见（与 tscn 中开关默认态一致）。
-func get_direct_ctrl_on() -> bool:
-	return bool(_data.get("settings", {}).get("direct_ctrl_on", true))
+## 控制模式：false=手动控制（只显示聊天/摇杆/图传），true=AI 接管（另显示画面源栏与附图按钮）。
+func get_ai_mode() -> bool:
+	return bool(_data.get("settings", {}).get("ai_mode", false))
 
 ## 输入框历史（旧→新，与输入时序一致）；条数上限由使用方裁剪。
 func get_input_history() -> PackedStringArray:
@@ -112,9 +112,9 @@ func set_stream_on(v: bool) -> void:
 	_data["settings"] = s
 	_save()
 
-func set_direct_ctrl_on(v: bool) -> void:
+func set_ai_mode(v: bool) -> void:
 	var s: Dictionary = _data.get("settings", {})
-	s["direct_ctrl_on"] = v
+	s["ai_mode"] = v
 	_data["settings"] = s
 	_save()
 
@@ -154,7 +154,7 @@ func _default_group(grp: String) -> Dictionary:
 		"settings":
 			return {
 				"auto_conn": false, "disable_auto_ws": false, "spin_mode": false,
-				"stream_on": false, "direct_ctrl_on": true,
+				"stream_on": false, "ai_mode": false,
 			}
 		_:
 			return {}

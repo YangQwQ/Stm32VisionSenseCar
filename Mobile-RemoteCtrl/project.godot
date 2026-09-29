@@ -22,6 +22,7 @@ DeviceConn="*res://net/DeviceConn.gd"
 AnimationManager="*res://animation/AnimationManager.gd"
 Store="*res://state/LocalStore.gd"
 AppLog="*res://state/AppLog.gd"
+Recorder="*res://state/Recorder.gd"
 
 [display]
 

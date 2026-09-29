@@ -1,7 +1,7 @@
 [gd_scene format=3 uid="uid://b4xjf0s65d01l"]
 
-[ext_resource type="Texture2D" uid="uid://crhs6fraysima" path="res://res/bluetooth.png" id="1_bp7m5"]
 [ext_resource type="Script" uid="uid://ciyuaayl55brc" path="res://ui/bluetooth/BTDeviceListItem.gd" id="1_mmk82"]
+[ext_resource type="Texture2D" uid="uid://4npx3jkv3hue" path="res://res/icon set.png" id="2_mmk82"]
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_i6pqd"]
 bg_color = Color(0.050980393, 0.078431375, 0.15294118, 0.5176471)
@@ -16,6 +16,10 @@ corner_radius_top_left = 75
 corner_radius_top_right = 75
 corner_radius_bottom_right = 75
 corner_radius_bottom_left = 75
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_7prhi"]
+atlas = ExtResource("2_mmk82")
+region = Rect2(0, 80, 80, 80)
 
 [node name="DeviceListItem" type="Button" unique_id=1719577304]
 custom_minimum_size = Vector2(500, 150)
@@ -32,7 +36,7 @@ offset_left = 50.0
 offset_top = 35.0
 offset_bottom = -35.0
 grow_vertical = 2
-texture = ExtResource("1_bp7m5")
+texture = SubResource("AtlasTexture_7prhi")
 expand_mode = 3
 stretch_mode = 5
 

@@ -85,7 +85,7 @@ const char* ai::tools_schema() {
 }}}},
 
 {"type":"function","function":{"name":"task","description":"任务记账(纯记录, 不含动作): note 记要点 / todo 重写任务列表 / done 标记已完成项。","parameters":{"type":"object","properties":{
-"note":{"type":"string","description":"记录目标特征(如大小、形状), 避免后续误认, 位置尽量不记; 也可备注用户发送图片的内容"},
+"note":{"type":"string","description":"记录目标特征(如大小、形状), 避免后续误认, 位置尽量不记; 也可备注用户发送图片的内容; 可以作为当前会话的长期记忆"},
 "todo":{"type":"array","description":"重写整个任务列表, 需要分步任务时用","items":{"type":"string"}},
 "done":{"type":"array","description":"标记第N项完成(首项为1, 可同时标多项; 取消标记需重写任务列表)","items":{"type":"integer"}}
 }}}},
@@ -104,7 +104,7 @@ const char* ai::tools_schema() {
 "summary":{"type":"string","description":"用中文写给之后的自己看: 摘要只写已确认事实、后续步骤、需要注意的事或总结出的经验, 不写未证实的猜测; 清空后你只能靠这段文字回忆之前做过什么"}},
 "required":["summary"]}}},
 
-{"type":"function","function":{"name":"say","description":"对用户说话, 也可用来回答用户的提问; 有值得汇报的进展、结论或要解释的事时使用; 没什么可说可以不使用, 认为没有必要的话允许不说话, 但是建议在每个任务阶段, 或者执行一定次数后说话一下; 执行finish前必须调用, 可以总结也可以回复用户","parameters":{"type":"object","properties":{
+{"type":"function","function":{"name":"say","description":"对用户说话, 也可用来回答用户的提问; 有值得汇报的进展、结论或要解释的事时使用; 没什么可说可以不使用, 认为没有必要的话允许不说话, 但是建议在每个任务阶段, 明确接下来执行动作时说一次接下来要干嘛; 执行finish前必须调用, 可以总结也可以回复用户","parameters":{"type":"object","properties":{
 "text":{"type":"string","description":"要说的话, 一句话, 用户可见; 执行任务时用于写接下来准备干什么等"}},
 "required":["text"]}}}
 ],"tool_choice":"auto")TOOLS";

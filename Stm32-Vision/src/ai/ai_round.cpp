@@ -169,8 +169,9 @@ struct RoundCtx {
   struct TaskItem { char* name; bool done; };
   TaskItem* s_tasks = nullptr;      // 任务列表: 单块 PSRAM(数组 + 名字区), 每次 todo 重写整体替换
   int s_task_n = 0;
-  char* goal_now = nullptr;         // 当前任务目标(可被 goal.set 热替换)
+  char* goal_now = nullptr;         // 当前目标(可被 goal.set 热替换; 跨任务保留)
   bool goal_explicit = false;       // AI 是否已显式 goal.set 过(≠"文案变了": 它常把用户原话原样写回来)
+  bool goal_inherited = false;      // 目标承自上次会话(≠本次用户发言): 状态块据此提示"可更新"而非"未设置"
   char compact_sum[512] = {0};      // compact 工具给的进展摘要: 本回合落地跑完后据此压缩历史(见 compact_history)
 
   // 历史环(PSRAM 表, 任务起点分配 / 收尾释放): 一回合一条, 内含 1~AI_HIST_CALL_MAX 个工具调用
@@ -428,6 +429,21 @@ static void notify_tasks(RoundCtx& c, const char* state) {
   free(buf);
 }
 
+// 推一份「物体记忆 + 车姿态」快照给手机(记忆地图的数据源):
+// {type:"ai_mem",params:{x,y,hd,objs:[{name,r,f,stale}]}} —— 坐标是车头系(右+/前+, cm)。
+// 与 ai_task 同一条结果队列; 记忆只在工具落地时变, 每轮推一次即可, 免得把深度有限的结果队列刷满。
+static void notify_mem(RoundCtx& c) {
+  JsonDocument d(&g_js_alloc);
+  d["type"] = "ai_mem";
+  JsonObject p = d["params"].to<JsonObject>();
+  ai::mem_export(p);
+  size_t need = measureJson(d) + 1;
+  char* buf = (char*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
+  if (!buf) return;
+  if (serializeJson(d, buf, need) > 0) ai::enqueue_result(buf, c.t.fn, c.t.ctx);
+  free(buf);
+}
+
 // 兜底 stop(任务终结出口统一解析一次)。stop_mode 由打断方写入: None=手动 move/stop 接管(不补停);
 // Wheels=手动 arm(只停轮子); All=其余。仅当存在持续指令残留才补。
 static void resolve_stop() {
@@ -450,13 +466,64 @@ enum class RoundR : uint8_t { NextRound, ExitTask };
 // 结果文本会作为该次 tool 调用的返回值回喂给模型 —— 这是它唯一的执行反馈通道。
 static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap);
 
+// ---------------- 跨任务「会话」上下文 ----------------
+// 任务收尾**不释放**历史环与任务笔记，交给下一次任务接着用 —— 这就是"任务结束后继续对话仍延续先前
+// 上下文"（AI 记得自己说过/做过什么、笔记还在）；物体记忆与车位姿在 ai_mem，也不再每任务清空。
+// 只有手机端 /clear（ai_clear → session_clear）才真正重置 = 开新会话。
+// ⚠️ 历史环本身有硬上限(AI_HIST_MAX_TURNS，满了淘汰最旧整回合)，且会按提示调 compact 压缩，所以
+//    "一直保留"不会无限涨；但长期不 clear 会一直占着那块 PSRAM（这是有意的取舍）。
+static bool g_sess_active = false;
+static HistTurn* g_sess_hist = nullptr;
+static int g_sess_hist_n = 0;
+static uint16_t g_sess_img_tag_n = 0;   // 图片归属发号器：跨任务继续递增，免得新回合 tag 与历史里的撞车
+static char* g_sess_note = nullptr;     // AI 的任务笔记（其长期记忆，见 ai_prompt 里 task.note 的说明）
+static char* g_sess_goal = nullptr;     // 当前目标：跨任务保留（补充发言不该把目标换成那句补充）
+static RoundCtx::TaskItem* g_sess_tasks = nullptr;   // 任务列表（整块 PSRAM，名字在块尾）
+static int g_sess_task_n = 0;
+// 清空请求：任务在跑时先登记，等收尾（round_task_finish）再清 —— 避免与 worker 抢历史环。
+static bool g_sess_clear_pending = false;
+
+static void sess_free(void) {
+  if (g_sess_hist) {
+    for (int i = 0; i < g_sess_hist_n; i++) hist_free_turn(g_sess_hist[i]);
+    free(g_sess_hist);
+  }
+  ps_free(g_sess_note);
+  ps_free(g_sess_goal);
+  free(g_sess_tasks);   // 任务列表整块分配(名字在块尾), 一次放掉
+  g_sess_hist = nullptr;
+  g_sess_hist_n = 0;
+  g_sess_img_tag_n = 0;
+  g_sess_note = nullptr;
+  g_sess_goal = nullptr;
+  g_sess_tasks = nullptr;
+  g_sess_task_n = 0;
+  g_sess_active = false;
+}
+
+void ai::session_clear(void) {
+  if (ai::busy()) {   // 任务在跑：登记，等它收尾时清（历史环此刻归 worker 所有）
+    g_sess_clear_pending = true;
+    blog::logf(blog::AI, "会话清空已登记(等当前任务收尾)");
+    return;
+  }
+  sess_free();
+  ai::mem_reset();
+  blog::logf(blog::AI, "AI 会话上下文已清空(历史/笔记/物体记忆/车位姿)");
+}
+
 // ---------------- 任务初始化 ----------------
 static void round_task_init(RoundCtx& c) {
   g_last_continuous = false;  // 本任务尚未下发过持续指令(防上一任务残留标志误判)
   g_last_cont_type = 0;
   ai::set_busy(true);
-  // 新任务 = 新坐标系: 车位置=原点、初始车头=0°, 清空上一任务的空间记忆。
-  ai::mem_reset();
+  // 坐标原点**不再每任务重置**：物体记忆/车位姿是会话上下文的一部分，跨任务延续；
+  // 只有 ai_clear（手机 /clear）才回到"新坐标系：原点 + 车头 0° + 空记忆"。
+  if (g_sess_clear_pending) {   // 上一任务跑着时登记的 /clear：这次任务开始前生效
+    g_sess_clear_pending = false;
+    sess_free();
+    ai::mem_reset();
+  }
   // 水位清零: 本任务的低点从此算起。一轮 AI 就是内部堆被压得最深的时候
   // (TLS 组包/收响应 + 双帧 PSRAM 副本 + 历史环), 低点落到哪正是要量的事。
   hwatch::reset_min();
@@ -473,19 +540,50 @@ static void round_task_init(RoundCtx& c) {
   // 打印实际端点/模型, 便于排查 404/401 等云端拒绝(配错路径是常见原因)
   ai::logf("[ai] 端点=%s 模型=%s key=%s", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
                 cfg::ai_key().isEmpty() ? "空" : "已配置");
-  // 当前任务目标(独立 user 消息展示; 可被 goal.set 热替换)。按原话长度分配, 不设上限;
+  // 目标与任务列表：延续上次会话时**一并承接** —— 这样"中止后补充发言"看着还是同一个任务
+  // （面板标题与计划都还在）；全新会话才用本次发言当目标。
+  if (g_sess_active) {
+    c.goal_now = g_sess_goal;
+    c.s_tasks = g_sess_tasks;
+    c.s_task_n = g_sess_task_n;
+    c.goal_inherited = (c.goal_now != nullptr);
+    g_sess_goal = nullptr;
+    g_sess_tasks = nullptr;
+    g_sess_task_n = 0;
+  }
+  // 目标(独立 user 消息展示; 可被 goal.set 热替换)。按原话长度分配, 不设上限;
   // 分配失败就留空(手机端标题退化成"AI 任务"), 不影响任务本身继续跑。
-  if (!ps_set(c.goal_now, c.t.text))
+  if (ps_str(c.goal_now)[0]) {
+    ai::logf("[ai] 延续既有目标: %s", c.goal_now);
+  } else if (!ps_set(c.goal_now, c.t.text)) {
     ai::logf("[ai] 警告: 目标文本分配失败(PSRAM 不足), 状态块里将没有目标");
+  }
   // 历史环表(PSRAM): 一回合一条, 内含 1~AI_HIST_CALL_MAX 个工具调用。放 PSRAM 是因为它比 RoundCtx
   // 本身还大(数十回合 × 数个调用), 而 RoundCtx 按值建在 worker 那 16KB 栈上, 塞不下。
-  c.hist = (HistTurn*)heap_caps_malloc(AI_HIST_MAX_TURNS * sizeof(HistTurn), MALLOC_CAP_SPIRAM);
-  if (c.hist) {
-    memset(c.hist, 0, AI_HIST_MAX_TURNS * sizeof(HistTurn));
-    // 用户最初的发言也进历史环(一条 user 消息): 目标消息每轮重发之外, 对话流里也留一份原话。
-    if (c.t.text && c.t.text[0]) hist_add_chat(c, c.t.text, /*origin=*/true);
+  if (g_sess_active) {
+    // 承接上一任务的会话：历史/笔记原样接过来（默认路径）。
+    // 上一任务的实景帧与用户参考图已随之释放 ⇒ 旧图片编号全作废，提醒模型别去引用（同 compact 的做法）。
+    c.hist = g_sess_hist;
+    c.hist_n = g_sess_hist_n;
+    c.img_tag_n = g_sess_img_tag_n;
+    c.task_note = g_sess_note;
+    g_sess_hist = nullptr;
+    g_sess_hist_n = 0;
+    g_sess_img_tag_n = 0;
+    g_sess_note = nullptr;
+    g_sess_active = false;
+    c.img_purged = true;
+    if (c.t.text && c.t.text[0]) hist_add_chat(c, c.t.text, /*origin=*/true);   // 本轮发言也进对话流
+    ai::logf("[ai] 承接上次会话: 历史 %d 回合, 笔记%s", c.hist_n, ps_str(c.task_note)[0] ? "保留" : "空");
   } else {
-    ai::logf("[ai] 历史环分配失败(PSRAM 不足): 本任务无历史, 模型看不到自己的前几回合");
+    c.hist = (HistTurn*)heap_caps_malloc(AI_HIST_MAX_TURNS * sizeof(HistTurn), MALLOC_CAP_SPIRAM);
+    if (c.hist) {
+      memset(c.hist, 0, AI_HIST_MAX_TURNS * sizeof(HistTurn));
+      // 用户最初的发言也进历史环(一条 user 消息): 目标消息每轮重发之外, 对话流里也留一份原话。
+      if (c.t.text && c.t.text[0]) hist_add_chat(c, c.t.text, /*origin=*/true);
+    } else {
+      ai::logf("[ai] 历史环分配失败(PSRAM 不足): 本任务无历史, 模型看不到自己的前几回合");
+    }
   }
   // 用户参考图快照(供整轮任务复用, 避免中途被覆盖): 暂存里最近 ≤3 张有效图各留一份独立 PSRAM
   // 副本, 并与实景帧统一编号(各槽 ed_num), 供 look 按编号回看。
@@ -493,6 +591,7 @@ static void round_task_init(RoundCtx& c) {
   for (int i = 0; i < AI_EDITED_SLOTS; i++) if (c.ed_img[i] && c.ed_len[i]) c.ed_num[i] = img_next_id();
   // 任务起点先挂一张空面板: 此刻只有目标(用户原话), 列表等 AI 调 task 补。手机端由此知道"有任务在跑"。
   notify_tasks(c, "running");
+  notify_mem(c);
 }
 
 // ---------------- 回合入口检查(中断 / 掉线 / 等待态) ----------------
@@ -520,7 +619,7 @@ static PrepR prep_gate(RoundCtx& c) {
     vTaskDelay(pdMS_TO_TICKS(AI_WAIT_USER_POLL_MS));
   }
   // 等待结束(用户回话 / 超时): 面板从"等你输入"回到"进行中" —— 否则它会一直挂着等你, 而 AI 其实已继续。
-  if (was_wait && !c.wait_user && !c.interrupted) notify_tasks(c, "running");
+  if (was_wait && !c.wait_user && !c.interrupted) { notify_tasks(c, "running"); notify_mem(c); }
   if (c.interrupted) { blog::logf(blog::AI, "等待用户输入期间被新目标/手动中断"); return PrepR::Interrupted; }
   return PrepR::Ok;
 }
@@ -807,8 +906,15 @@ static void build_state_block(RoundCtx& c, PsaBuf& b) {
   bool has_origin = false;
   for (int i = 0; i < c.hist_n; i++) if (c.hist[i].origin) { has_origin = true; break; }
   b.put("\n任务目标: ");
-  if (!c.goal_explicit && has_origin) b.put("暂未设置, 请根据用户发言更新");
-  else b.put(ps_str(c.goal_now));
+  if (c.goal_inherited) {
+    // 承自上次会话: 明确摆出来并说明可按用户最新发言更新 —— 否则补充发言会被误当成新任务、旧目标被丢。
+    b.put(ps_str(c.goal_now));
+    b.put("(沿用上次会话的目标; 若用户最新发言另有要求, 请用 goal 的 set 更新)");
+  } else if (!c.goal_explicit && has_origin) {
+    b.put("暂未设置, 请根据用户发言更新");
+  } else {
+    b.put(ps_str(c.goal_now));
+  }
   if (c.t.ann && c.t.ann[0]) { b.put(" (操作者标注: "); b.put(c.t.ann); b.put(")"); }
   if (c.s_task_n > 0) { b.put("\n"); render_tasks(c, b); }
   if (ps_str(c.task_note)[0]) { b.put("\n任务笔记: "); b.put(c.task_note); }
@@ -819,8 +925,8 @@ static void build_state_block(RoundCtx& c, PsaBuf& b) {
     c.stall_hint = false;
   }
   if (c.wait_note[0]) { b.put("\n注意: "); b.put(c.wait_note); c.wait_note[0] = 0; }
-  if (c.img_purged) {   // compact 之后: 旧编号全作废, 此刻正是 AI 想引用它们的时候
-    b.put("\n注意: 可回看的画面(含用户参考图)已随历史压缩清空, 不要再引用更早的图片编号; 需要看图请重新 look");
+  if (c.img_purged) {   // 历史被压缩 / 承接上次会话时: 旧编号全作废, 此刻正是 AI 想引用它们的时候
+    b.put("\n注意: 可回看的画面(含用户参考图)已清空, 不要再引用更早的图片编号; 需要看图请重新 look");
     c.img_purged = false;
   }
   // 历史达软上限: 每轮催一次, 直到 AI 调 compact(硬上限兜底前它会先被提醒很多轮)。
@@ -1192,6 +1298,7 @@ static void do_task(RoundCtx& c, const char* args, char* out, size_t cap) {
       // 列表/笔记真变了才推快照: pure note 不重排列表, 但面板上笔记那行也要跟着换。
       // 注意 todo 是"整段重写"(旧项全清、done 全清) —— 手机端会看到进度回退, 这是模型行为不是 bug。
       notify_tasks(c, "running");
+      notify_mem(c);
     }
   }
   PsaBuf rt;
@@ -1214,11 +1321,13 @@ static void do_goal(RoundCtx& c, const char* args, char* out, size_t cap) {
   const char* g = cmdD["set"] | "";
   if (g[0]) {
     c.goal_explicit = true;   // ⚠️ 与文案是否变化无关: 原话常与用户发言一字不差, 用 strcmp 判会把它整段吞掉
+    c.goal_inherited = false; // 已正式落定: 状态块不必再说"沿用上次会话的目标"
     if (strcmp(g, ps_str(c.goal_now))) {
       if (ps_set(c.goal_now, g)) {   // 按实际长度分配, 无上限
         ai::logf("[ai] 目标更新: %s", c.goal_now);
         snprintf(eset, sizeof(eset), "已更新");
         notify_tasks(c, "running");   // 目标被改写: 面板标题跟着变(AI 常把用户原话重述成更具体的目标)
+        notify_mem(c);
       } else snprintf(eset, sizeof(eset), "内存不足");
     } else snprintf(eset, sizeof(eset), "无变化");
   }
@@ -1570,6 +1679,8 @@ static RoundR round_step(RoundCtx& c) {
   c.net_fail = 0;
 
   dispatch_calls(c);
+  // 动作落地后立刻推一份记忆/位姿快照: 记忆图能跟着车动（终态那次由收尾统一推，这里不重复）。
+  if (!c.done) notify_mem(c);
   if (c.done) return RoundR::ExitTask;
   // 单回合模式(/ai oneshot): 一个回合决策即收尾, 让手机端复位「发送」并显示任务结束。
   if (c.t.one_shot) {
@@ -1606,6 +1717,7 @@ static void round_task_finish(RoundCtx& c) {
   // 终态快照: 面板定格成"已完成/失败/已中止"(不再随时间变化), 手机端据此保留列表供回看。
   // 中断(abort)也发: 手机端点「中止」时本地已乐观置灰, 这条是板端的确认。
   notify_tasks(c, c.interrupted ? "abort" : (c.fail ? "fail" : "done"));
+  notify_mem(c);   // 终态也带一份记忆快照: 收尾后地图停在最后一次记录的位置
   // 任务终结补发 done: 覆盖失败/掉线等"只报 error 不带 done"的终态, 让手机端把「中止」复位为
   // 「发送」。被中断时跳过(避免误复位下一任务); 已置 sent_done 的不再补发。
   if (!c.interrupted && !c.sent_done) {
@@ -1616,15 +1728,29 @@ static void round_task_finish(RoundCtx& c) {
     ai::enqueue_result(s.c_str(), c.t.fn, c.t.ctx);
   }
 
-  task_list_free(c);               // 任务列表(单块 PSRAM)
-  ps_free(c.task_note);            // 变长文本: 收尾统一放掉(与 hist/cur/prev 同一条出口)
-  ps_free(c.goal_now);
+  g_sess_goal = c.goal_now;        // 目标与任务列表一并交给下一次任务（补充发言 = 接着同一个任务）
+  g_sess_tasks = c.s_tasks;
+  g_sess_task_n = c.s_task_n;
+  c.goal_now = nullptr;
+  c.s_tasks = nullptr;
+  c.s_task_n = 0;
   for (int i = 0; i < AI_EDITED_SLOTS; i++) if (c.ed_img[i]) free(c.ed_img[i]);  // 用户编辑图快照
   if (c.cur) free(c.cur);          // 最近一张帧 PSRAM 副本
   for (int i = 0; i < AI_PREV_SLOTS; i++) if (c.prev[i]) free(c.prev[i]);   // 先前帧环各槽副本
-  if (c.hist) {                    // 历史环: 逐回合放掉各调用的字符串, 再放表本身
-    for (int i = 0; i < c.hist_n; i++) hist_free_turn(c.hist[i]);
-    free(c.hist);
+  // 历史环与任务笔记**交给下一次任务**（g_sess），不在收尾释放 —— 这是"继续对话延续上下文"的实现。
+  g_sess_hist = c.hist;
+  g_sess_hist_n = c.hist_n;
+  g_sess_img_tag_n = c.img_tag_n;
+  g_sess_note = c.task_note;
+  g_sess_active = (g_sess_hist != nullptr) || (g_sess_note != nullptr)
+                  || (g_sess_goal != nullptr) || (g_sess_tasks != nullptr);
+  c.hist = nullptr;
+  c.hist_n = 0;
+  c.task_note = nullptr;
+  if (g_sess_clear_pending) {      // 任务跑着时登记的 /clear：收尾即清，下次任务从空白会话开始
+    g_sess_clear_pending = false;
+    sess_free();
+    ai::mem_reset();
   }
   if (c.t.ctx) delete (int*)c.t.ctx;  // 任务期 sink fd
   ai::logf("[ai] 任务结束 gen=%lu", c.t.generation);

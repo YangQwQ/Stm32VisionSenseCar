@@ -273,13 +273,6 @@ func connect_device(address: String, display_name: String = "") -> bool:
 func disconnect_device() -> void:
 	_teardown_device()
 
-## 恢复路径专用：按已记录地址直接重连（MAC 稳定，无需先扫描）。本质同 connect_device，
-## 供 DeviceConn 在 WS 恢复/兜底时把 BLE 重新拉起来。
-func connect_saved(address: String, display_name: String = "") -> bool:
-	if address.is_empty():
-		return false
-	return connect_device(address, display_name)
-
 func _on_device_connected() -> void:
 	if _dev_name.is_empty() and _dev != null:
 		var n: String = _dev.call("get_name")

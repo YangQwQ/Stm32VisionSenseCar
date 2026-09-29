@@ -56,9 +56,12 @@ static void ai_worker(void*) {
 
     if (!t.text && !t.nav) continue;
 
+    // 立刻置忙(而不是等进到任务主体里再置): session_clear 用 busy() 判断能否直接清会话，
+    // 若留着"槽已取走、还没置忙"的窗口，/clear 会在 worker 正读会话状态时把它释放掉。
+    m_busy = true;
+
     // 纯导航任务(/move to): 不调云端, 直接本地巡航到目标坐标即回报。
     if (t.nav) {
-      m_busy = true;
       if (!t.nav_global) { ai::s_car_x = 0; ai::s_car_y = 0; ai::s_car_heading = 0; }  // local=以当前位姿为新原点
       ai::NavR r = ai::navigate_to(t.generation, t.nav_x, t.nav_y, NAV_STOP_CM_GOTO);
       JsonDocument f(&g_js_alloc);

@@ -77,6 +77,12 @@ static func ai_chat(message: String) -> Dictionary:
 	# 无任务在跑时板端忽略并回执提示。非 BLACKLISTED 类型，支持 BLE 兜底。
 	return {"type": "ai_chat", "params": {"message": message}, "id": _new_id()}
 
+static func ai_clear() -> Dictionary:
+	# 开新会话：中止在跑的任务 + 清空板端会话上下文（历史/笔记/物体记忆/车位姿）。
+	# ⚠️ 板端会话上下文默认**跨任务保留**（任务结束不清），只有这条才真正重置。
+	# 手机端 /clear 用；非 BLACKLISTED 类型，BLE 兜底可用。
+	return {"type": "ai_clear", "params": {}, "id": _new_id()}
+
 static func ai_oneshot(message: String, annotation: Dictionary = {}, use_image: bool = false) -> Dictionary:
 	# 单轮 AI：板侧只执行一次决策即自动收尾（区别于 ai_goal 的迭代闭环）。参数同 ai_goal。
 	var params: Dictionary = {"message": message}
@@ -145,7 +151,7 @@ static func help_lines() -> PackedStringArray:
 ## 指令提示表：完整指令（语法） → 说明。/help 与输入 / 时的匹配提示共用。
 const COMMAND_HINTS := {
 	"/ping [IP|域名]": "连通性测试（不带参数=测小车）",
-	"/clear": "清空消息区(仅本机)",
+	"/clear": "清空消息区 + 开新会话(重置板端 AI 上下文: 历史/笔记/物体记忆/车位姿)",
 	"/stream [on|off]": "图传开关",
 	"/grid [on|off]": "图传叠加标定网格（本地，不下发板子）",
 	"/stop [wheels|arm]": "停车",

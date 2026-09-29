@@ -8,17 +8,20 @@ extends VBoxContainer
 
 signal stream_requested(on: bool)
 signal grid_requested(on: bool)
-## /append 请求：Main 弹出系统文件选择器选图，读图后打开标注编辑器。
-signal image_pick_requested()
+## 选好并压缩后的图片：交 Main 打开标注编辑器（「采用」后进入附件列表）。
+signal image_picked(img: Image)
+## /clear 开了新会话（板端上下文已重置）：Main 据此清掉本地记忆图。
+signal session_cleared
 
 const CP := preload("res://net/proto/CommandProto.gd")
 const SC := preload("res://ui/chat/SlashCommands.gd")
 const MAX_IMAGES := 3
 const MAX_HISTORY := 50   # 输入历史落盘保留的条数上限
 
-## 底部面板（TabContainer）两种内容各自需要的面板高度（anchored 于 ChatLog 底部）。
+## 底部面板（TabContainer）三种内容各自需要的面板高度（anchored 于 ChatLog 底部）。
 const _HINT_AREA_H := 43.0
 const _IMAGE_AREA_H := 310.0
+const _PLAYBACK_AREA_H := 200.0
 
 @onready var _chat_log: RichTextLabel = $ChatLog
 @onready var _bottom: TabContainer = $ChatLog/BottomPanl
@@ -35,9 +38,13 @@ const _IMAGE_AREA_H := 310.0
 
 ## AI 任务执行中：发送按钮切换为「中止」（急停），按下打断任务并停车。
 var _ai_running := false
+## 回放中：聊天区改为渲染录制下来的事件，底部切到回放控制条，输入禁用。
+var _replaying := false
 
 ## 待上传的编辑图附件 [{image: Image, annotation: Dictionary}]，按加入顺序展示。
 var _attachments: Array = []
+## 选图对话框（懒建，仅 /append 与附图按钮用）。
+var _pick_dialog: FileDialog = null
 ## 输入历史（仅纯文本）：上/下键翻阅，_history_idx 指向当前展示项。
 ## _history_idx == size() 表示停在"当前草稿位"；_draft 存首次上翻前未发送的输入，供下键恢复。
 ## 历史落盘持久化（Store），启动时读回。
@@ -58,6 +65,12 @@ func _ready() -> void:
 
 ## 追加一条聊天消息。who 取值：本机 / 板 / AI / AI工具 / AI日志 / 提示 / 日志 / 状态。
 func chat(who: String, msg: String) -> void:
+	_append_line(who, msg)
+	AppLog.write(who, msg)  # 聊天区出现的内容统一落盘（启动已建好文件）
+	Recorder.record_chat(who, msg)  # 顺带进录制（回放中 Recorder 自己会丢弃）
+
+## 只把一行写进聊天区（不落盘、不录制）：回放渲染走这里。
+func _append_line(who: String, msg: String) -> void:
 	if who == "本机":
 		_chat_log.append_text("[b]本机[/b]: %s\n" % msg)
 	elif who == "板":
@@ -77,7 +90,6 @@ func chat(who: String, msg: String) -> void:
 		_chat_log.append_text("[color=#b39ddb]状态[/color]: %s\n" % msg)
 	else:
 		_chat_log.append_text(msg + "\n")
-	AppLog.write(who, msg)  # 聊天区出现的内容统一落盘（启动已建好文件）
 
 ## 展示一条 ai_result：{type:"ai_result", id, params:{error?, reason?, done?, command:{type,params,reason}}}。
 func show_ai_result(data: Dictionary) -> void:
@@ -115,6 +127,7 @@ func show_ai_result(data: Dictionary) -> void:
 ## 面板自己渲染，不往聊天流里写 —— 任务进度若混进流水，每回合一条会把自己淹掉。
 func show_task(params: Variant) -> void:
 	_task_panel.apply(params)
+	Recorder.record_task(params)
 
 func _cmd_text(cmd: Dictionary) -> String:
 	var t: String = str(cmd.get("type", ""))
@@ -129,6 +142,12 @@ func _cmd_text(cmd: Dictionary) -> String:
 # 两者共用 ChatLog 底部的 BottomPanl：有附件时切到图片页（更高），否则按 / 指令显示提示。
 
 func _refresh_bottom() -> void:
+	if _replaying:
+		# 回放：底部固定切到回放控制条（上一步/暂停/下一步 + 进度）
+		_bottom.visible = true
+		_bottom.current_tab = 2
+		_bottom.offset_top = -_PLAYBACK_AREA_H
+		return
 	if not _attachments.is_empty():
 		# 有图优先显示图片，不显示指令提示
 		_bottom.visible = true
@@ -168,6 +187,88 @@ func _on_del_pressed(index: int) -> void:
 	_render_images()
 	_refresh_bottom()
 	_message_input.grab_focus()
+
+# ============================== 选图（/append 与附图按钮） ==============================
+# 从系统图库选一张图 → 压缩到目标大小 → 交 Main 打开标注编辑器（采用后作为附件上行）。
+
+## 输入框右侧附图按钮：与 /append 同效。
+func _on_append_img_pressed() -> void:
+	_pick_image()
+
+## 打开系统文件选择器（懒建 FileDialog）；Android 上走系统 SAF。
+func _pick_image() -> void:
+	if _pick_dialog == null:
+		_pick_dialog = FileDialog.new()
+		_pick_dialog.title = "选择图片"
+		_pick_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+		_pick_dialog.access = FileDialog.ACCESS_FILESYSTEM
+		_pick_dialog.use_native_dialog = true
+		_pick_dialog.filters = PackedStringArray(["*.png ; PNG 图片", "*.jpg ; JPG 图片", "*.jpeg ; JPEG 图片"])
+		_pick_dialog.file_selected.connect(_on_pick_file)
+		var pics: String = OS.get_system_dir(OS.SYSTEM_DIR_PICTURES)
+		if not pics.is_empty():
+			_pick_dialog.current_dir = pics
+		add_child(_pick_dialog)
+	_pick_dialog.popup_centered()
+
+func _on_pick_file(path: String) -> void:
+	var img := Image.new()
+	if img.load(path) != OK:
+		chat("提示", "图片读取失败: %s" % path)
+		return
+	var small: Image = _compress_to_target(img, 20480)  # 压到目标大小，避免把大图发给板端/AI
+	if small == null:
+		chat("提示", "图片压缩失败（未能压到目标大小内）")
+		return
+	image_picked.emit(small)
+
+## 把图压到 ≤ max_bytes（JPEG）：先降质量，仍超则等比缩宽后再降质，返回压缩后 Image。
+## 0=用原宽（仅降质）；宽度从大到小、质量从高到低，命中即返回（尽量清晰）。
+func _compress_to_target(img: Image, max_bytes: int) -> Image:
+	var widths := [0, 1600, 1280, 1024, 800, 640, 480, 360]
+	var qualities := [0.88, 0.76, 0.64, 0.52, 0.40, 0.30]
+	for w: int in widths:
+		var cur: Image = img
+		if w > 0 and img.get_width() > w:
+			cur = img.duplicate()
+			cur.resize(w, maxi(int(round(img.get_height() * float(w) / float(img.get_width()))), 1))
+		for q: float in qualities:
+			var buf: PackedByteArray = cur.save_jpg_to_buffer(q)
+			if buf.size() > 0 and buf.size() <= max_bytes:
+				var out := Image.new()
+				if out.load_jpg_from_buffer(buf) == OK:
+					return out
+	return null
+
+# ============================== 只读 / 回放 ==============================
+
+## 回放（只读）：禁掉输入与发送 —— 回放时绝不能再发指令（否则是拿历史界面在开车）。
+func set_input_enabled(on: bool) -> void:
+	_message_input.editable = on
+	_send_btn.disabled = not on
+
+## 进入回放：清场并切到底部控制条。拖动/回退时 Main 会再调一次（等价重置）。
+func begin_replay() -> void:
+	_replaying = true
+	_chat_log.clear()
+	_task_panel.visible = false
+	_message_input.text = ""
+	_refresh_bottom()
+
+## 回放渲染一条事件（chat / task）。
+func replay_apply(ev: Dictionary) -> void:
+	match str(ev.get("k", "")):
+		"chat":
+			_append_line(str(ev.get("who", "")), str(ev.get("msg", "")))
+		"task":
+			_task_panel.call("apply", ev.get("params"))
+
+## 退出回放：回到实时视图。
+func end_replay() -> void:
+	_replaying = false
+	_chat_log.clear()
+	_task_panel.visible = false
+	_refresh_bottom()
 
 ## 保存当前图传画面（/snapshot，本地操作，不下发板子）。
 ## 优先写相册 Pictures 目录；失败或 Android 分区存储限制时兜底写应用 user:// 目录。
@@ -267,6 +368,8 @@ func _send_during_ai(text: String) -> void:
 ## 切换 AI 执行中状态：Main 摇杆手动接管 / 板端 done / get_state.ai_busy 同步都会调用。
 func set_ai_running(run: bool) -> void:
 	_ai_running = run
+	# 录制器据此决定逻辑时钟是否前进（空闲等待在回放里被抹掉）。
+	Recorder.set_ai_running(run)
 	# 复位即"任务不在跑了"（手动接管 / 中止 / 掉线 / 板端 done）：面板跟着收尾，
 	# 免得板端还没来得及回终态时，它还挂着"进行中"。
 	if not run:
@@ -387,6 +490,8 @@ func _recall_history(dir: int) -> bool:
 	return true
 
 func _input(event: InputEvent) -> void:
+	if _replaying:
+		return   # 回放中禁用输入历史翻阅（输入框本就是只读的）
 	if not (event is InputEventKey):
 		return
 	var k := event as InputEventKey
@@ -436,8 +541,7 @@ func _apply_slash_local(r: Dictionary) -> void:
 		"help":
 			chat("提示", "可用指令:\n" + "\n".join(CP.help_lines()))
 		"clear":
-			_chat_log.clear()
-			AppLog.clear()
+			save_current_session()
 		"stream":
 			stream_requested.emit(bool(r.get("on", true)))
 		"grid":
@@ -445,7 +549,7 @@ func _apply_slash_local(r: Dictionary) -> void:
 		"snapshot":
 			_snapshot()
 		"append":
-			image_pick_requested.emit()
+			_pick_image()
 		"ws":
 			_apply_ws_local(r)
 
@@ -463,3 +567,16 @@ func _apply_ws_local(r: Dictionary) -> void:
 		_:
 			var auto := "自动重连" if DeviceConn.ws_is_auto() else "无自动重连"
 			chat("提示", "WS:%s（%s）" % [DeviceConn.get_ws_state(), auto])
+
+## 归档当前趟并开新会话：与 /clear 完全等价（保存按钮直接复用它）。
+## 归档这一趟录制，清聊天区/任务面板/本地日志，并让板端重置 AI 上下文（历史/笔记/物体记忆/车位姿）。
+## 平时的任务结束**不**自动重置上下文 —— 继续发目标即可接着先前上下文跑。
+func save_current_session() -> void:
+	Recorder.archive_current()
+	_chat_log.clear()
+	_task_panel.visible = false   # 上一任务的面板一并收掉（板端不会为空会话推快照）
+	AppLog.clear()
+	set_ai_running(false)   # 开新会话：发送按钮复位（板端也会因 ai_clear 中止在跑的任务）
+	session_cleared.emit()
+	if not DeviceConn.send_command(CP.ai_clear()):
+		chat("提示", "上下文重置指令未发送(当前离线)")

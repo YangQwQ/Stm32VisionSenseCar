@@ -45,6 +45,11 @@ enum class StopMode : uint8_t { None, Wheels, All };
 void cancel(StopMode m = StopMode::All);  // 中止当前任务（新目标 / 手动指令 / ai_cancel）
 bool busy();                              // 是否有任务进行中（BLE status.ai_busy 用）
 
+// 清空 AI 会话上下文（历史环 / 任务笔记 / 物体记忆 / 车位姿）—— 手机端 /clear（ai_clear）用。
+// 会话上下文默认**跨任务保留**（任务收尾不释放），只有这里才真正重置 = 开新会话。
+// 任务在跑时先登记，等它收尾再清（历史环归 worker 线程所有，不能从这里抢）。
+void session_clear();
+
 // AI 任务进行中"插话"：把用户补充文本追加进当前任务上下文，不打断任务（区别于 set_goal）。
 // 返回是否有任务在跑（true=已入队，worker 下一轮连同 prompt 一起喂给模型）。
 bool append_chat(const char* text);

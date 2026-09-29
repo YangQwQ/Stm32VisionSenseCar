@@ -30,6 +30,8 @@ signal auto_scan_requested()
 signal status_received(data: Dictionary)
 signal text_received(data: Dictionary)
 signal frame_received(img: Image)
+## 图传原始 JPEG 字节（解码前）：只给录制用，避免解出来的图再压回去。
+signal frame_jpeg(bytes: PackedByteArray)
 
 enum Channel { NONE, BLE, WS }
 
@@ -82,6 +84,8 @@ func _ready() -> void:
 	# 注意：图传帧是纯下行，不能当作"WS 上行通路还活着"的依据（曾据此抑制 WS 心跳，
 	# 结果图传期间上行 ping 永不发、板端 idle 探测必然到期并判死重连）。心跳由 WSCarClient 自持。
 	_udp.frame_received.connect(_on_udp_frame)
+	# 原始 JPEG 旁路（录制用）：解码前就把字节上抛。
+	_udp.frame_jpeg.connect(frame_jpeg.emit)
 
 	add_child(_ble)
 	add_child(_ws)
@@ -214,12 +218,12 @@ func stop_video() -> void:
 func ws_is_auto() -> bool:
 	return _ws.is_auto_reconnect()
 
-func is_ws_only() -> bool:
-	return _channel == Channel.WS
-
 # ============================== 发送选路（WS 优先） ==============================
 
 func send_command(cmd: Dictionary) -> bool:
+	# 回放（只读）：一律不发 —— 在唯一出口拦，UI 漏禁也发不出去。
+	if Recorder.is_playing():
+		return false
 	var t: String = str(cmd.get("type", ""))
 	if _ws.is_connected_car():
 		print("[SEND] %s via WS" % t)
@@ -234,18 +238,13 @@ func send_command(cmd: Dictionary) -> bool:
 
 ## 编辑图（JPEG 二进制）：仅走 WS。调用方保证先 send_image 后 send_command(ai_goal) 保序。
 func send_image(img: Image) -> bool:
+	if Recorder.is_playing():
+		return false
 	if _ws.is_connected_car():
 		_ws.send_image(img)
 		return true
 	push_warning("编辑图未发送（WS 不可用）")
 	return false
-
-func best_transport_name() -> String:
-	if _ws.is_connected_car():
-		return "WS"
-	if _ble.is_device_connected():
-		return "BLE"
-	return "离线"
 
 # ============================== 传输事件处理 ==============================
 

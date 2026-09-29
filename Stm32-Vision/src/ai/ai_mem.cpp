@@ -132,6 +132,25 @@ void mem_tick_stale(void) {
     if (g_mem[i].valid) g_mem[i].stale++;
 }
 
+// 导出车姿态 + 物体记忆为 JSON: 手机端「画面源 = 记忆」时据此画车头系俯视图。
+// 坐标与 mem_feed 完全同一套逆变换(车头系: 右+/前+, cm), 只读。
+void mem_export(JsonObject out) {
+  out["x"] = s_car_x;
+  out["y"] = s_car_y;
+  out["hd"] = (int)s_car_heading;
+  JsonArray objs = out["objs"].to<JsonArray>();
+  float h = s_car_heading * AI_PI / 180.0f;
+  for (int i = 0; i < AI_MEM_MAX; i++) {
+    if (!g_mem[i].valid || !ps_str(g_mem[i].name)[0]) continue;   // 空槽/无名不导出
+    float dx = g_mem[i].gx - s_car_x, dy = g_mem[i].gy - s_car_y;
+    JsonObject o = objs.add<JsonObject>();
+    o["name"] = g_mem[i].name;
+    o["r"] = cosf(h) * dx + sinf(h) * dy;    // 车头系: 右+ 左-
+    o["f"] = -sinf(h) * dx + cosf(h) * dy;   // 车头系: 前+ 后-
+    o["stale"] = (int)g_mem[i].stale;
+  }
+}
+
 // 生成喂给 AI 的空间记忆文本: 小车的全局 (x,y) 与朝向, 再按新鲜度(最近更新的在前)列出各物体。
 // ⚠️ 两种坐标系别混: 小车报的是**全局** (x,y); 物体位置一栏是**车头系**(按提示词的定义 x=车正前, y=车正右, cm)。
 // 久未更新的条目照旧列出(不设喂回上限, 免得找早先记下的物体时找不着), 过期程度由"N轮未更新"表达。

@@ -84,9 +84,6 @@ func _flush() -> void:
 	_empty_hint = null
 	_device_seen.clear()
 
-func device_count() -> int:
-	return _device_seen.size()
-
 func _add_device_card(name: String, address: String) -> void:
 	if _empty_hint != null:
 		_empty_hint.queue_free()

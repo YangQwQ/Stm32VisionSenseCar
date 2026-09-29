@@ -2,16 +2,16 @@ extends Control
 ## App 壳：组装子视图，维护连接编排与交互。
 ## 传输语义：/ 前缀=指令；纯文本=AI 目标（DIRECT ai_goal）。
 ## 所有指令经 DeviceConn.send_command：WS 优先、BLE 兜底。
+## 布局：手动控制 / AI 接管 两模式，可见性统一由 _apply_layout 收口（不再散在各处改 visible）。
 
 const CP := preload("res://net/proto/CommandProto.gd")
 
+# ------------------------------ 视图引用 ------------------------------
 @onready var _video: Control = $BodyControl/Video
-@onready var _joystick: VirtualJoystick = $BodyControl/CtrlArea/Joystick
-@onready var _wifi_popup: PanelContainer = $WifiPopup
+@onready var _wifi_popup: PanelContainer = $PopupWindow
 @onready var _editor: Control = $BodyControl/ImgEditToolbar
-@onready var _annotate_btn: Button = $BodyControl/VidControls/AnnotateBtn
+@onready var _annotate_btn: Button = $BodyControl/AIModeCtrl/AnnotateBtn
 @onready var _dim: ColorRect = $BGDimSharder
-var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 
 @onready var _scan_panel: Control = $BodyBTScan
 @onready var _ble_dot: Label = $TopBar/HBox/VBoxContainer/BleStat/BleDot
@@ -21,10 +21,26 @@ var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 @onready var _conn_stat: Label = $TopBar/HBox/ConnectionStat
 
 @onready var _chat_panel = $BodyControl/ChatPanel
-@onready var _stream_toggle: CheckButton = $BodyControl/VidControls/StreamToggle
-@onready var _direct_ctrl_btn: CheckButton = $BodyControl/VidControls/DirectCtrlToggle
+@onready var _session_panel: Control = $BodyControl/ChatPanel/ChatLog/SessionPanel
+@onready var _save_btn: Button = $BodyControl/ChatPanel/ChatLog/SessionPanel/VBox/Title/SaveBtn
+@onready var _playback_bar: Control = $BodyControl/ChatPanel/ChatLog/BottomPanl/PlaybackCtrl
+@onready var _stream_toggle: CheckButton = $BodyControl/GeneralCtrl/StreamToggle
+@onready var _ctrl_mode_btn: Button = $BodyControl/GeneralCtrl/CtrlModeToggle
+@onready var _source_btn: Button = $BodyControl/AIModeCtrl/StreamToggle
 @onready var _ctrl_area: Control = $BodyControl/CtrlArea
+@onready var _joystick: Control = $BodyControl/CtrlArea/Joystick
 @onready var _bottom_padding: Panel = $BodyControl/BottomPadding
+
+## AI 接管模式才显示的组件（批量显隐：以后增删组件只改这一处）。
+@onready var _aimode_row: Control = $BodyControl/AIModeCtrl
+@onready var _append_img_btn: Control = $BodyControl/ChatPanel/InputRow/MessageInput/AppendImgBtn
+## 整栏：回放期间也要留着 —— SessionBtn 是回放列表的唯一入口，藏起来就退不出回放了。
+@onready var _ai_only: Array[Control] = [_aimode_row]
+## 其内的输入类组件：回放中只读，收起。
+@onready var _ai_inputs: Array[Control] = [_append_img_btn]
+
+## 手动控制模式才显示的组件（AI 接管时收起底部控制区，把屏幕让给图传/聊天/回放）。
+@onready var _manual_only: Array[Control] = [_ctrl_area]
 
 @onready var _body_ctrl: Control = $BodyControl
 @onready var _body_about: Control = $BodyAbout
@@ -35,27 +51,21 @@ var _pick_dialog: FileDialog = null   # /append 选图对话框（懒建）
 @onready var _nav_ctrl: TextureButton = $NaviBar/HBox/Control
 @onready var _nav_about: TextureButton = $NaviBar/HBox/About
 
-var _joy_held := false
-var _last_joy_cmd := Vector2.ZERO  # 上一次真正下发的摇杆指令（模拟值量化后对比用）
-var _last_spin_active := false     # 原地旋转模式下当前是否在转（避免斜向切换时漏停残余自转）
-# 摇杆量化档：死区内不动作；速度分 低速/高速 两档；转向固定档。仅档位变化才发 move，松手发 stop。
-const _JOY_DEADZONE := 0.15
-const _JOY_SLOW := 0.5
-const _JOY_FAST := 1.0
-const _JOY_FAST_THRESH := 0.7
-const _JOY_STEER := 0.8
-## 直接驱动时的摇杆映射参数。
-const _DRIVE_MAX := 1000       # 油门满量程 PWM
-const _SERVO_CENTER := 150     # 转向舵中位
-const _SERVO_RANGE := 30       # 转向舵单侧偏转量
-const _SPIN_SPEED := 800       # 原地旋转模式下左右推摇杆的单轮 PWM（全系统统一 800 档）
+# ------------------------------ 模式 / 画面源 / 图传 ------------------------------
+var _ai_mode := false      # false=手动控制，true=AI 接管
+var _map_on := false       # 画面源：false=图传，true=记忆地图
+var _stream_on := false    # 图传开关（持久化）
+var _editing := false      # 标注中：图传冻结，画面停在最后一帧
+## 弹窗「确认」要执行的动作（如删除会话）；由 _on_popup_confirmed 消费。
+var _confirm_action: Callable = Callable()
+
 ## 最近一次成功连接的设备名，用于顶栏「已连接: xxx」。
 var _device_name := ""
 var _page_tween: Tween = null
 const _PAGE_DURATION := 0.28
 const _PAGE_TRIGGER := 24.0   # 横向滑动达到该位移才判定为切页手势（区分纵向滚动）
 const _PAGE_FLING := 600.0    # 拖动中采样的瞬时横向速度超过该值按"甩动"吸附到下/上一页（px/s）
-const _VEL_SAMPLE_MS := 33    # 拖动中每隔该时长采一次速（镜像 ScrollContainer 的位移差/时长 采样）
+const _VEL_SAMPLE_MS := 33    # 拖动中每隔该时长采一次速
 # 横向切页手势状态：当前页 / 拖动基准 / 是否已进入切页。
 var _cur_page := 0
 var _swipe_start := Vector2.ZERO
@@ -64,10 +74,10 @@ var _drag_active := false
 var _drag_float := 0.0
 var _mouse_held := false   # 桌面兜底：仅在按住左键拖动时响应横移（避免悬停误触发）
 var _swipe_skip := false   # 手势落在摇杆区域内时置真：整段不响应，避免和转向拖动冲突
-var _drag_accum := 0.0      # 累计手指横向位移（当前 x - 起点 x）
-var _last_sample := 0.0     # 上次采速时的累计位移
-var _last_sample_tick := -1 # 上次采速时刻（ms），<0 表示尚未采速
-var _vel := 0.0             # 拖动中最近一次采到的瞬时横向速度（px/s）
+var _drag_accum := 0.0     # 累计手指横向位移
+var _last_sample := 0.0    # 上次采速时的累计位移
+var _last_sample_tick := -1
+var _vel := 0.0
 ## 待配网设备 + 待下发 WiFi/AI（设备卡片 → 连接窗口 → 确认）。
 var _pending_addr := ""
 var _pending_name := ""
@@ -87,16 +97,35 @@ func _ready() -> void:
 	DeviceConn.status_received.connect(_on_ble_status)
 	DeviceConn.text_received.connect(_on_ws_text)
 	DeviceConn.frame_received.connect(_on_frame)
+	DeviceConn.frame_jpeg.connect(Recorder.record_frame)  # 原始 JPEG 直接进录制（不在录制态时 Recorder 自丢）
 	DeviceConn.state_changed.connect(_on_ble_state)
 	# 扫描页设备卡片被选中 → 走连接编排。
 	_scan_panel.device_selected.connect(_on_device_item_selected)
-	# /append：聊天区发起的"从图库选图"由 Main 弹出系统文件选择器并打开标注编辑器。
-	_chat_panel.image_pick_requested.connect(_on_chat_image_pick_requested)
-	# 标注工具条（非模态，浮在图传上方）：采用/取消由编辑器回抛，Main 统一收尾（解冻 + 复位开关）。
+	# 选图（/append 与输入框附图按钮）→ 打开标注编辑器。
+	_chat_panel.image_picked.connect(_on_chat_image_picked)
+	# 标注工具条（非模态，浮在图传上方）：采用/取消由编辑器回抛，Main 统一收尾。
 	_editor.connect("image_sent", _on_editor_image_sent)
 	_editor.connect("cancelled", _on_editor_cancelled)
-	# 配网弹窗仍为模态：背景遮罩随其显隐同步；点遮罩空白处（弹窗之外）由遮罩自己上报。
-	_wifi_popup.visibility_changed.connect(_sync_modal_dim)
+	# 直控面板：摇杆手动接管 / 板端 AI 运行态回抛。
+	_ctrl_area.connect("manual_takeover", _on_manual_takeover)
+	_ctrl_area.connect("ai_busy_changed", _on_ai_busy_changed)
+	# 通用弹窗：配网确认 / 删除会话确认。
+	_wifi_popup.connect("provision_confirmed", _on_wifi_confirmed)
+	_wifi_popup.connect("confirmed", _on_popup_confirmed)
+	# 会话回放：列表选择/删除 + 控制条 + 录制器信号。
+	_session_panel.connect("session_selected", _on_session_selected)
+	_session_panel.connect("delete_requested", _on_session_delete_requested)
+	_playback_bar.connect("step_requested", _on_replay_step)
+	_playback_bar.connect("toggle_pause_requested", _on_replay_toggle_pause)
+	_playback_bar.connect("seek_requested", _on_replay_seek)
+	_wifi_popup.connect("cancelled", _on_popup_cancelled)
+	_chat_panel.session_cleared.connect(_on_session_cleared)
+	Recorder.replay_event.connect(_on_replay_event)
+	Recorder.replay_frame.connect(_on_replay_frame)
+	Recorder.replay_seeked.connect(_on_replay_seeked)
+	Recorder.replay_progress.connect(_on_replay_progress)
+	Recorder.replay_finished.connect(_on_replay_finished)
+	# 配网弹窗为模态：背景遮罩随其显隐同步（visibility_changed 已在 tscn 连接）。
 	_dim.connect("tapped", _on_dim_tapped)
 	_sync_modal_dim()
 
@@ -106,21 +135,23 @@ func _ready() -> void:
 	_nav_about.toggled.connect(_on_nav_toggled.bind(2))
 
 	_request_ble_permissions()
-	# WS 由 BLE 会话驱动（DeviceConn 在连接态自动连 WS）：不在启动时自连/心跳，
-	# 等设备连接 / 板子上报 IP 再连。
 	_update_status()
-	# 设置项：读取本地配置并同步两个开关状态；开启启动自连时按最近设备重连。
+
+	# 设置项：读取本地配置并同步开关状态；开启启动自连时按最近设备重连。
 	_auto_conn_btn.set_pressed_no_signal(Store.get_auto_conn())
 	_disable_ws_btn.set_pressed_no_signal(Store.get_disable_auto_ws())
 	_spin_mode_btn.set_pressed_no_signal(Store.get_spin_mode())
-	# 图传 / 虚拟摇杆区开关按上次退出时的状态恢复：图传只回填开关与画面区，
-	# 真正的起流待 WS 连上后由 _on_ws_connected 重发（此刻还没有链路可发）。
-	_stream_toggle.set_pressed_no_signal(Store.get_stream_on())
-	_video.visible = Store.get_stream_on()
-	_direct_ctrl_btn.set_pressed_no_signal(Store.get_direct_ctrl_on())
-	_ctrl_area.visible = Store.get_direct_ctrl_on()
+	_ctrl_area.call("set_spin_mode", _spin_mode_btn.button_pressed)
+
+	# 模式 / 图传 / 画面源：按上次退出时的状态恢复，再统一应用一次布局。
+	_ai_mode = Store.get_ai_mode()
+	_map_on = false
+	_stream_on = Store.get_stream_on()
+	_stream_toggle.set_pressed_no_signal(_stream_on)
+	_apply_layout()
+	# 图传真正的起流待 WS 连上后由 _on_ws_connected 重发（此刻还没有链路可发）。
 	if Store.get_auto_conn():
-		# 启动即自动连接：直接进控制页（页 1，触发 _on_nav_toggled → _switch_page），不再停在蓝牙扫描页。
+		# 启动即自动连接：直接进控制页（页 1，触发 _on_nav_toggled → _switch_page）。
 		_nav_ctrl.button_pressed = true
 		_try_startup_connect()
 
@@ -136,6 +167,81 @@ func _request_ble_permissions() -> void:
 		if not OS.get_granted_permissions().has(p):
 			OS.request_permission(p)
 
+# ============================== 布局 / 模式 ==============================
+
+## 一处收口"哪些组件该显示"：模式、回放、图传、标注、画面源。
+## 任何会改变可见性的地方都只调它，别再各自改 visible。
+func _apply_layout() -> void:
+	var replaying: bool = Recorder.is_playing()
+	for n in _ai_only:
+		n.visible = _ai_mode
+	var ai_inputs: bool = _ai_mode and not replaying
+	for n in _ai_inputs:
+		n.visible = ai_inputs
+	# 底部控制区只在「手动控制」显示：AI 接管（和回放）时收起。
+	for n in _manual_only:
+		n.visible = not _ai_mode and not replaying
+	if not _ctrl_area.visible:
+		# 收起控制区时务必松开摇杆：隐藏正在拖拽的摇杆可能收不到 release，把车留在"前进"。
+		_ctrl_area.call("release_all")
+	_ctrl_mode_btn.text = "模式：AI接管" if _ai_mode else "模式：手动控制"
+	_ctrl_mode_btn.set_pressed_no_signal(_ai_mode)
+	var show_map: bool = _ai_mode and _map_on and not replaying
+	_source_btn.set_pressed_no_signal(_map_on)
+	_source_btn.text = "画面源：记忆" if _map_on else "画面源：图传"
+	_video.call("show_map", show_map)
+	_video.visible = _stream_on or _editing or replaying or show_map
+	_chat_panel.call("set_input_enabled", not replaying)
+	# 回放是只读态：下列控件都与「实时图传」或「live 记忆地图」相关，在回放里是 no-op，
+	# 禁掉它们，免得点下去没反应（画面源切记忆、图传开关在回放里都无效）让人以为坏了。
+	# 回放列表入口(SessionBtn)必须保持可用 —— 它是回放的唯一出口。
+	_source_btn.disabled = replaying            # 画面源：回放只画录制帧，记忆地图无意义
+	_stream_toggle.disabled = replaying or _editing   # 图传开关：回放时实时流无效；标注时冻结也禁
+	_ctrl_mode_btn.disabled = replaying         # 模式切换：切到手动会把人踢出回放
+	_annotate_btn.disabled = replaying          # 标注：在回放帧上框选无意义
+	_sync_bottom_padding()
+
+## 模式切换（tscn: GeneralCtrl/CtrlModeToggle）。
+func _on_ctrl_mode_toggled(on: bool) -> void:
+	_ai_mode = on
+	Store.set_ai_mode(on)
+	if not on:
+		_map_on = false                  # 退出 AI 接管：画面源回到图传
+		_session_panel.call("close")     # 回放列表只属于 AI 接管
+		if Recorder.is_playing():
+			Recorder.stop_play()          # 手动模式没有回放入口，别把人困在只读态
+	_apply_layout()
+
+## 画面源切换（tscn: AIModeCtrl/StreamToggle，仅 AI 接管模式可见）。
+func _on_source_toggled(on: bool) -> void:
+	_map_on = on
+	_apply_layout()
+
+## 会话回放列表入口（tscn: AIModeCtrl/SessionBtn）。
+func _on_session_btn_pressed() -> void:
+	_session_panel.call("toggle")
+
+## 保存当前会话（tscn: ChatPanel/ChatLog/SessionPanel/VBox/Title/SaveBtn）。
+## 与 /clear 等价（归档当前趟 + 开新会话）；但无可保存内容（没跑过任务/空趟）或回放中时弹窗提醒，不静默丢弃。
+func _on_save_pressed() -> void:
+	if Recorder.is_playing():
+		_wifi_popup.call("open_confirm", "回放中无法保存", "正在回放历史会话，不能保存当前会话。退出回放后再试。", "知道了")
+		_confirm_action = Callable()   # 纯提醒：确认即关闭，不执行任何动作
+		return
+	if not Recorder.has_session_to_save():
+		_wifi_popup.call("open_confirm", "暂无可保存的会话", "当前会话还没有执行过任务，没有内容可以保存。", "知道了")
+		_confirm_action = Callable()   # 同上：纯提醒
+		return
+	_chat_panel.call("save_current_session")
+
+## 摇杆一动 = 手动接管：打断板端 AI 闭环，发送按钮复位「发送」。
+func _on_manual_takeover() -> void:
+	_chat_panel.set_ai_running(false)
+
+## 板端 AI 运行态（状态位 bit4）回抛。
+func _on_ai_busy_changed(busy: bool) -> void:
+	_chat_panel.set_ai_running(busy)
+
 # ============================== 页面切换 ==============================
 # 底部导航点击时把三个 body 横向滑移：目标页 ratio.x=0，其余沿左右各摆一屏。
 # body 各自持有固定的相对序号（BTScan=0 / Control=1 / About=2）。
@@ -149,7 +255,7 @@ func _switch_page(page: int) -> void:
 	_cur_page = clampi(page, 0, 2)
 	_snap_to(_cur_page, true)
 
-## 把三页各自摆到对应"页浮点" f 处（f=页序号，含拖动中的小数）：BTScan=0 / Control=1 / About=2。
+## 把三页各自摆到对应"页浮点" f 处（f=页序号，含拖动中的小数）。
 func _apply_page_offset(f: float) -> void:
 	_scan_panel.offset_transform_position = Vector2(-20.0 * f, 0)
 	_scan_panel.offset_transform_position_ratio = Vector2(0.0 - f, 0)
@@ -183,9 +289,8 @@ func _sync_nav(page: int) -> void:
 	_nav_about.set_pressed_no_signal(page == 2)
 
 ## 画面上左右滑动切页：走 _gui_input（Godot 的 GUI 派发，谁挡住谁消费）。
-## 背景遮罩与标注画布都是 mouse_filter=STOP 且盖在上层，触点被它们吃掉，这里自然收不到，
-## 故不必再自行判断"是否模态 / 是否标注中"。横移超过阈值且横向占主导才切页；
-## 落在摇杆区内整段跳过，避免和转向拖动冲突。
+## 背景遮罩与标注画布都是 mouse_filter=STOP 且盖在上层，触点被它们吃掉，这里自然收不到。
+## 横移超过阈值且横向占主导才切页；落在摇杆区内整段跳过，避免和转向拖动冲突。
 func _gui_input(event: InputEvent) -> void:
 	if event is InputEventScreenTouch:
 		var t := event as InputEventScreenTouch
@@ -195,7 +300,7 @@ func _gui_input(event: InputEvent) -> void:
 			_drag_active = false
 			_drag_float = _drag_base
 			_reset_velocity()
-			_swipe_skip = _joystick.get_global_rect().has_point(t.position)
+			_swipe_skip = _ctrl_area.visible and _joystick.get_global_rect().has_point(t.position)
 		else:
 			if _drag_active:
 				_end_drag()
@@ -227,7 +332,7 @@ func _gui_input(event: InputEvent) -> void:
 			_drag_active = false
 			_drag_float = _drag_base
 			_reset_velocity()
-			_swipe_skip = _joystick.get_global_rect().has_point(mb.position)
+			_swipe_skip = _ctrl_area.visible and _joystick.get_global_rect().has_point(mb.position)
 		else:
 			_mouse_held = false
 			if _drag_active:
@@ -257,7 +362,6 @@ func _end_drag() -> void:
 		target = clampi(int(_drag_base) + (1 if _vel < 0.0 else -1), 0, 2)
 	_snap_to(target, true)
 
-## 按下时重置速度采样。
 func _reset_velocity() -> void:
 	_drag_accum = 0.0
 	_last_sample = 0.0
@@ -278,41 +382,45 @@ func _track_velocity(px: float) -> void:
 		_last_sample = _drag_accum
 		_last_sample_tick = now
 
-# ============================== 模态弹窗（配网） ==============================
-# 背景遮罩 BGDimSharder 挂在 Main 根下：显隐跟随配网弹窗的 visibility_changed，
-# 各条关闭路径（确认/取消）都不用单独通知，淡出期间也保持。
-# 遮罩自身 mouse_filter 为 STOP，吃掉下层的翻页手势与摇杆/按钮；"点遮罩关闭"也交给遮罩自己。
+# ============================== 模态弹窗 ==============================
+# 背景遮罩 BGDimSharder 挂在 Main 根下：显隐跟随弹窗的 visibility_changed（tscn 连接），
+# 点空白处关闭交给遮罩自己上报。
 
 func _modal_open() -> bool:
 	return _wifi_popup.visible
 
-## 弹窗显隐变化时同步遮罩（信号驱动，不必每帧轮询；淡出到真正隐藏前遮罩都保持）。
 func _sync_modal_dim() -> void:
 	_dim.visible = _modal_open()
 
-## 点遮罩空白处关闭：配网弹窗等同取消。遮罩只露在弹窗之外（弹窗在其上层、自己消费触点），
-## 故遮罩上报的点击必在空白处，不必再判断是否落在弹窗本体上。
+## 点遮罩空白处关闭 = 取消。
 func _on_dim_tapped() -> void:
 	_wifi_popup.call("close")
 
+## 弹窗「确认」（Message 页）：执行挂起的动作。
+func _on_popup_confirmed() -> void:
+	var act := _confirm_action
+	_confirm_action = Callable()
+	if act.is_valid():
+		act.call()
+
 # ============================== BLE ==============================
 
-## 设置项：启动时自动连接上次设备。持久化开关；开启时立即尝试自连（含等待蓝牙就绪）。
+## 设置项：启动时自动连接上次设备。
 func _on_auto_conn_toggled(on: bool) -> void:
 	Store.set_auto_conn(on)
 	if on:
 		_try_startup_connect()
 
-## 设置项：关闭自动建立 WS 连接（纯蓝牙控制）。仅持久化，连连接态下一次设备连接生效。
+## 设置项：关闭自动建立 WS 连接（纯蓝牙控制）。
 func _on_disable_ws_toggled(on: bool) -> void:
 	Store.set_disable_auto_ws(on)
 
 ## 设置项：原地旋转模式——开启后左右推摇杆改为发送原地旋转(spin)，取代转向舵。
 func _on_spin_mode_toggle(on: bool) -> void:
 	Store.set_spin_mode(on)
+	_ctrl_area.call("set_spin_mode", on)
 
-## 启动（或开启自连开关）时重连上次设备。实际扫描由 DeviceConn.prepare_auto_scan(true)
-## 内部门控「启动自连」并解析目标；这里仅读上次设备拿提示文案。
+## 启动（或开启自连开关）时重连上次设备。
 func _try_startup_connect() -> void:
 	if DeviceConn.get_ble_state() == "unavailable":
 		return
@@ -328,7 +436,7 @@ func _try_startup_connect() -> void:
 
 ## 轮询等待蓝牙适配器进入可用状态（Android 含运行时授权弹窗）。超时或不可用则放弃。
 func _await_ble_ready() -> bool:
-	for i in 600:  # 轮询等待，带超时上限
+	for i in 600:
 		var s: String = DeviceConn.get_ble_state()
 		if s in ["idle", "scanning", "connecting", "connected"]:
 			return true
@@ -340,30 +448,26 @@ func _await_ble_ready() -> bool:
 func _on_ble_state(_s: String) -> void:
 	_update_status()
 
-## 扫描结束：列表收尾（复位/补漏/空提示）交给扫描页，本处只做权限提示。
+## 扫描结束：列表收尾交给扫描页，本处只做权限提示。
 func _on_scan_finished(devices: Array) -> void:
 	var empty: bool = _scan_panel.call("on_scan_finished", devices)
-	# 整轮空列表且 Android 未授权：提示用户（权限交叉逻辑留在编排层）。
 	if empty and OS.get_name() == "Android" \
 			and not OS.get_granted_permissions().has("android.permission.BLUETOOTH_SCAN"):
 		_chat_panel.chat("提示", "未授予蓝牙/附近设备权限，扫描不到设备——请到系统设置允许本 App 权限后刷新")
 
-## 扫描中逐台发现：交给扫描页"边扫边显示"。
 func _on_device_found(device: Dictionary) -> void:
 	_scan_panel.call("on_device_found", device)
 
 func _on_device_item_selected(name: String, address: String) -> void:
-	# 点击设备卡片：暂存目标，弹出配网/连接窗口（连接 + 可选下发 WiFi/AI，推荐用已存配置）
+	# 点击设备卡片：暂存目标，弹出配网/连接窗口。
 	_pending_addr = address
 	_pending_name = name
-	_wifi_popup.call("set_device", name)
-	_wifi_popup.call("popup")
+	_wifi_popup.call("open_provision", name)
 
 func _on_device_connected(_address: String, name: String) -> void:
 	_device_name = name
 	_update_status()
 	# BLE 已连接（会话开始）：发起 WS（默认软 AP 地址；板子上报 IP 时 DeviceConn 会用 ws://ip 覆盖）。
-	# 设置了「关闭自动建立WS连接」= 纯蓝牙控制，则跳过自动连 WS（仍可用 /ws connect 手动连）。
 	if not DeviceConn.get_ws_state() in ["connected", "connecting"] and not Store.get_disable_auto_ws():
 		DeviceConn.connect_ws()
 	_chat_panel.chat("提示", "已连接设备 %s" % name)
@@ -372,7 +476,7 @@ func _on_device_connected(_address: String, name: String) -> void:
 	var ai: Dictionary = _pending_ai
 	_pending_provision = {}
 	_pending_ai = {}
-	# 连上后拉一次状态，同步灯/夹爪 + AI 运行态（覆盖纯蓝牙、无 WS 场景；与 _on_ws_connected 幂等）。
+	# 连上后拉一次状态，同步灯/夹爪 + AI 运行态。
 	await _wait_gatt_ready()
 	DeviceConn.send_command(CP.get_state())
 	if not wifi.is_empty():
@@ -388,17 +492,10 @@ func _on_device_connected(_address: String, name: String) -> void:
 
 func _on_device_disconnected(reason: String) -> void:
 	_update_status()
-	# 会话结束：WS 重连/双断恢复等策略由 DeviceConn 收口，这里仅提示 UI。
-	# 注意：WS_ONLY 让出 BLE 射频时的 BLE 断开不触发本信号（DeviceConn 在此场景不抛 device_disconnected）。
 	_chat_panel.chat("提示", "设备已断开: %s" % reason)
 
 func _on_ble_status(data: Dictionary) -> void:
-	# 板端 BLE status 两种形态：
-	#  1) build_status 包装：{"ip",...,"reply":"<JSON>"}（词表应答/状态），无顶层 type → 解包 reply 再路由；
-	#  2) send_status 直推的独立 JSON：顶层带 type（如 exec_status）。
-	# 统一解出消息体后交给公共处理器（_handle_board_msg），与 WS 通道同一套展示逻辑。
-	# 顶层 bits（build_status 附带的状态位）先同步灯/夹爪按钮 —— 纯蓝牙下没有 WS 的 status 回执，
-	# 灯等按钮能不能亮起来就靠它（不覆盖本地 AI 运行态，见 _apply_state_bits）。
+	# 板端 BLE status 两种形态（build_status 包装 / send_status 直推），解包后走同一套展示逻辑。
 	var _b: Variant = data.get("bits")
 	if _b is int or _b is float:
 		_apply_state_bits(int(_b))
@@ -409,14 +506,13 @@ func _on_ble_status(data: Dictionary) -> void:
 		if r is String and j.parse(r as String) == OK and j.data is Dictionary:
 			msg = j.data as Dictionary
 		else:
-			_update_status()  # 无 reply 的纯状态 notify：只刷新 UI，无可展示文本
+			_update_status()
 			return
 	if msg.has("type"):
 		_handle_board_msg(msg)
 	_update_status()
 
 ## 从 exec_status 的 params 提取可读状态文本；无 text 回退显示原始 cmd/hex。
-## 供 WS（_on_ws_text）与 BLE（_on_ble_status）两条通道共用。
 func _exec_status_text(p: Variant) -> String:
 	if p is Dictionary:
 		var t1: Variant = (p as Dictionary).get("text")
@@ -432,12 +528,10 @@ func _exec_status_text(p: Variant) -> String:
 		return line
 	return ""
 
-## 统一扫描入口。auto=true（启动/恢复）：同步自动目标名；
-## auto=false（手动）：打断自动重连 + 复位连接占位 + 开扫。
-## 列表不在开扫时清空：由扫描页在真正显示新设备时才清旧列表（见 ScanPanel），避免扫描间隙空白。
+## 统一扫描入口。auto=true（启动/恢复）；auto=false（手动）。
 func _start_scan(auto: bool) -> void:
 	if auto:
-		_pending_name = DeviceConn.auto_target_name()   # 顶栏 "连接中: xxx"
+		_pending_name = DeviceConn.auto_target_name()
 	else:
 		DeviceConn.cancel_auto_reconnect()
 		_pending_addr = ""
@@ -445,18 +539,13 @@ func _start_scan(auto: bool) -> void:
 	DeviceConn.scan()
 
 func _on_refresh_toggled(pressed_on: bool) -> void:
-	# toggle 按下 → 统一入口（打断自动重连 + 开扫），松开 → 统一停扫（恢复扫描一并打断）。
 	if pressed_on:
 		_start_scan(false)
 	else:
 		DeviceConn.stop_scan()
 
-## 任何一次扫描（手动 / 双断恢复）都由 DeviceConn 的上报驱动同一套扫描按钮 + 动画，保证统一、可打断。
 func _on_device_scan_started() -> void:
 	_scan_panel.call("show_scanning")
-
-func _on_provision_pressed() -> void:
-	_wifi_popup.call("popup")
 
 func _on_wifi_confirmed(ssid: String, password: String, url: String, key: String, model: String) -> void:
 	# 连接窗口「连接」确认：连接暂存设备；WiFi/AI 留空则仅连接不下发。
@@ -469,7 +558,6 @@ func _on_wifi_confirmed(ssid: String, password: String, url: String, key: String
 	_pending_ai = {}
 	if not url.is_empty():
 		_pending_ai = {"url": url, "key": key, "model": model}
-	# 持久化本次配置（留空保留旧值），下次打开弹窗自动预填；并记录最近设备供启动自连。
 	Store.set_wifi(ssid, password)
 	Store.set_ai(url, key, model)
 	Store.set_last_device(_pending_addr, _pending_name)
@@ -485,46 +573,32 @@ func _wait_gatt_ready() -> void:
 
 # ============================== WS / 视频 ==============================
 
-## get_state 回传（type:"state"）：params.bits 为板端状态位字节，按位同步直控按钮（灯/夹爪/AI 运行态）。
+## get_state 回传（type:"state"）：params.bits 为板端状态位字节，按位同步直控按钮。
 func _apply_state(data: Dictionary) -> void:
 	var st: Variant = data.get("params")
 	if st is Dictionary:
 		var b: Variant = (st as Dictionary).get("bits")
-		# Godot JSON 解析把数字存成 float（typeof=3），兼容 int/float。
 		if b is int or b is float:
-			# 主动 get_state（重连/刷新）是 AI 运行态的初始化点：此时按 bit4 同步「中止/发送」。
 			_apply_state_bits(int(b), true)
 
-## 按板端状态位字节同步直控按钮。WS 与 BLE 通道共用。
-## apply_ai=true 仅在主动 get_state/reconnect 首同步时传：此时按 bit4 初始化「中止/发送」；
-## 其余（动作回执/BLE status 的 bits）不覆盖本地 AI 运行态 —— AI 的「中止/发送」由
-## ai_goal/ai_result(done)/手动接管/掉线 管理，避免一次普通回执的 bit4 把正在运行的任务误打回「发送」。
-## 灯/夹爪(bits0-3)始终按位同步。
-## bit 布局与 Stm32-Vision/command.cpp（state_bits）逐位 mirror，改一侧必改另一侧：
-##   bit0 前灯 / bit1 震灯 / bit2 背灯 / bit3 夹爪夹紧 / bit4 AI busy；bit5-7 留空。
+## 按板端状态位字节同步直控按钮（WS 与 BLE 通道共用）。
+## apply_ai=true 仅在主动 get_state/reconnect 首同步时传：此时按 bit4 初始化「中止/发送」。
+## bit 布局与 Stm32-Vision/command.cpp（state_bits）逐位 mirror，改一侧必改另一侧。
 func _apply_state_bits(bits: int, apply_ai: bool = false) -> void:
-	$BodyControl/CtrlArea.call("sync_state", {
-		"front": (bits & 1) != 0,
-		"vibe": (bits & 2) != 0,
-		"back": (bits & 4) != 0,
-	}, (bits & 8) != 0)
-	if apply_ai:
-		_chat_panel.set_ai_running((bits & 16) != 0)
+	_ctrl_area.call("apply_state_bits", bits, apply_ai)
 
 func _on_ws_connected() -> void:
 	_chat_panel.chat("板", "WS 已连接")
 	_update_status()
-	# 连上后主动拉一次当前状态，同步直控面板按钮（灯/夹爪），避免重连后状态不一致。
 	DeviceConn.send_command(CP.get_state())
-	# WS 建立即进入 WS_ONLY（让出 BLE 射频）由 DeviceConn 在内部处理。
-	# 重连后按图传开关当前状态重发开启指令：断连期间开关保持「开」但板子画面已断，需重发恢复。
-	if _stream_toggle.button_pressed:
+	# 重连后按图传开关当前状态重发开启指令：断连期间开关保持「开」但板子画面已断。
+	if _stream_on:
 		_apply_stream(true)
 
 func _on_ws_disconnected(reason: String) -> void:
 	_video.call("show_no_signal", true)
 	DeviceConn.stop_video()  # WS 掉线：UDP 对端随之失效，停接收
-	_chat_panel.set_ai_running(false)  # 掉线即任务中断：按钮复位「发送」，避免重连后残留「中止」
+	_chat_panel.set_ai_running(false)  # 掉线即任务中断：按钮复位「发送」
 	_update_status()
 	var r := reason
 	if r.is_empty():
@@ -532,67 +606,57 @@ func _on_ws_disconnected(reason: String) -> void:
 	_chat_panel.chat("板", "WS 已断开:%s" % r)
 
 func _on_frame(img: Image) -> void:
-	if _editing:
-		return  # 标注中：画面冻结在进入标注时的那一帧（_video / current_image 都保持不动）
+	# 标注中：画面冻结在进入标注时的那一帧；回放中：实时帧不许顶掉回放画面。
+	if _editing or Recorder.is_playing():
+		return
 	_video.call("set_frame", img)
 	DeviceConn.current_image = img
 
 func _on_ws_text(data: Dictionary) -> void:
 	_handle_board_msg(data)
 
-## 板端上行消息统一处理（AI 结果/日志/状态/词表回执），WS 与 BLE 两条通道共用：
-## 按顶层 type 路由展示；返回 true 表示已消费，false 表示未知类型（留给调用方兜底）。
+## 板端上行消息统一处理（AI 结果/日志/状态/词表回执），WS 与 BLE 两条通道共用。
 func _handle_board_msg(data: Dictionary) -> bool:
+	# 回放中一律不展示：否则实时消息会插进回放的时间线里。
+	if Recorder.is_playing():
+		return true
 	var t: String = str(data.get("type", ""))
 	match t:
 		"pong":
-			# 板端保活应答（每心跳周期一次）：带当场状态位（bits），**只同步不打印**——打印就成了
-			# 每几秒一行的噪声。保活是板端当场现测的，不像动作回执可能陈旧 ⇒ 可用它覆盖本地 AI
-			# 运行态（apply_ai=true）。这正是"AI 任务在跑、发送按钮却没变成中止"的兜底：任务由
-			# 另一侧起停、或漏收了一次 ai_result 时，按钮会在一个心跳周期内自行纠正。
+			# 板端保活应答：带当场状态位（bits），只同步不打印（否则每几秒一行噪声）。
 			var pp: Variant = data.get("params")
 			if pp is Dictionary:
 				var pb: Variant = (pp as Dictionary).get("bits")
-				# Godot JSON 解析把数字存成 float（typeof=3），兼容 int/float。
 				if pb is int or pb is float:
 					_apply_state_bits(int(pb), true)
 		"ai_result":
 			_chat_panel.show_ai_result(data)
 		"ai_task":
-			# 板端任务面板快照（params:{state,round,goal?,note?,tasks:[{name,done}]}）：
-			# 任务列表本来只进模型上下文与日志，这条才把它结构化送上来给手机端的悬浮面板。
 			_chat_panel.show_task(data.get("params"))
+		"ai_mem":
+			# 板端物体记忆 + 车姿态快照：喂给记忆地图（画面源=记忆时画）。
+			_video.call("show_map_data", data.get("params"))
 		"ai_tool":
-			# 板端每个工具落地后即时回推的执行轨迹（{type:"ai_tool", params:{text}}），**不走 /log 开关**：
-			# AI 倾向"做完再 say"，不开日志时整段执行过程是黑的；这条补上"正在用什么工具"的可见性。
 			var tp: Variant = data.get("params")
 			if tp is Dictionary:
 				var ttv: Variant = (tp as Dictionary).get("text")
 				if ttv is String and not (ttv as String).is_empty():
 					_chat_panel.chat("AI工具", ttv as String)
 		"log":
-			# 板端统一日志模块回推（/log <exec|ai|all> on 开启）：来源+文本，展示并落盘。
-			# 板端发 {type:"log", params:{src:"exec|ai|...", text:"..."}}。
 			var lp: Variant = data.get("params")
 			if lp is Dictionary:
 				var lsrc := str((lp as Dictionary).get("src", ""))
 				var ltv: Variant = (lp as Dictionary).get("text")
 				if ltv is String:
-					# ai 类别用「AI日志」样式单列（ChatPanel 已有该分支，颜色与「日志」区分）：
-					# 全类别混进同一个灰色「日志」区时，AI 行为被 cmd/exec 的噪声淹掉，
-					# 看起来就像"AI 日志不发了"。
 					if lsrc == "ai":
 						_chat_panel.chat("AI日志", ltv as String)
 					else:
 						_chat_panel.chat("日志", "[%s] %s" % [lsrc, ltv as String])
 		"state":
-			# get_state 回传：同步直控按钮（灯/夹爪/AI 运行态）。
 			_apply_state(data)
 		"exec_status":
 			_chat_panel.chat("状态", _exec_status_text(data.get("params")))
 		"status":
-			# status 回执：展示可读 reason，并按其附带的状态位（bits，若存在）同步直控按钮
-			# （reset / ai_cancel / light 等"会触发动作重置"的回执都自动带上 bits）。
 			var line2 := ""
 			var pm: Variant = data.get("params")
 			if pm is Dictionary:
@@ -600,7 +664,6 @@ func _handle_board_msg(data: Dictionary) -> bool:
 				if pd.has("reason"):
 					line2 = str(pd.get("reason"))
 				var b: Variant = pd.get("bits")
-				# Godot JSON 解析把数字存成 float（typeof=3），兼容 int/float。
 				if b is int or b is float:
 					_apply_state_bits(int(b))
 			if line2 != "":
@@ -613,41 +676,33 @@ func _on_stream_toggled(on: bool) -> void:
 	Store.set_stream_on(on)
 	_apply_stream(on)
 
-## 虚拟按键开关：整块摇杆/直控区显隐（持久化，下次启动按此恢复）。
-func _on_direct_ctrl_visible_toggled(on: bool) -> void:
-	Store.set_direct_ctrl_on(on)
-	_ctrl_area.visible = on
-	_sync_bottom_padding()
-
-## 摇杆区隐藏时输入框贴底，软键盘会盖住它：撑起底部占位把聊天区抬起来，键盘收起即还原。
-## 弹窗期间不抬（弹窗自带输入框，遮罩下面的聊天区不该跟着动）。
+## 控制区收起时输入框贴底、软键盘会盖住它：撑起底部占位把聊天区抬起来，键盘收起即还原。
+## 弹窗/回放期间不抬（弹窗自带输入框，回放的输入本就禁用）。
 func _sync_bottom_padding() -> void:
-	var want: bool = not _modal_open() and not _ctrl_area.visible \
+	var want: bool = not _modal_open() and not _ctrl_area.visible and not Recorder.is_playing() \
 		and DisplayServer.has_feature(DisplayServer.FEATURE_VIRTUAL_KEYBOARD) \
 		and DisplayServer.virtual_keyboard_get_height() > 0
 	if _bottom_padding.visible != want:
 		_bottom_padding.visible = want
 
-## 图传开关统一出口：开 → 先起 UDP 接收拿本地端口，再发 stream(udp_port) 让板子向该端口推 JPEG；
-## 关 → 停 UDP 接收并发 stream off。_on_ws_connected / /stream 均走这里，保证端口上报一致。
+## 图传开关统一出口：开 → 先起 UDP 接收拿本地端口，再发 stream(udp_port)；
+## 关 → 停 UDP 接收并发 stream off。_on_ws_connected / /stream 均走这里。
 func _apply_stream(on: bool) -> void:
+	_stream_on = on
 	var port := -1
 	if on:
 		port = DeviceConn.start_video()
 		if port < 0:
 			_chat_panel.chat("提示", "UDP 图传初始化失败")
 	DeviceConn.send_command(CP.stream(on, port if port > 0 else 0, _my_ipv4()))
-	_video.visible = on
+	_apply_layout()
 
-## 取手机非回环 IPv4 本机地址（板端建 UDP 会话用，见 CommandProto.stream）。
-## 优先挑与板子（WS 对端）同网段的地址：手机可能带 VPN/虚拟网卡，直接取首个非回环地址
-## 可能把隧道 IP 报给板子，板端 UDP 发到该地址不可达 → 手机收不到画面。
+## 取手机非回环 IPv4 本机地址（板端建 UDP 会话用）。优先挑与板子（WS 对端）同网段的地址。
 func _my_ipv4() -> String:
 	var host: String = DeviceConn.board_ip()
 	for a in IP.get_local_addresses():
 		if _is_usable_ipv4(a) and not host.is_empty() and _same_subnet(a, host):
 			return a
-	# 兜底：无匹配网段时任取一个可用 IPv4（无 VPN 环境与旧行为一致）
 	for a in IP.get_local_addresses():
 		if _is_usable_ipv4(a):
 			return a
@@ -665,8 +720,6 @@ func _same_subnet(a: String, b: String) -> bool:
 
 # ============================== 框选（编辑器） ==============================
 
-var _editing := false   # 标注中：图传冻结（_on_frame 丢帧），画面停在最后一帧供标注
-
 ## 「框选目标」开关：开 → 冻结图传取当前帧进标注；关 → 关闭工具条并收尾。
 func _on_annotate_toggled(on: bool) -> void:
 	if not on:
@@ -681,71 +734,26 @@ func _on_annotate_toggled(on: bool) -> void:
 	_begin_edit(img)
 
 ## 进入标注：图传区临时可见（图传关着时也能在冻结帧上标注），冻结帧交给画布。
-## 图传开关一并禁用：编辑中关掉图传会让画面连同画布一起消失，只剩工具条。
 func _begin_edit(img: Image) -> void:
 	_editing = true
-	_video.visible = true
-	_stream_toggle.disabled = true
 	_annotate_btn.set_pressed_no_signal(true)
+	_apply_layout()   # 图传开关的禁用由「replaying or _editing」统一在这里管
 	_editor.call("open", img)
 
-## 退出标注：解冻图传、图传区还原到开关状态、复位「框选目标」按钮、放开图传开关。
+## 退出标注：解冻图传、复位「框选目标」按钮、放开图传开关。
 func _end_edit() -> void:
 	_editing = false
-	_video.visible = _stream_toggle.button_pressed
-	_stream_toggle.disabled = false
 	_annotate_btn.set_pressed_no_signal(false)
+	_apply_layout()
 
 ## 编辑器「采用」：编辑图进聊天区附件列表，然后收尾。
 func _on_editor_image_sent(img: Image, annotation: Dictionary) -> void:
 	_end_edit()
 	_chat_panel.call("_on_image_sent", img, annotation)
 
-## /append：打开系统文件选择器选一张图片（懒建 FileDialog）。
-## 选择后压缩到目标大小、走同一套标注编辑器，采用后进入附件列表。
-func _on_chat_image_pick_requested() -> void:
-	if _pick_dialog == null:
-		_pick_dialog = FileDialog.new()
-		_pick_dialog.title = "选择图片"
-		_pick_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
-		_pick_dialog.access = FileDialog.ACCESS_FILESYSTEM
-		_pick_dialog.use_native_dialog = true  # Android 上走系统 SAF 文件选择器（4.6+ 内置，无需插件）
-		_pick_dialog.filters = PackedStringArray(["*.png ; PNG 图片", "*.jpg ; JPG 图片", "*.jpeg ; JPEG 图片"])
-		_pick_dialog.file_selected.connect(_on_pick_file)
-		var pics: String = OS.get_system_dir(OS.SYSTEM_DIR_PICTURES)
-		if not pics.is_empty():
-			_pick_dialog.current_dir = pics
-		add_child(_pick_dialog)
-	_pick_dialog.popup_centered()
-
-func _on_pick_file(path: String) -> void:
-	var img := Image.new()
-	if img.load(path) != OK:
-		_chat_panel.chat("提示", "图片读取失败: %s" % path)
-		return
-	img = _compress_to_target(img, 20480)  # 压缩到目标大小，避免把大图发给板端/AI
-	if img == null:
-		_chat_panel.chat("提示", "图片压缩失败（未能压到目标大小内）")
-		return
+## 选图（/append 与附图按钮）：ChatPanel 已压缩好，这里打开标注编辑器。
+func _on_chat_image_picked(img: Image) -> void:
 	_begin_edit(img)
-
-## 把图压到 ≤ max_bytes（JPEG）：先降质量，仍超则等比缩宽后再降质，返回压缩后 Image。
-## 0=用原宽（仅降质）；宽度从大到小、质量从高到低，命中即返回（尽量清晰）。
-func _compress_to_target(img: Image, max_bytes: int) -> Image:
-	var widths := [0, 1600, 1280, 1024, 800, 640, 480, 360]
-	var qualities := [0.88, 0.76, 0.64, 0.52, 0.40, 0.30]
-	for w: int in widths:
-		var cur: Image = img
-		if w > 0 and img.get_width() > w:
-			cur = img.duplicate()
-			cur.resize(w, maxi(int(round(img.get_height() * float(w) / float(img.get_width()))), 1))
-		for q: float in qualities:
-			var buf: PackedByteArray = cur.save_jpg_to_buffer(q)
-			if buf.size() > 0 and buf.size() <= max_bytes:
-				var out := Image.new()
-				if out.load_jpg_from_buffer(buf) == OK:
-					return out
-	return null
 
 func _on_editor_cancelled() -> void:
 	_end_edit()  # 取消 = 放弃这张图，不影响输入框与已附图
@@ -760,79 +768,67 @@ func _on_chat_stream_requested(on: bool) -> void:
 func _on_chat_grid_requested(on: bool) -> void:
 	_video.call("show_grid", on)
 
-# ============================== 手动控制 ==============================
+# ============================== 会话回放 ==============================
 
-func _process(_delta: float) -> void:
-	if _joy_held:
-		_update_joystick()
-	_sync_bottom_padding()
-
-func _update_joystick() -> void:
-	# 内置 VirtualJoystick 把分量写入 4 个 vjoy_* action，据此还原方向向量
-	var x: float = Input.get_action_strength("vjoy_right") - Input.get_action_strength("vjoy_left")
-	var y: float = Input.get_action_strength("vjoy_down") - Input.get_action_strength("vjoy_up")
-	var v: Vector2 = Vector2(x, y)
-	# 上=前进：推进取 -y；左右取 x。量化成：速度 低速/高速 两档 + 固定转向，死区内归零
-	var throttle := 0.0
-	if absf(v.y) >= _JOY_DEADZONE:
-		var sp: float = _JOY_FAST if absf(v.y) > _JOY_FAST_THRESH else _JOY_SLOW
-		throttle = signf(v.y) * -sp
-	var steering := 0.0
-	if absf(v.x) >= _JOY_DEADZONE:
-		steering = signf(v.x) * _JOY_STEER
-	# 原地旋转模式下摇杆斜向（左右+前后同时有效）：原地转与前进物理互斥，忽略转向、只前进/后退。
-	# 普通（转向舵）模式保留"一边转弯一边前进"的原有行为。
-	var spin_mode: bool = _spin_mode_btn.button_pressed
-	var diagonal: bool = spin_mode and absf(v.x) >= _JOY_DEADZONE and absf(v.y) >= _JOY_DEADZONE
-	# cmd 仅做"是否变化"的去重；斜向时 steering 归零，避免单独触发自转。
-	var cmd := Vector2(throttle, 0.0 if diagonal else steering)
-	if cmd == _last_joy_cmd:
+func _on_session_selected(id: int) -> void:
+	_session_panel.call("close")
+	if id < 0:
+		Recorder.stop_play()   # 当前会话 = 退出回放（回 live）
 		return
-	_last_joy_cmd = cmd
-	# 摇杆操作 = 手动接管：打断板端 AI 闭环，聊天发送按钮恢复「发送」
-	_chat_panel.set_ai_running(false)
-	if cmd == Vector2.ZERO:
-		# 松手/居中：停四轮；原地旋转模式下停旋转（复位自转态），否则转向回正
-		DeviceConn.send_command(CP.drive(0))
-		if spin_mode:
-			DeviceConn.send_command(CP.spin(0))
-			_last_spin_active = false
-		else:
-			DeviceConn.send_command(CP.servo(0, _SERVO_CENTER))
+	if not Recorder.play(id):
+		_session_panel.call("set_selected", -1)
+		_chat_panel.chat("提示", "该会话没有可回放的内容")
 		return
-	# 直接驱动：油门 → 全车 drive；左右 → 转向舵；原地旋转模式下左右推改为原地旋转。
-	var drive_spd := int(round(absf(throttle) * _DRIVE_MAX))
-	if throttle < 0:
-		drive_spd = -drive_spd
-	DeviceConn.send_command(CP.drive(clampi(drive_spd, -1000, 1000)))
-	if spin_mode:
-		# 原地旋转模式：仅纯左右（非斜向）才自转；斜向/前进时若此前在转则补停残余自转。
-		var want_spin: bool = (not diagonal) and absf(steering) >= _JOY_DEADZONE
-		var want_dir: int = 1 if steering > 0 else -1
-		if want_spin != _last_spin_active:
-			DeviceConn.send_command(CP.spin(want_dir if want_spin else 0, _SPIN_SPEED))
-			_last_spin_active = want_spin
-	else:
-		DeviceConn.send_command(CP.servo(0, clampi(
-			_SERVO_CENTER + int(round(steering / _JOY_STEER * _SERVO_RANGE)), 50, 250)))
+	_session_panel.call("set_selected", id)
+	_chat_panel.call("begin_replay")
+	_playback_bar.call("set_paused", false)
+	_apply_layout()
 
-func _on_joystick_pressed(_v: Variant = null) -> void:
-	_joy_held = true
-	_last_joy_cmd = Vector2.ZERO
-	_last_spin_active = false
+func _on_session_delete_requested(id: int) -> void:
+	_confirm_action = func(): Recorder.delete(id)
+	_wifi_popup.call("open_confirm", "删除会话", "是否确认删除该会话？", "删除")
 
-func _on_joystick_release(_v: Variant = null) -> void:
-	_joy_held = false
-	_last_joy_cmd = Vector2.ZERO
-	_last_spin_active = false
-	_chat_panel.set_ai_running(false)
-	DeviceConn.send_command(CP.drive(0))
-	if _spin_mode_btn.button_pressed:
-		DeviceConn.send_command(CP.spin(0))
-	else:
-		DeviceConn.send_command(CP.servo(0, _SERVO_CENTER))
+func _on_popup_cancelled() -> void:
+	# 取消（按钮或点遮罩）也要清掉挂起的确认动作，免得下次弹确认框时误触发上一次的。
+	_confirm_action = Callable()
+
+## /clear 开了新会话：板端上下文已清，本地记忆图也一并清掉（板子不会主动推一份空快照）。
+func _on_session_cleared() -> void:
+	_video.call("clear_map")
+
+func _on_replay_event(ev: Dictionary) -> void:
+	_chat_panel.call("replay_apply", ev)
+
+func _on_replay_frame(img: Image) -> void:
+	_video.call("set_frame", img)
+
+func _on_replay_seeked() -> void:
+	# 拖动/回退：清场后由 Recorder 重新抛该点之前的事件。
+	_chat_panel.call("begin_replay")
+
+func _on_replay_progress(t_ms: int, dur_ms: int) -> void:
+	_playback_bar.call("set_progress", 0.0 if dur_ms <= 0 else float(t_ms) / float(dur_ms))
+
+func _on_replay_finished() -> void:
+	_chat_panel.call("end_replay")
+	_playback_bar.call("set_paused", true)
+	_apply_layout()
+
+func _on_replay_step(dir: int) -> void:
+	Recorder.step(dir)
+	_playback_bar.call("set_paused", true)
+
+func _on_replay_toggle_pause() -> void:
+	Recorder.toggle_pause()
+	_playback_bar.call("set_paused", Recorder.is_paused())
+
+func _on_replay_seek(ratio: float) -> void:
+	Recorder.seek_ratio(ratio)
 
 # ============================== 状态 ==============================
+
+func _process(_delta: float) -> void:
+	_sync_bottom_padding()
 
 func _update_status() -> void:
 	var ble: String = DeviceConn.get_ble_state()
@@ -843,7 +839,7 @@ func _update_status() -> void:
 	_ws_dot.modulate = Color.GREEN if online else Color(1, 1, 1, 0.3)
 	_ble_stat.text = "BLE:%s" % ble
 	_ws_stat.text = "WS:%s" % ("已连接" if online else "未连接")
-	# 顶栏大字三态：WS 在线优先判定（WS_ONLY 下 BLE 已让出射频），WS 连着即算已连接。
+	# 顶栏大字三态：WS 在线优先判定（WS_ONLY 下 BLE 已让出射频）。
 	var ble_ok: bool = DeviceConn.is_device_connected()
 	if online:
 		_conn_stat.text = ("已连接: %s" % _device_name) if _device_name != "" else "已连接(WS)"

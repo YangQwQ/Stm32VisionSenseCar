@@ -10,6 +10,8 @@ extends Node
 ## 在途解码期间的整帧直接覆盖丢弃 —— 画面只追最新，显示顺序天然单调（不会把旧帧翻出来重播）。
 
 signal frame_received(img: Image)
+## 解码前的原始 JPEG 整帧（录制用旁路）：只在本类里拿得到，解出来的 Image 再压回去不划算。
+signal frame_jpeg(bytes: PackedByteArray)
 
 const MAGIC0 := 0x56
 const MAGIC1 := 0x44
@@ -31,9 +33,6 @@ var _mutex := Mutex.new()
 var _pending := PackedByteArray()  # 待解码的最新整帧（worker 取走前可被新来的整帧覆盖）
 var _result: Image = null          # worker 解出的画面，主线程取走后置空
 var _task_id := -1                 # 在途解码任务 id（-1 = 空闲）
-
-func is_active() -> bool:
-	return _peer != null
 
 func get_port() -> int:
 	return _local_port
@@ -147,6 +146,7 @@ func _assemble() -> void:
 	else:
 		img_bytes.resize(_total)  # 保证与声明的 total 长度一致（缺片理论上不会走到这）
 	_reset()
+	frame_jpeg.emit(img_bytes)
 	_pending = img_bytes  # 覆盖写：在途解码期间来的新整帧直接顶掉旧的（只追最新）
 
 func _read_u16(b: PackedByteArray, off: int) -> int:

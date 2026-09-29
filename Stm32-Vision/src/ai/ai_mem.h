@@ -38,5 +38,9 @@ bool mem_find(const char* name, float* tx, float* ty);
 bool mem_forget(const char* name);
 // 每轮结束: 所有物体未观测则过期轮数 +1。
 void mem_tick_stale();
+// 导出车姿态 + 物体记忆为 JSON(供手机端"画面源=记忆"绘制俯视图)。
+// 写入 out: {x,y,hd, objs:[{name, r, f, stale}]} —— r=车头系右+ cm, f=前+ cm(与 mem_feed 同一套逆变换)。
+// 只读, 不改任何状态。
+void mem_export(JsonObject out);
 
 }  // namespace ai

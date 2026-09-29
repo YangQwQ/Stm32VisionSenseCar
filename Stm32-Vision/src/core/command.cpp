@@ -420,6 +420,15 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
+  if (!strcmp(type, "ai_clear")) {
+    // 开新会话：中止在跑的任务 + 清空会话上下文（历史/笔记/物体记忆/车位姿）。
+    // 手机端 /clear 用它；任务在跑时清空会被登记到任务收尾再生效（见 ai::session_clear）。
+    ai::cancel(ai::StopMode::All);
+    ai::session_clear();
+    reply_status(doc, reply, reply_ctx, "AI 会话上下文已清空");
+    return;
+  }
+
   if (!strcmp(type, "ai_chat")) {
     // AI 任务进行中"插话"：把用户补充喂给当前任务，不打断（区别于 ai_goal/ai_cancel）。
     // 无任务在跑时忽略，仅回执提示——不当作新目标接管。
