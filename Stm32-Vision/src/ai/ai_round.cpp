@@ -131,7 +131,7 @@ struct RoundCtx {
 
   // look 出图的清单(下一回合组包时注入到 look 那条 tool 结果): 顺序 = 给图顺序, 最多 2 张(硬上限)。
   // 指针指向任务期常驻缓冲(cur/prev/ed_img), 任务中途不会被释放。
-  struct LookImg { const uint8_t* p = nullptr; size_t n = 0; };
+  struct LookImg { const uint8_t* p = nullptr; size_t n = 0; bool zoomed = false; };
   LookImg look_set[2];
   uint8_t look_cnt = 0;             // 清单张数(0=本回合没出图)
   bool look_live = false;           // 清单含"新拍的实景" → 才算 observe 基准 / 才滚动 prev
@@ -752,8 +752,8 @@ static AttR round_attempt(RoundCtx& c) {
       hc.imgs[0] = ImgRef(); hc.imgs[1] = ImgRef();
       if (!hc.img_n || !owner) continue;
       // 清单顺序 = 给图顺序(新拍 → prev → user)
-      hc.imgs[0] = ImgRef{ c.look_set[0].p, c.look_set[0].n };
-      if (hc.img_n >= 2 && c.look_set[1].p) { hc.imgs[1] = ImgRef{ c.look_set[1].p, c.look_set[1].n }; with_prev = true; }
+      hc.imgs[0] = ImgRef{ c.look_set[0].p, c.look_set[0].n, c.look_set[0].zoomed };
+      if (hc.img_n >= 2 && c.look_set[1].p) { hc.imgs[1] = ImgRef{ c.look_set[1].p, c.look_set[1].n, c.look_set[1].zoomed }; with_prev = true; }
       carried = true;
       owner_ti = ti;
     }
@@ -768,7 +768,7 @@ static AttR round_attempt(RoundCtx& c) {
   br.turns = c.hist;
   br.turn_n = c.hist_n;
   br.tail_hint = c.pend_hint[0] ? c.pend_hint : nullptr;   // 一次性提示: 挂最新一条 tool 结果/尾部画面
-  br.frame = { c.frame, c.frame_len };
+  br.frame = { c.frame, c.frame_len, false };   // 尾部画面恒为全幅 → low
   br.use_frame = c.frame_note[0] != 0;
   br.frame_note = c.frame_note;
   build_body(body, br);
@@ -1440,7 +1440,7 @@ static bool do_look(RoundCtx& c, const char* args, char* out, size_t cap) {
       snprintf(out, cap, "look: 取画面失败(摄像头/缓冲异常), 稍后再试。");
       return false;
     }
-    c.look_set[c.look_cnt] = RoundCtx::LookImg{ c.cur, c.cur_len };
+    c.look_set[c.look_cnt] = RoundCtx::LookImg{ c.cur, c.cur_len, zoomed };
     c.look_ids[c.look_cnt] = c.cur_id;
     snprintf(dsc[c.look_cnt], sizeof(dsc[0]), "新拍的当前画面(%s)", ln);
     c.look_cnt++; c.look_live = true;
@@ -1454,7 +1454,7 @@ static bool do_look(RoundCtx& c, const char* args, char* out, size_t cap) {
       for (int s = 0; s < AI_EDITED_SLOTS; s++)   // 用户参考图池
         if (c.ed_num[s] == k && c.ed_len[s] > 0) { p = c.ed_img[s]; n = c.ed_len[s]; who = "用户发送的图片"; break; }
     if (!p || n == 0 || n > AI_EDITED_IMG_MAX) continue;   // 号不在保留范围(末尾按"要而没给"统一提示)
-    c.look_set[c.look_cnt] = RoundCtx::LookImg{ p, n };
+    c.look_set[c.look_cnt] = RoundCtx::LookImg{ p, n, false };
     c.look_ids[c.look_cnt] = k;
     snprintf(dsc[c.look_cnt], sizeof(dsc[0]), "%s", who);
     c.look_cnt++;

@@ -33,6 +33,7 @@ struct PsaBuf {
 struct ImgRef {
   const uint8_t* p = nullptr;
   size_t n = 0;
+  bool hi = false;   // true=detail:"high"(放大/精判图); false=detail:"low"(全幅, 省 token/省 prefill)
 };
 
 // ================ agent 循环的历史视图 ================

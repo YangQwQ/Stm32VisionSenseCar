@@ -36,8 +36,11 @@ static void esc_append(PsaBuf& b, const char* s) {
 }
 
 // 图块前缀/后缀: base64 数据夹在中间, 故拆成两段静态文本, 数据由 PieceStream 边发边编码。
+// 全幅图走 low(只 fit 进一张 512×512=85 token, VGA 下几乎无损且省 prefill); 放大/精判图走 high。
+// DeepSeek 只认 low/high/original/auto, medium 会被 422 拒。
 static const char IMG_PRE[] = "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
-static const char IMG_SUF[] = "\",\"detail\":\"high\"}}";   // DeepSeek 只认 low/high/original/auto, medium 会被 422 拒
+static const char IMG_SUF_LOW[]  = "\",\"detail\":\"low\"}}";
+static const char IMG_SUF_HIGH[] = "\",\"detail\":\"high\"}}";
 
 // base64 第 oi 个输出字符。无状态: 由输入直接算出, 故 rewind 重播的字节必然一致(不需要留编码状态)。
 static char b64_at(const uint8_t* in, size_t n, size_t oi) {
@@ -416,7 +419,7 @@ void build_body(PieceList& l, const BodyReq& r) {
       l.take(pre);
       l.add_b64(r.frame.p, r.frame.n);
       PsaBuf suf;
-      suf.put(IMG_SUF);
+      suf.put(r.frame.hi ? IMG_SUF_HIGH : IMG_SUF_LOW);
       suf.put("]}");
       l.take(suf);
     } else {
