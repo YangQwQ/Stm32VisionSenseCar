@@ -1362,23 +1362,36 @@ static void do_car(RoundCtx& c, const char* args, char* out, size_t cap) {
 }
 
 // 渲染「当前可查看图片」一行: 实景帧环 + (本回合新拍、即将进环的 cur) + 用户参考图池, 按编号升序去重。
-// 模型据此挑 look(image=[...]) 的编号 —— 号写死, 不必自己数"还剩几张"。
+// 每条都标来源(实景/参考图), 别让 AI 拿参考图编号当实景或反之。已有实拍画面时参考图只列一张
+// (取编号最大的那张当代表), 免得刷屏; 其余参考图编号仍见首轮提示, 要看得凭编号 look。
 static void render_viewable(RoundCtx& c, PsaBuf& rt) {
-  uint32_t ids[AI_PREV_SLOTS + AI_EDITED_SLOTS + 1]; int n = 0;
+  uint32_t ids[AI_PREV_SLOTS + AI_EDITED_SLOTS + 1];
+  uint8_t src[AI_PREV_SLOTS + AI_EDITED_SLOTS + 1];   // 0=实景 1=参考图
+  int n = 0;
   // 本回合新拍时 cur 会挤进环首 ⇒ 最旧一槽随即被淘汰(见 prev_roll), 别把它列进来: 列了 AI 下回合
   // 真去用就"超出保留范围"了。纯回看不滚环, 故三槽都留得住。
   int keep = c.look_live ? AI_PREV_SLOTS - 1 : AI_PREV_SLOTS;
-  for (int s = 0; s < keep; s++) if (c.prev_id[s] && c.prev_len[s] > 0) ids[n++] = c.prev_id[s];
-  if (c.look_live && c.cur_id) ids[n++] = c.cur_id;   // 本回合新拍的: 组包后会滚进环, 下回合起可回看
-  for (int s = 0; s < AI_EDITED_SLOTS; s++) if (c.ed_num[s] && c.ed_len[s] > 0) ids[n++] = c.ed_num[s];
+  for (int s = 0; s < keep; s++) if (c.prev_id[s] && c.prev_len[s] > 0) { ids[n] = c.prev_id[s]; src[n] = 0; n++; }
+  if (c.look_live && c.cur_id) { ids[n] = c.cur_id; src[n] = 0; n++; }   // 本回合新拍的: 组包后会滚进环, 下回合起可回看
+  // 参考图: 有实拍画面时只留一张(编号最大当代表), 无实拍才全列。
+  uint32_t ed[AI_EDITED_SLOTS]; int en = 0;
+  for (int s = 0; s < AI_EDITED_SLOTS; s++) if (c.ed_num[s] && c.ed_len[s] > 0) ed[en++] = c.ed_num[s];
+  if (en > 0) {
+    if (n > 0 && en > 1) {
+      uint32_t mx = ed[0];
+      for (int i = 1; i < en; i++) if (ed[i] > mx) mx = ed[i];
+      ed[0] = mx; en = 1;
+    }
+    for (int i = 0; i < en; i++) { ids[n] = ed[i]; src[n] = 1; n++; }
+  }
   for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++)
-    if (ids[j] < ids[i]) { uint32_t t = ids[i]; ids[i] = ids[j]; ids[j] = t; }
+    if (ids[j] < ids[i]) { uint32_t t = ids[i]; ids[i] = ids[j]; ids[j] = t; uint8_t ts = src[i]; src[i] = src[j]; src[j] = ts; }
   rt.put("当前可查看图片: [");
   int w = 0;
   for (int i = 0; i < n; i++) {
     if (i && ids[i] == ids[i - 1]) continue;   // 排序后去重
-    char t[16];
-    snprintf(t, sizeof(t), "%sImage%u", w++ ? ", " : "", (unsigned)ids[i]);
+    char t[48];
+    snprintf(t, sizeof(t), "%sImage%u(%s)", w++ ? ", " : "", (unsigned)ids[i], src[i] ? "参考图" : "实景");
     rt.put(t);
   }
   rt.put("]");
@@ -1631,10 +1644,17 @@ static RoundR round_step(RoundCtx& c) {
         if (c.frame_moving) hpush(c.pend_hint, sizeof(c.pend_hint), AI_FRAME_MOVING_HINT);
         if (c.ed_n > 0) {
           // 注入的是**实景相机帧**, 用户发来的参考图并不在这里 —— 它们已统一编号, 要用得自己去 look 取。
-          char eb[192];
-          snprintf(eb, sizeof(eb),
-                   "用户本次还发来 %d 张参考图(未自动注入此处); 需要时用 look(image=[编号]) 查看, 编号见 look 结果的「当前可查看图片」",
-                   c.ed_n);
+          // 编号直接写死: 免得 AI 靠 look 结果那行裸数字去猜哪几张才是参考图。
+          char eb[256];
+          int o = snprintf(eb, sizeof(eb), "用户本次还发来 %d 张参考图(未自动注入此处), 编号: ", c.ed_n);
+          bool first = true;
+          for (int i = 0; i < AI_EDITED_SLOTS && o < (int)sizeof(eb) - 1; i++) {
+            if (!c.ed_num[i] || c.ed_len[i] == 0) continue;
+            o += snprintf(eb + o, sizeof(eb) - o, "%sImage%u", first ? "" : ", ", (unsigned)c.ed_num[i]);
+            first = false;
+          }
+          if (o < (int)sizeof(eb) - 1)
+            o += snprintf(eb + o, sizeof(eb) - o, "; 需要时用 look(image=[编号]) 查看");
           hpush(c.pend_hint, sizeof(c.pend_hint), eb);
         }
       } else if (c.fail) {
