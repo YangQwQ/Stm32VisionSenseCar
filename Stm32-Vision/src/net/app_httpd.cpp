@@ -34,6 +34,8 @@
 #include "src/net/ota.h"   // HTTP OTA 入口（/update）注册
 #include "src/ai/ai_dump.h"   // AI 抓帧留档清单/取图（/ai_dump, /ai_frame 调试用）
 #include "src/ai/magnify.h"   // /zoomshot：手动对当帧裁出中央放大图（等价于 AI 的 zoom）
+#include "src/ai/track.h"     // 跟踪目标位置/状态；TRACK_REFRESH_MS 见 Calibration.h
+#include "Calibration.h"      // TRACK_REFRESH_MS：图传顺带刷新标记的周期
 #include "src/ai/ai_client.h"   // ai::busy()：AI 任务进行中时图传 FPS 降半，让 CPU 与内部 DMA 池给 AI 让路
 #include "src/ai/ai_alloc.h"    // g_js_alloc(共享 PSRAM JSON 池)
 
@@ -128,7 +130,7 @@ static bool s_ws_had_client = false;               // WS 客户端曾经在位�
 // 与分片大小无关，故改小完全兼容。
 #define UDP_JPG_CHUNK (net::kWanMtu - 28 - UDP_FRAME_HDR)
 #define UDP_MAGIC0 0x56
-#define UDP_MAGIC1 0x44
+#define UDP_MAGIC1 0x44       // magic1：帧格式标志（0x44 = JPEG；相机常态直出 JPEG，跟踪模式为 RGB565 软编）
 static int s_udp_fd = -1;                    // UDP 会话 fd（懒创建）
 static volatile bool s_udp_peer_valid = false; // 已注册手机 UDP 对端
 static struct sockaddr_in s_udp_peer;        // 目标：手机 IP:udp_port（WS 处理任务写、推流任务读）
@@ -186,16 +188,39 @@ static void udp_out_free(void) {
     if (s_out_jpeg) { heap_caps_free(s_out_jpeg); s_out_jpeg = nullptr; s_out_cap = 0; }
 }
 
-// 把一帧 JPEG 拷入 PSRAM 副本作为"当前待发帧"，随后由 udp_pump() 逐分片续传。
-static bool udp_start_frame(const uint8_t *jpeg, size_t len) {
-    if (!len || len > 256 * 1024) return false;
+// 图传帧软编质量（jpge 刻度 0~100，越小帧越小、编码越快；与 sensor 的 jpeg_quality 0~63 不同刻度）。
+#define UDP_JPEG_QUALITY 12
+
+// 图传帧的编码缓冲（PSRAM，懒分配）：常态帧已是相机直出 JPEG（直接拷出）；仅跟踪模式下相机输出
+// RGB565、需软编一次。容量按"最坏情况"= 原始字节数 w*h*2（jpge 不可压缩时输出也不会超过它），一次分配后不再变。
+static uint8_t* s_enc_jpeg = nullptr;
+static size_t   s_enc_cap = 0;
+
+// 把一帧编码成 JPEG 到 s_enc_jpeg，返回长度（0 = 分配失败 / 编码失败）。JPEG 帧直拷，RGB565 帧软编。
+static size_t encode_stream_frame(const camera_fb_t* fb) {
+    const size_t need = (size_t)fb->width * fb->height * 2;
+    if (s_enc_cap < need) {
+        uint8_t* nb = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
+        if (!nb) return 0;
+        if (s_enc_jpeg) heap_caps_free(s_enc_jpeg);
+        s_enc_jpeg = nb; s_enc_cap = need;
+    }
+    return cam::encode_jpeg(fb, UDP_JPEG_QUALITY, s_enc_jpeg, s_enc_cap);
+}
+
+// 单帧字节上限：raw RGB565 VGA = 614KB（软编 JPEG 远小于此），给足余量同时挡异常值。
+#define UDP_MAX_FRAME_BYTES (1024 * 1024)
+
+// 把一帧数据拷入 PSRAM 副本作为"当前待发帧"，随后由 udp_pump() 逐分片续传。payload 一律是 JPEG。
+static bool udp_start_frame(const uint8_t *data, size_t len) {
+    if (!len || len > UDP_MAX_FRAME_BYTES) return false;
     if (!s_out_jpeg || len > s_out_cap) {
         uint8_t *nb = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
         if (!nb) return false;
         udp_out_free();
         s_out_jpeg = nb; s_out_cap = len;
     }
-    memcpy(s_out_jpeg, jpeg, len);
+    memcpy(s_out_jpeg, data, len);
     s_out_len = len;
     s_out_count = (uint16_t)((len + UDP_JPG_CHUNK - 1) / UDP_JPG_CHUNK);
     s_out_fid = s_udp_frame_id++;
@@ -521,6 +546,52 @@ static void ws_send_text_to_ws_clients(const char *text)
     }
 }
 
+// 跟踪目标位置 → 手机（画面上叠加十字/圆圈）。限频 10Hz。
+// 跟踪结束（stop/跟丢放弃）时补发一条 st="idle"，手机据此收起准星，否则会留一个过时的标记。
+static void maybe_send_track_pos(void)
+{
+    static uint32_t s_last_ms = 0;
+    static bool s_sent_active = false;
+    const bool act = track::active();
+    if (act) {
+        const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if ((uint32_t)(now - s_last_ms) < 100) return;
+        float u = 0, v = 0;
+        char buf[128];
+        // 用**未平滑**中心上报：手机叠加显示要跟手，平滑值会拖尾（控制闭环仍用 track::last_center 的平滑值）。
+        // novid=1：跟踪期板端不推视频，手机据此改为显示"标尺网格 + 跟踪点"占位（而不是冻结的旧画面）。
+        if (track::last_raw_center(&u, &v)) {
+            snprintf(buf, sizeof(buf),
+                     "{\"type\":\"track\",\"u\":%.4f,\"v\":%.4f,\"conf\":%.2f,\"st\":\"%s\",\"novid\":1}",
+                     (double)u, (double)v, (double)track::last_conf(), track::state_name(track::state()));
+        } else {
+            // 尚无有效中心(仍在锁定中)：只报状态、不带坐标，手机据此清掉旧标记，避免残留在左上角。
+            snprintf(buf, sizeof(buf), "{\"type\":\"track\",\"st\":\"%s\"}",
+                     track::state_name(track::state()));
+        }
+        ws_send_text_to_ws_clients(buf);
+        s_last_ms = now;
+        s_sent_active = true;
+    } else if (s_sent_active) {
+        ws_send_text_to_ws_clients("{\"type\":\"track\",\"st\":\"idle\"}");
+        s_sent_active = false;
+    }
+}
+
+// 跟踪期**唯一的喂帧者**：图传任务把抓到的帧交给追踪器（完整更新，不是"轻量刷新"）。
+// 为什么放这里：相机只有 ~4~6fps（曝光受限），"抓一帧"本身就要等 ~200ms —— 以前夹取循环自己抓
+// （还要丢帧冲积压）每步光这一段就 ~600ms。改成图传任务连续喂、夹取循环只读最新位置后，
+// 夹取那侧这段直接归零；而且位置是**连续**更新的，手机上的十字也真正跟手而非"每步一跳"。
+// 限频 TRACK_REFRESH_MS 只作为下限保护（相机本来就要 200ms 才出一帧）。
+static void track_feed(const camera_fb_t* fb) {
+    if (!track::active() || !fb || fb->format != PIXFORMAT_RGB565) return;
+    static uint32_t s_last_ms = 0;
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (TRACK_REFRESH_MS > 0 && (uint32_t)(now - s_last_ms) < (uint32_t)TRACK_REFRESH_MS) return;
+    s_last_ms = now;
+    track::update_from_fb(fb);
+}
+
 // 统一日志模块的转发器：WS 广播 + BLE status 通知（在 blog 转发任务线程执行）。
 // 由 startCameraServer 注册，供 blog::logf 排队后统一发手机。
 static void send_log_to_phone(const char *json)
@@ -556,7 +627,19 @@ static void ws_stream_task(void *arg)
 
         // 升级中一律走"停推流"分支：闸门在 command/ws_handle_text 已挡住重新开启，这里兜底，
         // 顺带把在途帧的 PSRAM 副本放掉，把内存与 core1 让给固件写入。
-        if (cmd::streaming() && !ota::active()) {
+        // ★ 跟踪期**不推视频**，但本任务成为**唯一的喂帧者**：连续把最新帧交给追踪器（完整更新）。
+        // 理由见 track_feed 的注释：相机只有 ~4~6fps，"抓一帧"就要等 ~200ms —— 把这件事从夹取循环
+        // 搬到图传任务后，夹取每步省掉约 600ms，而且位置是连续更新的（手机十字真正跟手）。
+        if (track::active()) {
+            s_out_active = false;
+            udp_out_free();
+            // ★ 先把队列里的旧帧丢掉再喂：相机 fb_count=3 且本任务（带解码+相关滤波 ~200ms）比相机慢，
+            //   队里会一直压着 2 帧旧的 ⇒ 直接 grab 喂给追踪器的是"动作前"的画面。实测症状：夹取闭环
+            //   的读数**滞后一步**（第 N 步读到的是第 N-1 步动作后的位置）→ 以为没转够、再转一脚 → 过头。
+            //   grab_fresh 连续 grab+return 把队倒空，最后一次阻塞等新帧 —— 与 /capture、/tracktest 同一套。
+            camera_fb_t* tfb = cam::grab_fresh(2);
+            if (tfb) { track_feed(tfb); cam::publish_latest(tfb); cam::return_frame(tfb); }
+        } else if (cmd::streaming() && !ota::active()) {
             if (s_out_active) {
                 udp_pump();              // 上一帧还在续传：按队列空闲续片，不抢新帧
                 // 弃帧只针对"发不动"：链路彻底不消化(持续一段时间一片都没出去)，
@@ -583,14 +666,15 @@ static void ws_stream_task(void *arg)
                 // AI 任务进行中降到一半 FPS：高帧推流压 CPU + 碎内部 DMA 池（TX pbuf 与 RX 同池互抢），
                 // 实测开着图传会让 DMA 块告警连发、并发 AI 被拖慢；降帧把两条都让给 AI。
                 int max_fps = ai::busy() ? (UDP_STREAM_MAX_FPS / 2) : UDP_STREAM_MAX_FPS;
+                // 跟踪期整段走上面的 track::active() 分支，到不了这里（故不再需要跟踪期的帧率钳制）。
                 if (grab_us - s_out_last_grab_us >= (1000000ULL / max_fps)) {
-                    camera_fb_t *fb = cam::grab();    // 图传高频：直接抓帧，拷入 PSRAM 后立刻还缓冲
+                    camera_fb_t *fb = cam::grab();    // 图传高频：直接抓帧，用完立刻还缓冲
                     if (fb) {
                         s_out_last_grab_us = grab_us;
-                        size_t flen = cam::jpeg_len(fb);   // 勿用 fb->len：虚高会把后续帧当本帧推出去
-                        bool started = udp_start_frame(fb->buf, flen);
+                        cam::publish_latest(fb);            // 喂帧者顺手发布最新一帧（/capture 等按需读者用）
+                        size_t len = encode_stream_frame(fb);   // 常态帧已是 JPEG（直拷）；跟踪模式 RGB565 才软编
                         cam::return_frame(fb);
-                        if (started) udp_pump();
+                        if (len > 0 && udp_start_frame(s_enc_jpeg, len)) udp_pump();
                     }
                 }
             }
@@ -671,6 +755,8 @@ static void ws_stream_task(void *arg)
                 ble::send_status(js);
             }
         }
+        // 本地跟踪目标 → 手机叠加显示（限频 10Hz，跟丢/停止时补发 idle）
+        maybe_send_track_pos();
         // 图传已改走 UDP：WS 客户端在位仅作指令/状态通道，几乎不占射频；
         // 只有"真在推帧"（UDP 图传 / MJPEG 推流）才停 BLE 广播，否则手机随时可发现
         // VisionS3 重连（此前 WS 常挂/半开会让广播永久关闭，导致手机不重启连不上）。
@@ -792,6 +878,143 @@ static esp_err_t bmp_handler(httpd_req_t *req)
     return res;
 }
 
+// ---- /tracktest：板端追踪"降采样灰度解码"自检（Phase 0） ----
+// 对当帧做降采样灰度解码并把该档灰度图以 BMP 回传，供肉眼确认降采样回调读取正确（右/下边缘不应
+// 有斜缝或块错位）。?scale=N（0..3，默认 2）；?all=1 额外把 0..3 四档各解一遍打耗时/luma 统计
+// （默认只解请求档，避免一次请求连解四档把内部 DMA 块水位压到 0）。
+static void bmp_put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v & 0xFF); p[1] = (uint8_t)(v >> 8); }
+static void bmp_put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF); p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF); p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+// 灰度 → 24 位 BMP（自底向上、BGR、行按 4 字节对齐），返回总字节数。
+static size_t gray_to_bmp(const uint8_t *g, int w, int h, uint8_t *out) {
+    const int rowbytes = (w * 3 + 3) & ~3;
+    const size_t pix = (size_t)rowbytes * h;
+    const size_t total = 54 + pix;
+    memset(out, 0, 54);
+    out[0] = 'B'; out[1] = 'M';
+    bmp_put32(out + 2, (uint32_t)total);
+    bmp_put32(out + 10, 54);
+    bmp_put32(out + 14, 40);
+    bmp_put32(out + 18, (uint32_t)w);
+    bmp_put32(out + 22, (uint32_t)h);
+    bmp_put16(out + 26, 1);
+    bmp_put16(out + 28, 24);
+    bmp_put32(out + 34, (uint32_t)pix);
+    bmp_put32(out + 38, 2835);
+    bmp_put32(out + 42, 2835);
+    for (int y = 0; y < h; y++) {
+        const uint8_t *src = g + (size_t)(h - 1 - y) * w;
+        uint8_t *dst = out + 54 + (size_t)y * rowbytes;
+        for (int x = 0; x < w; x++) { dst[x * 3] = src[x]; dst[x * 3 + 1] = src[x]; dst[x * 3 + 2] = src[x]; }
+    }
+    return total;
+}
+
+static esp_err_t tracktest_handler(httpd_req_t *req)
+{
+    int scale = 2;
+    bool all = false;
+    float su = -1.0f, sv = -1.0f, sw = 0.0f, sh = 0.0f;
+    int n = 1;
+    bool do_stop = false;
+    bool cont = false;   // cont=1: 不重新 seed，沿用当前跟踪目标继续跑 n 帧（做运动测试用）
+    bool chr = false;    // chr=1: 回传**色度**通道 BMP（诊断彩色目标在色度里是否拉得开）
+    char qs[192];
+    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK) {
+        char p[16];
+        if (httpd_query_key_value(qs, "scale", p, sizeof(p)) == ESP_OK) { scale = atoi(p); if (scale < 0 || scale > 3) scale = 2; }
+        if (httpd_query_key_value(qs, "all", p, sizeof(p)) == ESP_OK) all = (atoi(p) != 0);
+        if (httpd_query_key_value(qs, "u", p, sizeof(p)) == ESP_OK) su = atof(p);
+        if (httpd_query_key_value(qs, "v", p, sizeof(p)) == ESP_OK) sv = atof(p);
+        if (httpd_query_key_value(qs, "w", p, sizeof(p)) == ESP_OK) sw = atof(p);
+        if (httpd_query_key_value(qs, "h", p, sizeof(p)) == ESP_OK) sh = atof(p);
+        if (httpd_query_key_value(qs, "n", p, sizeof(p)) == ESP_OK) { n = atoi(p); if (n < 1) n = 1; if (n > 20) n = 20; }
+        if (httpd_query_key_value(qs, "stop", p, sizeof(p)) == ESP_OK) do_stop = (atoi(p) != 0);
+        if (httpd_query_key_value(qs, "cont", p, sizeof(p)) == ESP_OK) cont = (atoi(p) != 0);
+        if (httpd_query_key_value(qs, "chr", p, sizeof(p)) == ESP_OK) chr = (atoi(p) != 0);
+    }
+    if (do_stop) {
+        track::stop();
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        return httpd_resp_sendstr(req, "track stopped\n");
+    }
+    // 本接口要**直读 RGB565** 帧缓冲（track.update / decode_gray / decode_chroma），而相机常态是 JPEG，
+    // 故先切到跟踪模式（幂等）。do_stop 分支已在上面经 track::stop() 切回 JPEG；其余情况把相机留在
+    // RGB565（诊断工具，用完记得打 ?stop=1 复位，或不理它——图传/ AI 对 RGB565 帧会软编，仍可用）。
+    cam::set_track_mode(true);
+    // 跟踪自检：给了 u/v 即 seed；cont=1 则沿用当前目标。然后连拍 n 帧逐帧跟踪（不动车、不经 AI），回文本轨迹。
+    if ((su >= 0.0f && sv >= 0.0f) || cont) {
+        if (!cont) track::seed("selftest", su, sv, sw, sh);
+        static char out[1600];
+        int off = snprintf(out, sizeof(out), "%s n=%d\n", cont ? "continue" : "seed", n);
+        for (int i = 0; i < n && off < (int)sizeof(out) - 160; i++) {
+            if (i) vTaskDelay(pdMS_TO_TICKS(250));
+            // 先空抓丢 4 帧：无图传消费者时 3 个缓冲可滞后好几帧，直接 grab 会拿到"动作前"的旧画面
+            // （排空后最后一次 grab 会阻塞等新帧 —— 现统一走 cam::grab_fresh，语义与 /capture 一致）
+            camera_fb_t *f = cam::grab_fresh(4);
+            if (!f) { blog::logf(blog::AI, "[tracktest] 第%d帧取帧失败", i + 1); continue; }
+            track::Result r = track::update_from_fb(f);   // 直读帧缓冲（RGB565），用完即还
+            cam::return_frame(f);
+            int us_prep = 0, us_search = 0;
+            track::last_phases_us(&us_prep, &us_search);
+            const int ls = off;
+            off += snprintf(out + off, sizeof(out) - off,
+                            "f%d ok=%d u=%.3f v=%.3f conf=%.2f st=%s dec=%dms trk=%dms"
+                            " | 准备%d 搜索%d us\n",
+                            i + 1, r.ok ? 1 : 0, (double)r.u, (double)r.v, (double)r.conf,
+                            track::state_name(r.st), track::last_decode_ms(), track::last_track_ms(),
+                            us_prep, us_search);
+            blog::logf(blog::AI, "[tracktest] %s", out + ls);   // 同一行也进 WS 日志（含尾换行，logf 会多一空行，无所谓）
+        }
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        return httpd_resp_send(req, out, off);
+    }
+    camera_fb_t *fb = cam::grab();
+    if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
+    const int W = fb->width, H = fb->height;
+    if (W <= 0 || H <= 0) { cam::return_frame(fb); httpd_resp_send_500(req); return ESP_FAIL; }
+    const int sel_gw = (W + (1 << scale) - 1) >> scale;
+    const int sel_gh = (H + (1 << scale) - 1) >> scale;
+    const size_t gray_cap = all ? (size_t)W * H : (size_t)sel_gw * sel_gh;   // 全档才需 1/1 尺寸
+    const size_t bmp_cap = 54 + (size_t)((sel_gw * 3 + 3) & ~3) * sel_gh;
+    uint8_t *gray = (uint8_t *)heap_caps_malloc(gray_cap ? gray_cap : 1, MALLOC_CAP_SPIRAM);
+    uint8_t *bmp  = (uint8_t *)heap_caps_malloc(bmp_cap, MALLOC_CAP_SPIRAM);
+    if (!gray || !bmp) {
+        cam::return_frame(fb);
+        if (gray) heap_caps_free(gray);
+        if (bmp) heap_caps_free(bmp);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    size_t bmp_len = 0;
+    const int lo = all ? 0 : scale, hi = all ? 3 : scale;
+    for (int sc = lo; sc <= hi; sc++) {
+        int gw = 0, gh = 0;
+        // 直读驱动帧（RGB565 抽点），多档连解期间持帧，解完即还。
+        int rc = chr ? track::decode_chroma(fb, sc, gray, (int)gray_cap, &gw, &gh)
+                     : track::decode_gray(fb, sc, gray, (int)gray_cap, &gw, &gh);
+        if (rc != 0) { blog::logf(blog::AI, "[tracktest] scale=%d 取图失败 rc=%d", sc, rc); continue; }
+        const size_t n = (size_t)gw * gh;
+        uint8_t mn = 255, mx = 0; uint32_t sum = 0;
+        for (size_t i = 0; i < n; i++) { uint8_t v = gray[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+        blog::logf(blog::AI, "[tracktest] %s scale=%d %dx%d 取图=%dms min=%u max=%u avg=%lu",
+                   chr ? "chroma" : "luma", sc, gw, gh, track::last_decode_ms(), (unsigned)mn,
+                   (unsigned)mx, (unsigned long)(sum / (n ? n : 1)));
+        if (sc == scale) bmp_len = gray_to_bmp(gray, gw, gh, bmp);
+    }
+    cam::return_frame(fb);
+    heap_caps_free(gray);
+    if (bmp_len == 0) { heap_caps_free(bmp); httpd_resp_send_500(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, "image/bmp");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    esp_err_t r = httpd_resp_send(req, (const char *)bmp, (int)bmp_len);
+    heap_caps_free(bmp);
+    return r;
+}
+
 static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_t len)
 {
     jpg_chunking_t *j = (jpg_chunking_t *)arg;
@@ -848,18 +1071,43 @@ static esp_err_t capture_handler(httpd_req_t *req)
 {
     camera_fb_t *fb = NULL;
     esp_err_t res = ESP_OK;
+    // /capture 读"发布的最新一帧"时用的拷贝缓冲容量 / 允许的旧帧年龄(ms)。
+    // 96K 罩得住 VGA JPEG(实测 20~60K)；1s 约等于几个喂帧周期（跟踪期本来就慢）。
+    static const size_t   kCaptureCopyCap  = 96 * 1024;
+    static const uint32_t CAPTURE_MAX_AGE_MS = 1000;
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
     int64_t fr_start = esp_timer_get_time();
 #endif
 
+    // ★ 优先用**喂帧任务发布的最新一帧**：那份是刚拍的（喂帧者已经排空过队列），而且零等待。
+    //   自己再 grab 一次会和喂帧者抢同一条队列、互相错位 —— 那正是"取帧量到的目标位置与追踪器
+    //   看到的不是同一帧"的结构性来源。发布帧最多旧一个喂帧周期；过期/没有才自己排空抓一张。
+    {
+      static uint8_t* s_copy = nullptr;        // PSRAM，首次用到才分配
+      if (!s_copy) s_copy = (uint8_t*)heap_caps_malloc(kCaptureCopyCap, MALLOC_CAP_SPIRAM);
+      uint32_t age_ms = 0;
+      const size_t n = s_copy ? cam::latest_copy(s_copy, kCaptureCopyCap, &age_ms) : 0;
+      if (n > 0 && age_ms <= CAPTURE_MAX_AGE_MS) {
+        httpd_resp_set_type(req, "image/jpeg");
+        httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_set_hdr(req, "X-Source", "published");
+        httpd_resp_send(req, (const char*)s_copy, n);
+        return ESP_OK;
+      }
+    }
+
+    // 没有可用的发布帧（跟踪期相机是 RGB565，或还没喂过）⇒ 自己排空抓一张（cam::grab_fresh
+    // 内部连续 grab+return 把队列倒空，最后一次阻塞等新帧，见 camera.h 的说明）。
 #if CONFIG_LED_ILLUMINATOR_ENABLED
     enable_led(true);
     vTaskDelay(150 / portTICK_PERIOD_MS); // The LED needs to be turned on ~150ms before the call to esp_camera_fb_get()
-    fb = cam::grab();             // or it won't be visible in the frame. A better way to do this is needed.
-    enable_led(false);
-#else
-    fb = cam::grab();
 #endif
+    fb = cam::grab_fresh(3);              // or it won't be visible in the frame. A better way to do this is needed.
+#if CONFIG_LED_ILLUMINATOR_ENABLED
+    enable_led(false);
+#endif
+    if (fb) cam::publish_latest(fb);      // 顺手也发布出去，后面按需的读者不用再抢队列
 
     if (!fb)
     {
@@ -1587,9 +1835,9 @@ static esp_err_t index_handler(httpd_req_t *req)
 void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    // 20 个槽：现 14（camera_httpd 上 12 个 + /zoomshot + ota 的 /update GET/POST 2 个）。
+    // 22 个槽（camera_httpd 的 16 个 + ota 的 /update GET/POST 2 个 + ws，留余量）。
     // 再加 URI 前先数一遍，超了 httpd_register_uri_handler 会静默失败（那个路径直接 404）。
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 22;
     // httpd 默认栈偏小，WS 指令处理链（cmd::handle → 统一日志转发）加深易触发栈 canary 崩溃
     // （实测收到 spin 时 httpd 栈溢出），调大与 ws_stream 同级避免 WS 指令线程爆栈。
     config.stack_size = 8192;
@@ -1653,6 +1901,19 @@ void startCameraServer()
         .uri = "/zoomshot",
         .method = HTTP_GET,
         .handler = zoomshot_handler,
+        .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+        ,
+        .is_websocket = true,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = NULL
+#endif
+    };
+
+    httpd_uri_t tracktest_uri = {
+        .uri = "/tracktest",
+        .method = HTTP_GET,
+        .handler = tracktest_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
         ,
@@ -1806,6 +2067,7 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &status_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
         httpd_register_uri_handler(camera_httpd, &zoomshot_uri);
+        httpd_register_uri_handler(camera_httpd, &tracktest_uri);
         httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
         httpd_register_uri_handler(camera_httpd, &xclk_uri);
@@ -1830,11 +2092,20 @@ void startCameraServer()
 #ifdef CONFIG_HTTPD_WS_SUPPORT
         httpd_register_uri_handler(stream_httpd, &ws_uri);
         // 栈先试 PSRAM（内部堆紧，见 heap_watch）：把 8KB 让回内部 DMA 池；失败退回内部栈保推流可用。
-        if (!s_ws_stack) s_ws_stack = (StackType_t*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+        // ⚠️ 声明 8192 **字** ⇒ 要分配 8192*4=32KB；只 malloc(8192 字节) 会让任务溢出 24KB 进相邻 PSRAM。
+        if (!s_ws_stack) s_ws_stack = (StackType_t*)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        // ★ 钉到 core 0（网络核），不跟 core1 的业务抢：本任务是 core1 上最大的 CPU 大户——跟踪期相机
+        // 是 RGB565，每帧要软编全幅 JPEG（几百 ms），钉在 core1 会把同核的追踪解码/搜索和
+        // exec::update_tick 的"到点停轮/机械臂缓动"饿到 ~10× 慢（真机实测：取图 85ms→925ms、
+        // 夹取每步 3s→15s）。core0 上 WiFi 栈优先级 ~23 会抢占它 ⇒ 软编**不会拖慢网络**；
+        // 反过来它只在网络空闲时吃剩余算力，正好互补。
+        // ⚠️ 它调用的 track_feed（跟踪期喂帧）也随之落到 core0：与 core1 的 grasp
+        // 追踪更新之间只有 track 的互斥锁做串行，没有跨核竞态（锁被占时 light 路径 try-lock 直接跳过）。
+        const BaseType_t kStreamCore = 0;   // ESP32-S3 双核：0=网络核(PRO_CPU)，1=应用核(APP_CPU)
         if (s_ws_stack) {
-            xTaskCreateStaticPinnedToCore(ws_stream_task, "ws_stream", 8192, NULL, 5, s_ws_stack, &s_ws_tcb, 1);
+            xTaskCreateStaticPinnedToCore(ws_stream_task, "ws_stream", 8192, NULL, 5, s_ws_stack, &s_ws_tcb, kStreamCore);
         } else {
-            xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 8192, NULL, 5, NULL, 1);
+            xTaskCreatePinnedToCore(ws_stream_task, "ws_stream", 8192, NULL, 5, NULL, kStreamCore);
         }
 #endif
     }

@@ -190,7 +190,8 @@ bool start(const char* target, int count, cmd::ReplyFn reply, void* reply_ctx) {
     return false;
   }
   // 栈只分一次、长期持有（PSRAM 不会碎片化到分不出 16KB）。
-  if (!s_task_stack) s_task_stack = (StackType_t*)heap_caps_malloc(k_task_stack, MALLOC_CAP_SPIRAM);
+  // ⚠️ 声明 k_task_stack **字** ⇒ 要分配 k_task_stack*4 字节；只 malloc(字节) 会让任务溢出。
+  if (!s_task_stack) s_task_stack = (StackType_t*)heap_caps_malloc(k_task_stack * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
   if (!s_task_stack) {
     if (j->ctx) delete (int*)j->ctx;
     vSemaphoreDelete(j->done);

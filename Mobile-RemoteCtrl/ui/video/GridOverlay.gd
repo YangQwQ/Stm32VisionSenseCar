@@ -12,14 +12,17 @@ func show_grid(on: bool) -> void:
 	queue_redraw()
 
 func _draw() -> void:
-	if not grid_on or _feed == null or _feed.texture == null:
+	if not grid_on or _feed == null:
 		return
 	var fsz := size
-	var tex: Texture2D = _feed.texture
-	if fsz.x <= 0.0 or fsz.y <= 0.0 or tex.get_width() <= 0:
+	if fsz.x <= 0.0 or fsz.y <= 0.0:
 		return
+	# 画面可能是空的（跟踪期板端不推流）：按 VGA 4:3 兜底画标尺，别让标尺跟着画面一起消失。
+	var ar_tex := 4.0 / 3.0
+	var tex: Texture2D = _feed.texture
+	if tex != null and tex.get_width() > 0 and tex.get_height() > 0:
+		ar_tex = float(tex.get_width()) / float(tex.get_height())
 	# Overlay 与 Feed 同锚全屏：本节点 rect 即图片容器；算内容 rect（KEEP_ASPECT_CENTERED）
-	var ar_tex := float(tex.get_width()) / float(tex.get_height())
 	var ar_box := fsz.x / fsz.y
 	var cw := fsz.x
 	var ch := fsz.y

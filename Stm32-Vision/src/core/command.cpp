@@ -2,6 +2,7 @@
 #include "src/net/config.h"
 #include "src/net/wifi_net.h"
 #include "src/ai/ai_client.h"
+#include "src/ai/grasp.h"          // auto_grasp: 本地自动夹取（标位置 → 自己对准/前进/合爪）
 #include "src/exec/direct_exec.h"
 #include "src/net/ping_svc.h"
 #include "src/exec/nezha_direct.h"
@@ -413,8 +414,23 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
     return;
   }
 
-  if (!strcmp(type, "ai_cancel")) {
-    // 显式取消 AI 任务：残留持续指令会在任务出口补停（≠强制停车）。
+  if (!strcmp(type, "auto_grasp")) {
+    // 本地自动夹取：标一个物体在画面上的位置 → 板端自己做 arm low/对准/前进/合爪（纯画面闭环，不经 AI）。
+    float x = params["x"] | -1.0f, y = params["y"] | -1.0f;
+    const float w = params["w"] | 0.0f, h = params["h"] | 0.0f;
+    const char* nm = params["name"] | "";
+    if (x < 0.0f || x > 1.0f || y < 0.0f || y > 1.0f) {
+      reply_status(doc, reply, reply_ctx, "auto_grasp 需要 x/y（物体画面位置 0~1）");
+      return;
+    }
+    if (grasp::busy()) { reply_status(doc, reply, reply_ctx, "已有一次自动夹取在进行"); return; }
+    ai::cancel(ai::StopMode::All);   // 手动接管：先打断可能在跑的 AI 任务
+    if (!grasp::request(x, y, w, h, nm)) { reply_status(doc, reply, reply_ctx, "自动夹取启动失败（参数非法）"); return; }
+    reply_status(doc, reply, reply_ctx, "已开始自动夹取（本地闭环，不经 AI）");
+    return;
+  }
+
+  if (!strcmp(type, "ai_cancel")) {   // 显式取消 AI 任务：残留持续指令会在任务出口补停（≠强制停车）。
     ai::cancel(ai::StopMode::All);
     reply_status(doc, reply, reply_ctx, "AI 任务已取消");
     return;

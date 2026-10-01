@@ -5,6 +5,8 @@ extends HBoxContainer
 
 signal cancelled
 signal image_sent(img: Image, annotation: Dictionary)
+## 「自动夹取」：把当前标注区域交给 Main 下发 auto_grasp（空字典 = 没有标注，让 Main 提示）。
+signal grasp_requested(annotation: Dictionary)
 
 const CanvasScript := preload("res://ui/editor/EditorCanvas.gd")
 
@@ -26,6 +28,7 @@ func _ready() -> void:
 	$ClearBtn.pressed.connect(_on_clear_pressed)
 	$CancelBtn.pressed.connect(_on_cancel_pressed)
 	$DoneBtn.pressed.connect(_on_done_pressed)
+	$GraspBtn.pressed.connect(_on_grasp_pressed)
 
 ## 进入标注：以冻结帧为底图，工具复位为「不选」。
 func open(img: Image) -> void:
@@ -64,3 +67,13 @@ func _on_done_pressed() -> void:
 	var ann: Dictionary = _canvas.call("first_region_norm")
 	close()
 	image_sent.emit(img, ann)
+
+func _on_grasp_pressed() -> void:
+	# 自动夹取不需要上传图（板端自己取帧）：取到区域就**直接收起画布**（免用户再手动点取消），
+	# 再交 Main 下发。没标注时不收起，留着让用户继续框，由 Main 提示。
+	var ann: Dictionary = _canvas.call("first_region_norm")
+	if ann.is_empty():
+		grasp_requested.emit(ann)
+		return
+	close()
+	grasp_requested.emit(ann)

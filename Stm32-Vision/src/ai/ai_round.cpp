@@ -10,6 +10,8 @@
 #include "src/ai/ai_alloc.h"    // g_js_alloc(共享 PSRAM JSON 池)
 #include "src/ai/magnify.h"     // 放大镜: 把目标附近裁出来放大重编码(AI 的"凑近看")
 #include "src/ai/ground_proj.h" // 屏幕→地面单应(观测解算)
+#include "src/ai/track.h"       // 本地目标追踪: 标注/observe 标范围 → 逐轮刷新目标坐标
+#include "Calibration.h"        // TRACK_SEED_H 等追踪常量
 #include "src/net/config.h"
 #include "src/net/wifi_net.h"
 #include "src/cam/camera.h"
@@ -47,6 +49,8 @@
 #define AI_HIST_MAX_TURNS 200   // 兜底上限: 到顶才丢最旧整回合(防 AI 始终不压缩把请求体撑爆)
 
 #define AI_FRAME_RETRY 4          // 单轮抓帧重试次数(推流并发占缓冲时会偶发取不到)
+// 全幅帧的软编质量(jpge 刻度 0~100)：相机常态是 RGB565，云端只吃 JPEG，全幅帧由 cam::encode_jpeg 软编。
+#define AI_FRAME_QUALITY 60       // 比放大镜略低(全幅是用来看整体的), 一帧几十 KB
 
 // ---------------- 放大镜(look(zoom=true)) ----------------
 // 放大镜: 把 AI 的"眼睛"凑近(裁块放大回喂), 让它在放大图里跟**看得见的夹爪**比相对位置; 裁框由程序记账 ⇒ 换回全幅是精确算术。
@@ -499,6 +503,7 @@ static void sess_free(void) {
   g_sess_tasks = nullptr;
   g_sess_task_n = 0;
   g_sess_active = false;
+  track::stop();   // 新会话不保留本地跟踪目标
 }
 
 void ai::session_clear(void) {
@@ -536,6 +541,22 @@ static void round_task_init(RoundCtx& c) {
     float ex, ey;
     ground::screen_to_world(0.5f, 0.5f, &ex, &ey);
     ai::logf("[ai] 单应OK 中心→(%.0f,%.0f)", ex, ey);
+  }
+  // 手机框选标注: 若解析出 {x,y,w,h} 就直接种给本地追踪器(标一个范围 → 自动锁定跟住)。
+  // ⚠️ 手机给的是**左上角 + 宽高**(归一化), 追踪器要的是**中心** ⇒ 此处换算; AI 的 observe 则是底部中心。
+  if (c.t.ann && c.t.ann[0]) {
+    JsonDocument d(&g_js_alloc);
+    if (deserializeJson(d, c.t.ann) == DeserializationError::Ok && d.is<JsonObjectConst>()) {
+      float bx = d["x"] | 0.0f, by = d["y"] | 0.0f, bw = d["w"] | 0.0f, bh = d["h"] | 0.0f;
+      if (bw > 0.0f && bh > 0.0f) {
+        const char* label = d["label"] | "标注目标";
+        track::seed(label, bx + bw * 0.5f, by + bh * 0.5f, bw, bh);
+        ai::logf("[track] 标注定范围: '%s' 中心(%.3f,%.3f) 框(%.3f,%.3f) → 已锁定, 后续按帧跟踪",
+                 label, (double)(bx + bw * 0.5f), (double)(by + bh * 0.5f), (double)bw, (double)bh);
+      } else {
+        ai::logf("[track] 标注无有效框(x/y/w/h), 未启用本地跟踪");
+      }
+    }
   }
   // 打印实际端点/模型, 便于排查 404/401 等云端拒绝(配错路径是常见原因)
   ai::logf("[ai] 端点=%s 模型=%s key=%s", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
@@ -675,20 +696,37 @@ static bool fetch_image(RoundCtx& c, bool zoom, char* note, size_t note_cap, boo
     vTaskDelay(pdMS_TO_TICKS(300 * c.net_fail));
     return false;
   }
-  // 必须用 cam::jpeg_len 而非 fb->len: 驱动会把 len 报大(缓冲里可能拼了多帧), 虚高的 len 会被原样
-  // base64 进请求体、压垮 WiFi 发送路径(详见 camera.cpp 的 jpeg_len 说明)。
-  size_t fl = cam::jpeg_len(fb);
+  // 相机常态是 RGB565，云端只吃 JPEG：软编一帧到 cur（编解码共用锁，见 cam::encode_jpeg）。
+  size_t fl = 0;
   bool copied = false;
-  if (fl > 0 && fl <= AI_EDITED_IMG_MAX) {
-    if (!c.cur) c.cur = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
-    if (c.cur) { memcpy(c.cur, fb->buf, fl); c.cur_len = fl; c.cur_id = img_next_id(); copied = true; }
+  if (!c.cur) c.cur = (uint8_t*)heap_caps_malloc(AI_EDITED_IMG_MAX, MALLOC_CAP_SPIRAM);
+  if (c.cur) {
+    fl = cam::encode_jpeg(fb, AI_FRAME_QUALITY, c.cur, AI_EDITED_IMG_MAX);
+    if (fl > 0) { c.cur_len = fl; c.cur_id = img_next_id(); copied = true; }
   }
-  // 抓帧后立即归还相机缓冲: AI 的 HTTPS 慢则数秒, 期间一直占着 fb 会把 fb_count=2 的缓冲池耗尽、
-  // 饿死并行推流; 帧数据后续一律用这份 PSRAM 副本。
+  // 本地追踪: 已锁定目标时, 用这张**全幅实景**刷新其坐标并回写记忆 —— 之后 approach/微操即吃到最新坐标,
+  // 不再依赖云端每轮重新指认。位姿快照取"此刻"(车已停稳、自抓帧后未动), 否则记忆会被整体平移。
+  // 直读驱动帧(RGB565)，省掉一次解码；必须在 return_frame 之前做。
+  if (track::active()) {
+    track::Result tr = track::update_from_fb(fb);
+    if (tr.ok) {
+      ai::CarPose pose{ ai::s_car_x, ai::s_car_y, ai::s_car_heading };
+      float rr = 0, ff = 0;
+      ai::mem_observe_xy(track::target_name(), true, tr.u, tr.v, &rr, &ff, &pose);
+      ai::logf("[track] '%s' → 像素(%.3f,%.3f) conf=%.2f 车头系(%.0f,%.0f) 取图%ums 搜索%ums",
+               track::target_name(), (double)tr.u, (double)tr.v, (double)tr.conf,
+               (double)rr, (double)ff, (unsigned)track::last_decode_ms(), (unsigned)track::last_track_ms());
+    } else {
+      ai::logf("[track] '%s' 本帧未跟上(%s) 取图%ums 搜索%ums", track::target_name(),
+               track::state_name(tr.st), (unsigned)track::last_decode_ms(), (unsigned)track::last_track_ms());
+    }
+  }
+  // 抓帧后立即归还相机缓冲: AI 的 HTTPS 慢则数秒, 期间一直占着 fb 会把缓冲池耗尽、饿死并行推流;
+  // 帧数据后续一律用 cur 这份 PSRAM 副本。
   cam::return_frame(fb);
   if (!copied) {
     c.cur_len = 0; c.cur_id = 0;
-    if (++c.net_fail >= AI_MAX_NET_FAIL) { c.fail = "帧过大或拷贝失败"; return false; }
+    if (++c.net_fail >= AI_MAX_NET_FAIL) { c.fail = "帧过大或编码失败"; return false; }
     return false;
   }
   if (note && note_cap)
@@ -858,6 +896,14 @@ static void land_observe_one(RoundCtx& c, JsonObjectConst ob) {
                fwd >= 0 ? "前" : "后", fwd >= 0 ? fwd : -fwd);
       size_t used = strlen(c.obs_echo);
       if (used + strlen(one) < sizeof(c.obs_echo)) memcpy(c.obs_echo + used, one, strlen(one) + 1);
+      // 标范围: 若 AI 给了框宽高 w/h(归一化), 用"底部中心"换算框中心种给本地追踪器。
+      // 放大图时框尺寸也按裁框比例换回全幅(与 px/py 同源); 未给框则用缺省框高, 仍按底部中心折算。
+      float bw = ob["w"] | 0.0f, bh = ob["h"] | 0.0f;
+      if (c.sent_zoomed) { bw *= (c.sent_x1 - c.sent_x0); bh *= (c.sent_y1 - c.sent_y0); }
+      if (bh <= 0.0f) bh = TRACK_SEED_H;
+      track::seed(nm, px, py - bh * 0.5f, bw, bh);
+      ai::logf("[track] observe 定范围: '%s' 中心(%.3f,%.3f) 框(%.3f,%.3f) → 已锁定",
+               nm, (double)px, (double)(py - bh * 0.5f), (double)bw, (double)bh);
     } else {
       ai::logf("[ai] 观测「%s」像素(%.2f,%.2f)不可用(越界/解算失败), 未记录", nm, px, py);
     }
@@ -916,6 +962,16 @@ static void build_state_block(RoundCtx& c, PsaBuf& b) {
     b.put(ps_str(c.goal_now));
   }
   if (c.t.ann && c.t.ann[0]) { b.put(" (操作者标注: "); b.put(c.t.ann); b.put(")"); }
+  // 本地已锁定目标: 明确告知, 让 AI 知道坐标会逐帧自动刷新, 不必每步都重新 observe 指认。
+  if (track::active()) {
+    float tu = 0, tv = 0;
+    if (track::last_center(&tu, &tv)) {
+      char tb[128];
+      snprintf(tb, sizeof(tb), "\n本地跟踪: 正锁定「%s」于画面(%.3f,%.3f); 坐标逐帧自动刷新, 靠近/对准可依赖它",
+               track::target_name(), (double)tu, (double)tv);
+      b.put(tb);
+    }
+  }
   if (c.s_task_n > 0) { b.put("\n"); render_tasks(c, b); }
   if (ps_str(c.task_note)[0]) { b.put("\n任务笔记: "); b.put(c.task_note); }
   if (c.task_remind[0]) { b.put("\n注意: "); b.put(c.task_remind); }
@@ -1779,6 +1835,7 @@ static void round_task_finish(RoundCtx& c) {
   hwatch::report("AI任务");
   free(c.t.text); free(c.t.ann);
   resolve_stop();   // 统一兜底: 持续指令残留即补停
+  track::stop();    // 任务结束(done/fail/中断)一并停本地跟踪 → 相机从 RGB565 切回 JPEG 常态
   ai::set_busy(false);
 }
 

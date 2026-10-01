@@ -8,8 +8,11 @@
 #include "src/net/ble.h"
 #include "src/net/ota.h"
 #include "src/ai/ai_client.h"
+#include "src/ai/grasp.h"      // 本地自动夹取（标位置 → 自己对准/前进/合爪，不经 AI）
 #include "src/core/board_log.h"
 #include "src/core/heap_watch.h"
+#include <freertos/FreeRTOS.h>   // vTaskPrioritySet：抬 Arduino loop 任务优先级（见 setup 末尾）
+#include <freertos/task.h>
 
 // 摄像头型号（CAMERA_MODEL_*）与引脚（camera_pins.h）的配置点已上移到 camera.h——
 // 各编译单元都经 camera.h 取得宏与引脚，此处是唯一配置点，不再在 .ino 重复定义。
@@ -53,6 +56,15 @@ void setup() {
   ota::init();  // 固件升级入口（ArduinoOTA 网络端口 + HTTP /update）；联网后由 update() 自动就绪
 
   ai::init();  // AI worker 任务（DIRECT 链路；依赖 WiFi 与摄像头）
+  grasp::init();  // 本地自动夹取 worker（纯画面闭环，不依赖 AI）
+
+  // ⚠️ 抬 Arduino loop 任务的优先级（默认 1，core 1）。
+  // loop() 里跑 exec::update_tick()，它负责两件**对时序敏感**的事：① 定距/定角动作"到点停轮"；
+  // ② 机械臂离散定位的 S 形缓动推进。而同在 core 1 的图传软编任务优先级 5、夹取搜索任务优先级 3，
+  // 都会抢占默认 1 的 loop —— 于是短脉冲被拉长（真机实测：命令转 8°、实际转出 30~90°，一步就把
+  // 目标甩出搜索窗而跟丢）、缓动被补成大跨度（观感"一卡一卡"）。抬到 6（高于图传的 5）后，
+  // update_tick 按 ~10ms 稳定推进；core 1 上其余任务(blog1/hwatch1/ping2/ai2)本就低于它。
+  vTaskPrioritySet(NULL, 6);
 
   blog::logf(blog::SYS, "Ready!");
 }

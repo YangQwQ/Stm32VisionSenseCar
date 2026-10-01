@@ -140,6 +140,18 @@ static func goto(x: float, y: float, frame: String = "local") -> Dictionary:
 		params["frame"] = "global"
 	return {"type": "goto", "params": params, "id": _new_id()}
 
+static func auto_grasp(x: float, y: float, w: float = 0.0, h: float = 0.0, obj_name: String = "") -> Dictionary:
+	# 本地自动夹取：x,y = 目标在画面上的**中心**(归一化 0~1)，w,h = 目标框宽高(可省，0 = 板端缺省)。
+	# 板端据此锁定目标并自己完成"降爪 → 对准 → 前进到位 → 合爪"，**不调云端 AI**。
+	var params: Dictionary = {"x": x, "y": y}
+	if w > 0.0:
+		params["w"] = w
+	if h > 0.0:
+		params["h"] = h
+	if obj_name != "":
+		params["name"] = obj_name
+	return {"type": "auto_grasp", "params": params, "id": _new_id()}
+
 ## /help 文案：由 COMMAND_HINTS 生成（唯一事实源，避免重复维护）；特殊说明在此追加。
 static func help_lines() -> PackedStringArray:
 	var out := PackedStringArray()

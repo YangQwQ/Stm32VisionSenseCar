@@ -6,6 +6,7 @@
 #include <freertos/semphr.h>
 #include <string.h>         // memcpy：高清帧拷入快照
 #include <esp_heap_caps.h>  // heap_caps_malloc(MALLOC_CAP_SPIRAM): 快照缓冲
+#include <img_converters.h> // frame2jpg_cb: 非 JPEG 帧软编码（图传 / AI 请求体）
 
 namespace cam {
 
@@ -36,13 +37,27 @@ static SemaphoreHandle_t s_jpeg_dec_mtx = nullptr;
 // 相机访问互斥锁：grab/request_hires 共用。抓帧与"重开相机切分辨率"在同一把锁里串行，否则
 // esp_camera_fb_get 与 esp_camera_deinit/init 并发操作驱动 → 死锁（实测：开着图传时放大取帧必卡死）。
 static SemaphoreHandle_t s_cam_mtx = nullptr;
-// 相机正在"deinit→重开"重建窗口（request_hires 内）。置位后 grab() 不再分发 fb，防止重建期间
-// 别处拿到的帧缓冲是旧 config 分配的、重建后被释放的悬垂指针。
+// 相机正在"deinit→重开"重建窗口（request_hires / set_track_mode 内）。置位后 grab() 不再分发 fb，
+// 防止重建期间别处拿到的帧缓冲是旧 config 分配的、重建后被释放的悬垂指针。
 static volatile bool s_reconfig = false;
+// 当前 VGA 常态的像素格式：JPEG=常态（图传/AI 直传，不软编）/ RGB565=跟踪模式（track 直读）。
+// request_hires 回 VGA 时据此恢复，否则跟踪期切高清后会把相机错误地留回 JPEG。只由 init()/set_track_mode() 写。
+static pixformat_t s_vga_fmt = PIXFORMAT_JPEG;
+
+// ---- 最新一帧发布（"随手要一张"的消费者读这里，不必自己 grab）----
+// 图传任务是唯一的 grab 者，它每拿到一帧就把 JPEG 副本发到这儿。拷贝在锁内完成，读者不会读到半帧。
+static const size_t kLatestCap = 96 * 1024;      // VGA JPEG 实测 20~60KB，96K 足够
+static uint8_t*            s_latest = nullptr;
+static size_t              s_latest_len = 0;
+static uint32_t            s_latest_ms = 0;
+static SemaphoreHandle_t   s_latest_mtx = nullptr;
 
 // 生成摄像头 config：各传感器/板型 pin 唯一配置点，VGA 常态与 SVGA 高清重建共用同一份骨架，
-// 只换 frame_size。调用方不得改里面的帧缓冲策略（WHEN_EMPTY/fb_count=3/PSRAM/jpeg_buffer 256K）。
-static camera_config_t make_config(framesize_t fs) {
+// 只换 frame_size 与像素格式。调用方不得改里面的帧缓冲策略（WHEN_EMPTY/fb_count=3/PSRAM）。
+// fmt：VGA 常态默认 JPEG——图传/AI 直接吃 sensor 硬编帧，省掉每帧软编；
+//      跟踪模式（set_track_mode(true)）才把 VGA 换成 RGB565——track 直读 luma/chroma，省掉软解；
+//      高清重建仍用 JPEG——放大镜只要中央带，整幅软解不划算，沿用驱动硬编。
+static camera_config_t make_config(framesize_t fs, pixformat_t fmt = PIXFORMAT_JPEG) {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -64,19 +79,21 @@ static camera_config_t make_config(framesize_t fs) {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size = fs;
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.pixel_format = fmt;
   // 图传 ws_stream_task 与 AI ai_worker 两个消费者并发抓帧：GRAB_LATEST 只认"最新帧"，
   // 在双缓冲下遇到多消费者会反复交出同一旧缓冲、并把 DMA 生产端卡死（图传冻结 + AI 反复收到同一张图）。
   // WHEN_EMPTY 双缓冲轮流交出，及时归还即不死锁，两者各取新鲜且不同的帧。
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 10;
   config.fb_count = 3;
-  // 新库字段：jpeg 帧缓冲上限。经典版旧库无此字段，默认 recv_size=width*height/5(VGA≈60KB)，
+  // jpeg_quality / jpeg_buffer_size 只对 JPEG 输出有意义：RGB565 下驱动按 width×height×2 自算帧长。
+  // jpeg_buffer_size：经典版旧库无此字段，默认 recv_size=width*height/5(VGA≈60KB)，
   // VGA+jpeg_quality=10 的高熵画面单帧 JPEG 常超 60KB，cam_hal 判定 fb 溢出(FB-OVF) → ll_cam_stop
   // 硬停 DCMI → 图传冻结。抬到 256KB 同时罩住"高清重开的 SVGA"（800×600 高熵 JPEG 可能 >128K），
   // 避免重建高清瞬间触发 FB-OVF。依赖重编后的新版 esp32-camera 库，旧库编译会报错。
-  config.jpeg_buffer_size = 256 * 1024;
+  const bool is_jpeg = (fmt == PIXFORMAT_JPEG);
+  config.jpeg_quality = is_jpeg ? 10 : 0;
+  config.jpeg_buffer_size = is_jpeg ? (256 * 1024) : 0;
 
   // PSRAM 缺失时降级（正常 N16R8 恒有 PSRAM，仅兜底）。
   if (!psramFound()) {
@@ -93,10 +110,10 @@ static void apply_sensor_calib() {
   if (!s) return;
   if (s->id.PID == OV3660_PID) {
     s->set_brightness(s, 1);
-    // 饱和度不再下调：本板是机器视觉用途，黄/红这类颜色是识别小目标最强的线索，
-    // 为"观感自然"压饱和度会直接吃掉它与地面的色差（量色差请取目标像素的分位数，
-    // 别用 bbox 均值——均值会被框进来的背景稀释，框一大一小就不可比）。
-    s->set_saturation(s, 0);
+    // 饱和度**上调**：本板是机器视觉用途，彩色小目标（不同颜色小方块）与灰地面/灰机械臂的判别
+    // 全靠色度。实测 set_saturation(0) 时一个小黄块在解码图里色度 std 只有 3.6（≈无色），
+    // 追踪只能退化成低对比的亮度匹配、频繁丢目标。提到 +2 让色度真正拉开。
+    s->set_saturation(s, 2);
     s->set_aec2(s, 0);
     s->set_exposure_ctrl(s, 1);
     s->set_aec_value(s, 230);
@@ -130,12 +147,13 @@ bool init() {
   pinMode(14, INPUT_PULLUP);
 #endif
 
-  camera_config_t config = make_config(FRAMESIZE_VGA);
+  camera_config_t config = make_config(FRAMESIZE_VGA, PIXFORMAT_JPEG);
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     blog::logf(blog::CAM, "init failed: 0x%x", err);
     return false;
   }
+  s_vga_fmt = PIXFORMAT_JPEG;   // 常态 = JPEG 直出（跟踪模式由 set_track_mode 切）
 
   apply_sensor_calib();
 
@@ -150,8 +168,13 @@ bool init() {
 
   if (!s_cam_mtx) s_cam_mtx = xSemaphoreCreateMutex();   // 一进 init 就先建锁（grab/request_hires 都要用）
   if (!s_snap_mtx) s_snap_mtx = xSemaphoreCreateMutex();
+  if (!s_latest_mtx) s_latest_mtx = xSemaphoreCreateMutex();
   if (s_snap) { heap_caps_free(s_snap); s_snap = nullptr; }   // 重入 init 先清旧快照
   s_snap = (uint8_t*)heap_caps_malloc(get_hires_snap_cap(), MALLOC_CAP_SPIRAM);   // 高清快照常驻 PSRAM
+  if (!s_latest) {
+    s_latest = (uint8_t*)heap_caps_malloc(kLatestCap, MALLOC_CAP_SPIRAM);
+    if (s_latest) s_latest_len = 0;
+  }
   blog::logf(blog::CAM, "[cam] 高清快照 %s", s_snap ? "就绪" : "分配失败(降级: 放大切高清将失效)");
   s_ready = true;
   return true;
@@ -159,12 +182,84 @@ bool init() {
 
 camera_fb_t* grab() {
   if (!s_ready) return nullptr;
-  // 抓帧持锁：与 request_hires 的重开相机串行（见 s_cam_mtx 注释）。
-  if (s_cam_mtx) xSemaphoreTake(s_cam_mtx, portMAX_DELAY);
+  // 抓帧持锁：与 request_hires / set_track_mode 的重开相机串行（见 s_cam_mtx 注释）。
+  // ⚠️ 用**带超时**的取锁而非 portMAX_DELAY：真机上遇到过"抓帧永远拿不到锁 → 整条闭环静默僵死、
+  // 只能断电"。超时后记一条限频日志并丢这一帧，让图传/AI/grasp 自愈而不是一起僵住（日志会点名是谁）。
+  if (s_cam_mtx && xSemaphoreTake(s_cam_mtx, pdMS_TO_TICKS(1200)) != pdTRUE) {
+    static uint32_t s_warn_ms = 0;
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if ((uint32_t)(now - s_warn_ms) > 2000) {
+      s_warn_ms = now;
+      blog::logf(blog::CAM, "[cam] grab 等相机锁超时(1200ms)：有任务长期持锁(重开相机/切格式卡住?)");
+    }
+    return nullptr;
+  }
   // 重建窗口内（deinit/init 之间）暂停分发 fb：此时缓冲是旧 config 分配的，返回即悬垂。丢这一帧，各消费方本容错。
-  camera_fb_t* fb = s_reconfig ? nullptr : esp_camera_fb_get();
+  camera_fb_t* fb = nullptr;
+  if (s_reconfig) {
+    static uint32_t s_warn2_ms = 0;
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if ((uint32_t)(now - s_warn2_ms) > 2000) {   // 正常重建是百 ms 级；反复出现=重建卡住了
+      s_warn2_ms = now;
+      blog::logf(blog::CAM, "[cam] grab 被 s_reconfig 挡下：重建窗口没关(卡在 deinit/init?)");
+    }
+  } else {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      // ★ 抓帧失败时把内部/DMA 水位打出来：相机取不到帧**几乎总是内部 DMA 块被吃干**（真机实测：
+      //   卡死时 `DMA块 最低=0k`、`堆最低=7k`，重启即恢复）。这条日志能在下一次卡死时**当场点出**
+      //   是内存耗尽，而不是含糊的"相机没帧"。限频 3s，免得每帧刷屏。
+      static uint32_t s_fail_ms = 0;
+      const uint32_t now2 = (uint32_t)(esp_timer_get_time() / 1000);
+      if ((uint32_t)(now2 - s_fail_ms) > 3000) {
+        s_fail_ms = now2;
+        blog::logf(blog::CAM, "[cam] 抓帧失败! 内部堆=%u 最大块=%u | DMA 最大块=%u (DMA 被吃干?)",
+                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+      }
+    }
+  }
   if (s_cam_mtx) xSemaphoreGive(s_cam_mtx);
   return fb;
+}
+
+// 排空取"当前"一帧：连续 grab+return 把队列倒空，最后一次 grab 就会阻塞等一帧新拍的。
+// 队列满时前几次是立刻返回的，只有最后一次等一个帧周期 —— 代价就是这么一点。
+camera_fb_t* grab_fresh(int drop) {
+  if (!s_ready) return nullptr;
+  if (drop < 0) drop = 0; else if (drop > 6) drop = 6;
+  for (int k = 0; k < drop; k++) {
+    camera_fb_t* stale = grab();
+    if (!stale) break;          // 拿不到就别空转，直接进最后一次
+    return_frame(stale);
+  }
+  return grab();
+}
+
+void publish_latest(const camera_fb_t* fb) {
+  if (!fb || !s_latest || !s_latest_mtx) return;
+  if (fb->format != PIXFORMAT_JPEG) return;   // RGB565 全帧 614KB，不每帧拷；那种模式按需方走 grab_fresh 软编
+  const size_t n = jpeg_len(fb);
+  if (n == 0 || n > kLatestCap) return;
+  if (xSemaphoreTake(s_latest_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  memcpy(s_latest, fb->buf, n);
+  s_latest_len = n;
+  s_latest_ms = (uint32_t)(esp_timer_get_time() / 1000);
+  xSemaphoreGive(s_latest_mtx);
+}
+
+size_t latest_copy(uint8_t* out, size_t cap, uint32_t* age_ms) {
+  if (!s_latest || !s_latest_mtx || !out || cap == 0) return 0;
+  if (xSemaphoreTake(s_latest_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return 0;
+  const size_t n = s_latest_len;
+  const bool ok = (n > 0 && n <= cap);
+  if (ok) {
+    memcpy(out, s_latest, n);
+    if (age_ms) *age_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_latest_ms;
+  }
+  xSemaphoreGive(s_latest_mtx);
+  return ok ? n : 0;
 }
 
 // 切高清真拍一帧（放大镜用）：用库唯一支持的正规切换路径——deinit 相机 → 以 hires 分辨率重新 init →
@@ -174,7 +269,11 @@ camera_fb_t* grab() {
 camera_fb_t* request_hires(framesize_t hires, int* ok) {
   if (ok) *ok = 0;
   if (!s_ready || !s_cam_mtx) return nullptr;
-  xSemaphoreTake(s_cam_mtx, portMAX_DELAY);   // 独占相机（等当前任何抓帧用完）
+  // 带超时取锁（同 grab 的说明）：拿不到就整条失败，别把自己僵在 portMAX_DELAY 上。
+  if (xSemaphoreTake(s_cam_mtx, pdMS_TO_TICKS(1500)) != pdTRUE) {
+    blog::logf(blog::CAM, "[cam] request_hires 放弃: 等相机锁超时(1500ms)");
+    return nullptr;
+  }
   s_reconfig = true;
   camera_fb_t* fb = nullptr;
   camera_fb_t* d = nullptr;
@@ -183,7 +282,7 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
   // deinit 后传感器未掉电、SCCB I2C 拆建后停在半事务，立即 init 会 I2C 静默失败 → framesize 变非法值 → 越界读
   // resolution[] → width=0 且驱动卡死。修法：deinit 后延时让总线释放；init 后跳过前几帧直到拿到有效帧(fb->width
   // 与 len 合法)才认定成功；拿不到回卫 VGA 且整条失败。SXGA 时序更紧必卡 → 调用方只应用于 SVGA。
-  camera_config_t hc = make_config(hires);
+  camera_config_t hc = make_config(hires, PIXFORMAT_JPEG);
   esp_camera_return_all();                // 清在途帧，避免 deinit 撞上未归还的缓冲
   esp_err_t e_de = esp_camera_deinit();
   vTaskDelay(pdMS_TO_TICKS(50));          // 等 SCCB 总线释放、XCLK 停稳
@@ -234,7 +333,7 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
     // 返回 ESP_FAIL(日志里的 -1)。失败后直接收手会把相机永久留在 deinit 态 —— 之后每次取帧都失败，
     // AI 空转多轮后任务夭折。故重试若干次：每次前先 deinit 回干净态(库对 cam_obj==NULL 安全)，
     // 并打出具体 esp_err 便于分诊。
-    camera_config_t vc = make_config(FRAMESIZE_VGA);
+    camera_config_t vc = make_config(FRAMESIZE_VGA, s_vga_fmt);   // 回到"当前常态格式"（JPEG 或跟踪模式 RGB565）
     esp_err_t e_lo_init = ESP_FAIL;
     for (int attempt = 1; attempt <= 3; attempt++) {
       esp_camera_return_all();
@@ -267,6 +366,52 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
   return nullptr;
 }
 
+// ---- 跟踪模式硬切换（track 起停时各切一次，不每帧切） ----
+// 常态 VGA = sensor 直出 JPEG（图传/AI 白嫖硬编，不软编）；track 只认 RGB565 帧缓冲，故进入跟踪时切
+// RGB565、结束切回 JPEG。切换必须走 deinit→init：两种格式的帧缓冲大小不同，热切 set_pixformat 会把帧
+// 写进不匹配的缓冲 → ll_cam_stop 卡死（与 set_framesize 同源的坑）。
+// 幂等：已是目标格式直接返回，不无谓重开（跟踪期反复调用、grasp/AI 两条路径叠加调用都安全）。
+// 失败重试 3 次（同 request_hires restore），绝不把相机留在 deinit 态。
+bool set_track_mode(bool on) {
+  if (!s_ready || !s_cam_mtx) return false;
+  const pixformat_t want = on ? PIXFORMAT_RGB565 : PIXFORMAT_JPEG;
+  // 带超时取锁：拿不到就放弃（相机保持当前格式），绝不把自己僵在这里 —— 跟踪起停只是"尽量切"，卡死代价大得多。
+  if (xSemaphoreTake(s_cam_mtx, pdMS_TO_TICKS(1500)) != pdTRUE) {
+    blog::logf(blog::CAM, "[cam] 切格式放弃: 等相机锁超时(1500ms)");
+    return false;
+  }
+  if (s_vga_fmt == want) { xSemaphoreGive(s_cam_mtx); return true; }   // 幂等：已是目标模式
+  s_reconfig = true;                          // 重建窗口：grab() 暂停分发（旧缓冲悬垂）
+  camera_config_t nc = make_config(FRAMESIZE_VGA, want);
+  esp_err_t e_init = ESP_FAIL;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    esp_camera_return_all();
+    esp_err_t e_de = esp_camera_deinit();
+    vTaskDelay(pdMS_TO_TICKS(50));            // 等 SCCB 总线释放、XCLK 停稳（同 request_hires）
+    e_init = esp_camera_init(&nc);
+    blog::logf(blog::CAM, "[cam] 切%s: 第%d次 deinit=%d init=%d(%s)",
+               on ? "RGB565(跟踪)" : "JPEG(常态)", attempt, (int)e_de, (int)e_init, esp_err_to_name(e_init));
+    if (e_init == ESP_OK) break;
+    vTaskDelay(pdMS_TO_TICKS(200));           // 给刚释放的内部 DMA 块回收/合并留窗口，再试
+  }
+  const bool ok = (e_init == ESP_OK);
+  if (ok) {
+    s_vga_fmt = want;
+    apply_sensor_calib();
+    // 重开相机后 AWB/AEC 从零收敛（只睡不取帧不收敛）：喂预热帧再放行，避免跟踪/AI 头几帧吃偏色。
+    for (int i = 0; i < HI_WARM_RECONFIG; i++) {
+      camera_fb_t* w = esp_camera_fb_get();
+      if (!w) break;
+      esp_camera_fb_return(w);
+    }
+  } else {
+    blog::logf(blog::CAM, "[cam] 切格式失败, 相机停在 deinit 态: 后续取帧会一直失败");
+  }
+  s_reconfig = false;
+  xSemaphoreGive(s_cam_mtx);
+  return ok;
+}
+
 // 真实 JPEG 长度。本板 fb_location=PSRAM + JPEG，驱动在这条分支下 **不是** 按实际字节数报 len，
 // 而是按"消耗的 DMA 半缓冲数 × 半缓冲大小"算（cam_hal.c 的 psram_mode 分支），本身是向上取整的；
 // 只有靠 ll_cam 里那处 EOI 截断（dma_buffer->len = offset_e + 2）才被修回真值。那处探测一旦没命中，
@@ -287,6 +432,42 @@ size_t jpeg_len(const camera_fb_t* fb) {
     if (b[i] == 0xFF && b[i + 1] == 0xD9) return i + 2;
   }
   return fb->len;   // 没找到 EOI（不该发生）：退回原值，至少不比现在更糟
+}
+
+// ---- 非 JPEG 帧 → JPEG 软编码（图传 / AI 请求体） ----
+// jpge 的输出回调：直接写进调用方缓冲（省一次 malloc+拷贝）。`index` 语义本地无源码可查，两种约定
+// 都兼容（仅当 index==已写长度时按 index 写，否则追加）；缓冲不够返回 0 并置 over。
+namespace {
+struct JpgOut { uint8_t* buf; size_t cap; size_t written; bool over; };
+
+size_t jpg_write_cb(void* arg, size_t index, const void* data, size_t len) {
+  JpgOut* o = (JpgOut*)arg;
+  // `!data` 是 jpge 收尾的 put_buf(NULL,0)，不是错误/溢出（上游契约：pBuf 空 ⇒ 收尾返回 true）。
+  if (!data) return 0;
+  size_t at = (index == o->written) ? index : o->written;
+  if (at + len > o->cap) { o->over = true; return 0; }
+  memcpy(o->buf + at, data, len);
+  o->written = at + len;
+  return len;
+}
+}  // namespace
+
+size_t encode_jpeg(const camera_fb_t* fb, int quality, uint8_t* out, size_t cap) {
+  if (!fb || !fb->buf || !out || cap == 0) return 0;
+  // JPEG 帧（高清快照）本就是这个格式，按真实长度直接拷出去。
+  if (fb->format == PIXFORMAT_JPEG) {
+    size_t rl = jpeg_len(fb);
+    if (rl == 0 || rl > cap) return 0;
+    memcpy(out, fb->buf, rl);
+    return rl;
+  }
+  // 非 JPEG（跟踪模式 = RGB565）：jpge 与 Tjpgd 共用静态上下文（见 camera.h 说明），持锁串行。
+  JpgOut o = { out, cap, 0, false };
+  lock_jpeg_dec();
+  bool ok = frame2jpg_cb((camera_fb_t*)fb, (uint8_t)quality, jpg_write_cb, &o);
+  unlock_jpeg_dec();
+  if (!ok || o.over || o.written == 0) return 0;
+  return o.written;
 }
 
 bool available() { return s_ready; }

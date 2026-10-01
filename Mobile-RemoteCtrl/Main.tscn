@@ -13,6 +13,7 @@
 [ext_resource type="Script" uid="uid://dgct6qpk5wr7s" path="res://ui/bluetooth/ScanPanel.gd" id="14_scan"]
 [ext_resource type="Script" uid="uid://dieh5mwxnthkr" path="res://ui/BgDimSharder.gd" id="20_3b0ty"]
 [ext_resource type="Script" uid="uid://64g1jpram2nr" path="res://ui/editor/ImageEditor.gd" id="20_devvj"]
+[ext_resource type="Script" uid="uid://c3n8kqtvz2m5p" path="res://ui/video/TrackOverlay.gd" id="15_track"]
 [ext_resource type="Script" uid="uid://xeoi8bgd6wn" path="res://ui/video/MemoryMap.gd" id="21_opmap"]
 [ext_resource type="Script" uid="uid://poj8cgc0qg14" path="res://ui/replay/SessionList.gd" id="22_session"]
 [ext_resource type="Script" uid="uid://cri355t1mpslh" path="res://ui/replay/PlaybackBar.gd" id="23_playback"]
@@ -1097,6 +1098,12 @@ layout_mode = 2
 size_flags_horizontal = 8
 text = "采用"
 
+[node name="GraspBtn" type="Button" parent="BodyControl/ImgEditToolbar" unique_id=891730124]
+custom_minimum_size = Vector2(150, 0)
+layout_mode = 2
+size_flags_horizontal = 8
+text = "自动夹取"
+
 [node name="Video" type="Control" parent="BodyControl" unique_id=1319034480]
 visible = false
 custom_minimum_size = Vector2(1080, 1080)
@@ -1141,6 +1148,16 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("13_grid")
+
+[node name="TrackOverlay" type="Control" parent="BodyControl/Video" unique_id=1607235094]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+script = ExtResource("15_track")
 
 [node name="OpMap" type="Control" parent="BodyControl/Video" unique_id=771234567]
 visible = false

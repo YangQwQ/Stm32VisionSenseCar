@@ -184,7 +184,8 @@ void init() {
   g_q = xQueueCreate(32, sizeof(char*));
   if (!g_q) return;                     // 队列创建失败：保持静默，转发自然关闭
   // 栈先试 PSRAM（内部堆紧，见 heap_watch）：把 8KB 让回内部 DMA 池；失败退回内部栈保转发可用。
-  if (!s_fwd_stack) s_fwd_stack = (StackType_t*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+  // ⚠️ 声明 8192 **字** ⇒ 要分配 8192*4=32KB；只 malloc(8192 字节) 会让任务溢出 24KB 进相邻 PSRAM。
+  if (!s_fwd_stack) s_fwd_stack = (StackType_t*)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
   if (s_fwd_stack) {
     xTaskCreateStaticPinnedToCore(forward_task, "blog_fwd", 8192, nullptr, 1, s_fwd_stack, &s_fwd_tcb, 1);
   } else {

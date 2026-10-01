@@ -99,7 +99,10 @@ void ai::init() {
   // 故不存在"写 flash 时 PSRAM 栈取不到"的风险。
   static StackType_t* s_ai_stack = nullptr;
   static StaticTask_t s_ai_tcb;      // TCB 必须留内部 RAM(FreeRTOS 断言)
-  if (!s_ai_stack) s_ai_stack = (StackType_t*)heap_caps_malloc(16384, MALLOC_CAP_SPIRAM);
+  // ⚠️ xTaskCreate* 的 usStackDepth 单位是**字**(StackType_t=4B)：下面声明 16384 字 ⇒ 必须分配
+  // 16384*4=64KB。旧代码只 malloc(16384 字节)，任务却以为有 64KB ⇒ 溢出 48KB 写进相邻 PSRAM
+  // （栈哨兵在 64KB 处、检查不到），静默踩坏堆 —— 症状就是"随机"故障。
+  if (!s_ai_stack) s_ai_stack = (StackType_t*)heap_caps_malloc(16384 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
   if (s_ai_stack) {
     g_worker = xTaskCreateStaticPinnedToCore(ai_worker, "ai_worker", 16384, nullptr, 2,
                                              s_ai_stack, &s_ai_tcb, 1);

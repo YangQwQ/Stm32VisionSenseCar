@@ -59,7 +59,7 @@ void hwatch::init() {
   if (s_task) return;
   // 栈放 PSRAM：内部堆紧到 16KB 栈都可能分配失败（实测过），
   // TCB 必须留内部 RAM（FreeRTOS 断言）。
-  if (!s_stack) s_stack = (StackType_t*)heap_caps_malloc(kTaskStack, MALLOC_CAP_SPIRAM);
+  if (!s_stack) s_stack = (StackType_t*)heap_caps_malloc(kTaskStack * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
   if (!s_stack) {
     blog::logf(blog::NET, "水位哨兵：PSRAM 栈分配失败，未启动");
     return;

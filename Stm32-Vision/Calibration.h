@@ -41,6 +41,37 @@ inline constexpr float ARM_RAISE_H_CM = 9.0f;
 inline constexpr float GRASP_LIFT_CM = 7.0f;  // 合爪后抬起的高度
 inline constexpr int   GRASP_SETTLE_MS = 250;  // 合爪到抬臂之间的等待（让夹爪真合到位再抬）
 
+// 前进步长还受"**横向漂移预算**"限制：一步前进会按实测 du_per_cm 把目标横向带偏，带偏量必须留在
+// u 容差内 —— 否则一步就把目标带出容差，而**贴近时旋转对 u 几乎无效**（目标离旋转轴很近，真机实测
+// 转 3 次 u 恒定不动），那个"偏右"就再也纠不回来。真机实测：4cm 前进带偏 +0.036u，之后连转 5°×5 次
+// u 纹丝不动 → 停在偏右 0.031 处中止。取 0.5 = 允许一步用掉 u 容差的 50%。
+inline constexpr float GRASP_DRIFT_BUDGET = 0.50f;
+// 还没实测到 du_per_cm 时（刚起跟第一次前进）用的**保守估计值**：真机实测 4cm 带偏 0.036u ≈ 0.009/cm。
+// 不用它就等于"第一次前进不设上限" —— 实测那一脚整 4cm 冲出去、外观直接掉到 -0.12 跟丢。
+inline constexpr float GRASP_DRIFT_ASSUMED = 0.009f;
+
+// ---- 合爪自检（空夹判定）----
+// 合爪 + 自动抬臂后，目标相对合爪前的位置变化**小于**这两个值 ⇒ 它还留在原地 ⇒ 判空夹。
+// 抬升 GRASP_LIFT_CM=7cm 在这么近的距离上位移很大，所以这两个值只要压过跟踪噪声即可；
+// 静止时跟踪抖动实测在 0.01 量级，故取 0.025 / 0.035。见 grasp.cpp 的 verify_grasp。
+// 合爪自检：**夹持位**（抬臂姿态可重复 ⇒ 夹住时方块在画面里的位置基本固定）。
+// 真机实测一次夹住时方块在 (0.499,0.457)，比合爪点(≈0.50,0.565)高约 0.11v。
+// 自检就"去这个位置看有没有方块"，并跟"地面原位"比 —— 夹持位明显更像目标 ⇒ 夹住了。
+inline constexpr float GRASP_HOLD_U = 0.50f;
+inline constexpr float GRASP_HOLD_V = 0.46f;
+inline constexpr float GRASP_HOLD_MARGIN = 0.08f;   // 夹持位外观分要比地面原位高出这么多才算"夹住"
+inline constexpr float GRASP_HOLD_SCAN_R = 0.06f;   // 夹持位邻域搜索半径（治"位形漂移导致单点落空"）
+// 判"**确定未夹住**"的地面证据门限：地面原位的外观分要**同时**满足
+//   ① ≥ 这个值（那块确实还很像目标，不是噪声/地板）
+//   ② 比夹持位高出 GRASP_HOLD_MARGIN
+// 两条都满足才敢报"确定未夹住"。否则一律报"可能已夹住"—— 宁可漏报，也不误报（误报会让 AI 以为没夹住）。
+inline constexpr float GRASP_EMPTY_MIN = 0.45f;
+// 重捕锁的**平移验证**：重捕（宽搜）刚抓回来的锁没经过任何动作验证，而它常抓到"恰好停在合爪点附近"
+// 的东西（真机实测：看着到位却夹空）。所以合爪前先退这么多 cm，要求 v 确实变小；不动就中止。
+inline constexpr int GRASP_VERIFY_BACK_CM = 3;
+// 实测：夹住时 地面原位 0.15 / 夹持位 0.30（方块被爪挡掉一部分，所以夹持位分也不高）；空夹时反过来
+// （地面 0.7+ / 夹持位 0.1 左右）。门限只要盖过噪声即可，取 0.08 留足余量。
+
 // ---- 原地旋转的车身几何（AI 姿态累积用）----
 // 坐标系原点=车头，但四轮差速原地旋转的枢轴是车几何中心、不是车头原点——于是旋转时车头原点
 // 本身会移动。car_update_pose 拿车头相对枢轴的距离折算这段位移，否则旋转后记忆坐标整体漂移
@@ -71,6 +102,106 @@ inline constexpr int   MV_MIN_PULSE_MS = 500;  // 脉冲下限：宁可多走一
 inline constexpr int   SPIN_TBL_N = 10;
 inline constexpr float SPIN_TBL_DEG[SPIN_TBL_N] = { 0.0f, 2.2f, 3.25f, 4.5f, 6.43f, 10.56f, 40.0f, 60.0f, 173.1f, 337.5f };
 inline constexpr int   SPIN_TBL_MS[SPIN_TBL_N]  = { 0,   10,    15,    25,   50,    100,    500,    750,    2250,   4500 };
+
+// ---- 板端本地目标追踪（track：相关滤波 dcf） ----
+// 实现见 src/ai/track.cpp（解码/取范围/状态机）与 src/ai/dcf.cpp（相关滤波内核）。
+// ⚠️ 实测解码耗时（2026-09-30，S3@240MHz，VGA JPEG）：scale0=215ms / scale1=230ms / scale2=207ms / scale3=40ms
+// —— 只有 1/8 真省 CPU（1/2、1/4 因平均过程反而略慢）。相关滤波只需灰度、且输入窗会重采样归一化，
+// 故取 1（1/2）即可，清晰度够、取图点数少 4 倍。
+inline constexpr int   TRACK_SCALE        = 1;
+inline constexpr float TRACK_SEED_W       = 0.10f;   // 点种子缺省框宽（归一化）
+inline constexpr float TRACK_SEED_H       = 0.13f;   // 点种子缺省框高（归一化）
+inline constexpr int   TRACK_TW_MIN       = 28;      // 种子框边长下限（全幅 px）：太小则匹配成噪声，一有大位移就被假峰骗走
+inline constexpr int   TRACK_TW_MAX       = 48;
+// ---- 相关滤波（dcf）的 PSR 门限 ----
+// PSR = (峰值 − 旁瓣均值) / 旁瓣标准差。MOSSE 类方法的通用经验：>20 非常可信、7~20 良好、<7 多半被遮挡/丢失。
+// 保持门比捕获门松，避免"分刚好卡在门限下就永远救不回"（NCC 时代真机踩过这个坑）。
+inline constexpr float TRACK_PSR_KEEP     = 6.0f;    // 已在跟时用
+inline constexpr float TRACK_PSR_LO       = 8.0f;    // 从锁定/丢失重捕时用
+inline constexpr float TRACK_SNAP_WIN   = 0.12f;   // 种子吸附搜索窗（归一化）：标记只是"大致位置"，板端在此窗口内
+                                                  // 用色度峰值把种子精确吸到目标上（实测手标常偏 30px，不吸附就锁到地面）
+inline constexpr int   TRACK_SNAP_GAIN   = 130;   // 吸附门槛(%): 候选框色度须≥"标记点框色度"的此百分比。
+inline constexpr int   TRACK_SNAP_MIN_CHROMA = 35; // **标记处本身的平均色度**低于此值就直接不吸附（保留用户标的位置）。
+                                                  // 色度吸附只对"确实有颜色"的目标可靠；目标本身色度低时，窗口内的
+                                                  // 色度峰多半是地面反光/杂色 —— 吸上去会把模板取到反光上，下一帧反光一变
+                                                  // 就"全画面一个点都找不到"（真机实测：两次 已吸附 的运行都是这样死的，
+                                                  // 而未吸附那次直接夹取成功）。
+                                                 // 即**只吸到明显比当前位置更有颜色的地方**——标记点已在目标上就不动，
+                                                 // 偏到地面时才被拉回目标；也顺带排除掉"背景里更大更鲜艳的杂物"(取最近)。
+// 魔棒取范围的色度容差（0~255 刻度）：框内主体色 ±此值内的像素算"目标本体"。太小则范围碎片化、
+// 太大则把影子/地面也吃进来。真机按"日志里魔棒范围尺寸是否接近方块实际大小"来调。
+inline constexpr int   TRACK_MAGIC_TOL    = 40;
+inline constexpr int   TRACK_LOST_N       = 3;       // 连续低分帧数 → Lost
+// ---- 跟踪精度改进 ----
+inline constexpr float TRACK_SMOOTH_ALPHA   = 0.45f;   // 指数平滑系数(0~1)：大=跟得紧但抖、小=稳但滞后。0.45 在 ~3fps 下约等效 2~3 帧移动平均
+inline constexpr int   TRACK_REACQ_MAX    = 15;      // Lost 后重捕帧上限，超则停
+inline constexpr float TRACK_MIN_STD      = 8.0f;    // 种子/模板的灰度标准差下限（判"太素不可跟"）
+// 手机标记刷新：图传任务复用已抓帧、按此周期（ms）调一次 track::update_from_fb(light=true)，把标记
+// 刷新率从"每控制步一次(<1Hz)"提到图传帧率量级。0 = 关闭（标记回退成每步一跳）。越小越跟手、CPU 越高。
+inline constexpr int   TRACK_REFRESH_MS   = 80;      // 喂帧下限间隔(ms)：跟踪期图传任务连续喂追踪器，这是底限保护
+                                                     // （相机 ~5fps 本来就要 200ms 才出一帧，80ms 基本不生效）
+
+// ---- 本地自动夹取（标位置 → arm low → 对准 u → 前进到 v → 合爪；纯画面闭环，不经 AI）----
+// 实现见 src/ai/grasp.cpp。全程只看画面里目标的归一化坐标 (u,v)，不用单应/全局坐标。
+inline constexpr float GRASP_U_TGT     = 0.49f;  // 对准目标：物体应到的画面 u
+inline constexpr float GRASP_V_TGT     = 0.575f;   // 到位目标：物体应到的画面 v
+// ⚠️ 容差必须**大于**执行器最小可分辨位移，否则闭环必然来回摆动（实测：最小可分辨转角≈4° ⇒ Δu≈0.036，
+// 容差设 0.025 时车左右转过头、永远收敛不了，最后停在一次跳变帧上合爪 → 横向偏约 10°）。
+inline constexpr float GRASP_U_TOL     = 0.045f;  // u 对准容差（**中距**参考值；实际用的容差按距离插值，见下）
+// u 容差**随距离自适应**（v 是距离代理：v 越大越近）。理由：同样的 Δu 在近处对应的物理横向误差更小，
+// 但合爪只发生在近处 ⇒ 远处放宽(省时间，反正每走一步都会重对)、近处收紧(合爪那一下必须准)。
+// ⚠️ 用户实测反馈："大多数时候它已经在夹爪前的最后一段了，那里精度该最高、还放宽容差就是错过"
+// ⇒ 收紧段整体前移、并且收紧后的绝对值更严（远/近两端都往下压）。
+inline constexpr float GRASP_U_TOL_FAR   = 0.060f;  // v ≤ V_FAR 时用（目标还远）
+inline constexpr float GRASP_U_TOL_NEAR  = 0.030f;  // v = GRASP_V_TGT 时用（可夹纵深）
+inline constexpr float GRASP_U_TOL_V_FAR = 0.30f;   // 从 v=此值开始线性收紧（≈距离 45~50cm）
+inline constexpr float GRASP_U_TOL_AIM   = 0.60f;   // "居中优先"：先朝 容差×此系数 收，连续没进展再退到整容差
+inline constexpr float GRASP_V_TOL     = 0.035f;
+inline constexpr int   GRASP_ALIGN_N   = 2;       // 连续 N 帧都对准才允许继续（防读到跳变帧就合爪）
+inline constexpr int   GRASP_MAX_ITERS = 60;      // 迭代上限
+inline constexpr int   GRASP_TIME_MS   = 60000;   // 总时限（防卡死）
+inline constexpr float GRASP_SPIN_GAIN = 150.0f;  // u 误差 → 转角(度)。实测每度只搬动 ~0.0055u（逼近时更大），
+                                                  // 原 45 太保守：|eu|=0.17 只敢转 7°，要 30° 才搬完，于是"小角度慢悠悠"。
+inline constexpr int   GRASP_SPIN_MIN_DEG = 5;    // 最小转角。原 8°：u 分辨率 0.045 ÷ 0.0055u/° ≈ 8°，
+                                                  // 4° 只搬 0.02u、低于噪声，故曾抬到 8。但 8° ⇒ 一步 0.044u，
+                                                  // 是"近处容差(±0.018)的两倍多" ⇒ 永远迈不进容差带，车一步跨过
+                                                  // 停在带外（真机实测终点 u 恒定偏 +0.019，从右侧接近就偏右）。
+                                                  // 降到 5°（SPIN_TBL 里 4.5°→25ms、6.43°→50ms，5°≈31ms 仍能真动）
+                                                  // ⇒ 步长 0.0275u，最近网格点必落在半步(0.014)内，落点误差减半。
+                                                  // ⚠️ 若实测 5° 转不动（脉冲太短顶不过静摩擦），退回 8 —— 那就靠
+                                                  // grasp.cpp 里"容差垫到半步"把落点锁在 ≤0.022（不再乱飘）。
+inline constexpr int   GRASP_SPIN_MAX_DEG = 25;   // 单步上限：25° ⇒ Δu≈0.14(88px) 仍落在搜索窗(±160px)内。
+                                                  // 用户明确"过头了转回来就行"，故放宽（原 10° 太保守）。
+inline constexpr float GRASP_MOVE_GAIN_CM = 40.0f; // v 误差 → 前进 cm
+inline constexpr int   GRASP_MOVE_MIN_CM = 1;
+inline constexpr int   GRASP_MOVE_MAX_CM = 4;     // 单步前进上限（保证 Δv 也落在搜索窗内，不跟丢）
+inline constexpr int   GRASP_MOVE_MAX_BACK_CM = 3; // 单步**后退**上限。两种情形会后退：
+                                                   // ① v 冲过可夹点太近（夹爪会顶开/撞到物体）；
+                                                   // ② u 怎么转都不变（多半锁到随车一起动的东西）时先退一步换个视角。
+                                                   //（旧策略是"只前进绝不后退"，用户实测"太近也不好"。）
+inline constexpr int   GRASP_BACK_MAX_N = 4;       // 一次夹取里最多后退几步，防前后来回蹭
+// 单步动作幅度还受**追踪器当前搜索半径**限制：预期位移(du/deg×角度、dv/cm×cm) ≤ 半径×此系数。
+// 半径本身受"输入窗归一化"约束（=2.5×目标尺寸），不能独立设定 —— 用这个系数把"动作幅度"压进半径里，
+// 就等价于"半径由预期位移决定"（真机实测：目标一大、s_obj 估计偏小，半径跟着小，25° 一步就出窗）。
+inline constexpr float GRASP_RADIUS_FRAC = 0.70f;
+// "动作后目标必须动"的物理判据（比"误差有没有变小"稳得多）：单步之后 |Δu|(旋转) / |Δv|(平移) 小于
+// **期望位移的 30%** ⇒ 这一脚目标没搭理我；连续 GRASP_STUCK_N 次就认定"锁到了随车一起动的东西"——
+// 夹爪在帧间完全一致、PSR 天生最高，真机实测 u 恒定 0.520、车转了 250° 也不动，而旧的"误差没变小"
+// 判据被 0.0001 的蠕动反复清零、永不触发。期望位移来自实测增益（du_per_deg / dv_per_cm），比绝对
+// 阈值（旧 GRASP_STUCK_EPS=0.005，已被抖动/透视漂移骗过）稳得多。
+inline constexpr int   GRASP_STUCK_N   = 3;
+inline constexpr float GRASP_THROTTLE  = 0.25f;
+inline constexpr int   GRASP_LOST_MAX  = 12;      // 连续跟丢帧数上限 → 中止。**必须 ≥ 追踪器的重捕预算**
+                                                  // （TRACK_LOST_N 3 + TRACK_REACQ_MAX 15，最多 18 帧）才有意义：
+                                                  // 定太小会在追踪器"丢失→全图重捕"还没跑完时就放弃夹取
+                                                  // （真机实测 4 帧就中止，表现为"转一下就不动了"）。
+inline constexpr int   GRASP_NO_PROG_N = 5;       // 连续 N 次动作后误差没变小 → 中止（目标不随动作移动=多半跟错了/被遮挡）
+inline constexpr int   GRASP_MOTION_START_MS = 250; // 动作后等它真正起转的上限（act 后一拍才置位，直接 settle 会抓到动作前的旧画面）
+// 位置由**图传任务连续喂帧**（app_httpd 的 track_feed），夹取循环不再自己抓帧。动作完成后要等
+// "一帧动作之后的画面被处理过"再读位置 —— 比动作停止时刻再晚 MARGIN 一点，确保那帧是停稳后拍的；
+// WAIT 是上限（相机 ~5fps，别死等）。
+inline constexpr int   GRASP_FRESH_MARGIN_MS = 300;
+inline constexpr int   GRASP_FRESH_WAIT_MS   = 1600;
 
 // ---- 屏幕→地面 单应标定点（改镜头/移相机后重测此表） ----
 // 每行一个坐标对：(屏幕归一化 u, v) → (车头系地面 x右+, y前+ cm)。

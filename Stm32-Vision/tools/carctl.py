@@ -1654,6 +1654,26 @@ def parse_args():
     p.add_argument("-t", "--tag", help="文件名标签（默认当前时刻）")
     p.set_defaults(func=cmd_zoomshot)
 
+    p = sub.add_parser("tracktest", parents=[common],
+                       help="板端降采样灰度解码自检（/tracktest）：取回灰度 BMP，确认边缘无错位")
+    p.add_argument("--scale", type=int, default=2, choices=[0, 1, 2, 3],
+                   help="降采样档 0=1/1,1=1/2,2=1/4,3=1/8（默认 2）")
+    p.add_argument("--all", action="store_true",
+                   help="额外把 0..3 四档各解一遍打耗时/luma 统计（默认只解请求档）")
+    p.add_argument("--chr", action="store_true",
+                   help="回传色度通道 BMP（诊断彩色目标在色度里是否拉得开）")
+    p.add_argument("--u", type=float, help="跟踪自检: 目标中心 u(0~1)，给了它和 --v 就进跟踪模式")
+    p.add_argument("--v", type=float, help="跟踪自检: 目标中心 v(0~1)")
+    p.add_argument("--w", type=float, help="跟踪自检: 目标框宽(0~1, 可省)")
+    p.add_argument("--h", type=float, help="跟踪自检: 目标框高(0~1, 可省)")
+    p.add_argument("--n", type=int, default=1, help="跟踪自检: 连拍帧数(默认 1, 上限 20)")
+    p.add_argument("--cont", action="store_true",
+                   help="跟踪自检: 不重新 seed，沿用当前跟踪目标继续跑（运动测试用）")
+    p.add_argument("--stop", action="store_true", help="停止当前本地跟踪")
+    p.add_argument("-o", "--out", help="输出路径（默认 tools/shots/g-<标签>.bmp）")
+    p.add_argument("-t", "--tag", help="文件名标签（默认当前时刻）")
+    p.set_defaults(func=cmd_tracktest)
+
     p = sub.add_parser("step", parents=[common],
                        help="发指令+抓帧+记状态行（手动夹取/复盘用，一次一条可对照的记录）")
     p.add_argument("type", help="词表指令类型，如 arm / move / spin")
@@ -1767,6 +1787,39 @@ def cmd_zoomshot(host: str, args) -> None:
     dst = Path(args.out) if args.out else SHOTS_DIR / f"z-{tag}.jpg"
     dst.write_bytes(blob)
     log(f"{dst}  {len(blob) / 1024:.1f}KB")
+
+
+def cmd_tracktest(host: str, args) -> None:
+    """板端 /tracktest：两种模式。
+
+    ① 灰度自检（默认，无 --u/--v）：取回降采样灰度 BMP，肉眼确认右/下边缘无错位。
+    ② 跟踪自检（给了 --u/--v）：先 seed 一个目标，再连拍 --n 帧逐帧跟踪并回文本轨迹——不动车、不经 AI，
+       用来验证"锁定得住、conf 正常、耗时多少"。移动目标/相机后再跑一次即可看它是否跟住。
+    """
+    if args.stop:
+        print(http_get(host, "/tracktest?stop=1", timeout=args.timeout).decode("utf-8", "replace"), end="")
+        return
+    if args.u is not None and args.v is not None:
+        q = f"/tracktest?u={args.u}&v={args.v}&n={args.n}"
+        if args.w is not None: q += f"&w={args.w}"
+        if args.h is not None: q += f"&h={args.h}"
+        resp = http_get(host, q, timeout=args.timeout)
+        # 板端同时把每帧结果打进了 AI 日志；这里把 HTTP 返回的轨迹原样打出
+        print(resp.decode("utf-8", "replace"), end="")
+        return
+    if args.cont:
+        resp = http_get(host, f"/tracktest?cont=1&n={args.n}", timeout=args.timeout)
+        print(resp.decode("utf-8", "replace"), end="")
+        return
+    blob = http_get(host, f"/tracktest?scale={args.scale}" + ("&all=1" if args.all else "")
+                    + ("&chr=1" if args.chr else ""), timeout=args.timeout)
+    if blob[:2] != b"BM":
+        sys.exit(f"不是 BMP（前16B {blob[:16]!r}）—— /tracktest 返回异常（固件可能未含该端点）")
+    SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    tag = args.tag or time.strftime("%H%M%S")
+    dst = Path(args.out) if args.out else SHOTS_DIR / f"{'c' if args.chr else 'g'}{args.scale}-{tag}.bmp"
+    dst.write_bytes(blob)
+    log(f"{dst}  {len(blob) / 1024:.1f}KB  (scale={args.scale})")
 
 
 def cmd_step(host: str, args) -> None:

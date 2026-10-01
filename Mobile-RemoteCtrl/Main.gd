@@ -106,6 +106,7 @@ func _ready() -> void:
 	# 标注工具条（非模态，浮在图传上方）：采用/取消由编辑器回抛，Main 统一收尾。
 	_editor.connect("image_sent", _on_editor_image_sent)
 	_editor.connect("cancelled", _on_editor_cancelled)
+	_editor.connect("grasp_requested", _on_editor_grasp_requested)
 	# 直控面板：摇杆手动接管 / 板端 AI 运行态回抛。
 	_ctrl_area.connect("manual_takeover", _on_manual_takeover)
 	_ctrl_area.connect("ai_busy_changed", _on_ai_busy_changed)
@@ -597,6 +598,7 @@ func _on_ws_connected() -> void:
 
 func _on_ws_disconnected(reason: String) -> void:
 	_video.call("show_no_signal", true)
+	_video.call("clear_track")  # 掉线：跟踪叠加一并清掉
 	DeviceConn.stop_video()  # WS 掉线：UDP 对端随之失效，停接收
 	_chat_panel.set_ai_running(false)  # 掉线即任务中断：按钮复位「发送」
 	_update_status()
@@ -636,6 +638,17 @@ func _handle_board_msg(data: Dictionary) -> bool:
 		"ai_mem":
 			# 板端物体记忆 + 车姿态快照：喂给记忆地图（画面源=记忆时画）。
 			_video.call("show_map_data", data.get("params"))
+		"track":
+			# 板端跟踪器目标位置（归一化 u/v + 置信度 + 状态）：叠加层画十字/圆圈。
+			# st=idle 表示跟踪已停：清掉叠加，避免残留旧十字。
+			# novid=1：跟踪期板端**不推视频**（省掉整幅软编，真机实测夹取每步快 ~1.5×）→ 手机改显占位。
+			var st_t := str(data.get("st", ""))
+			_video.call("set_track_novid", bool(data.get("novid", false)))
+			if st_t == "idle" or not data.has("u"):
+				_video.call("clear_track")
+			else:
+				_video.call("set_track_target", float(data.get("u", 0.0)),
+					float(data.get("v", 0.0)), float(data.get("conf", 0.0)), st_t)
 		"ai_tool":
 			var tp: Variant = data.get("params")
 			if tp is Dictionary:
@@ -757,6 +770,20 @@ func _on_chat_image_picked(img: Image) -> void:
 
 func _on_editor_cancelled() -> void:
 	_end_edit()  # 取消 = 放弃这张图，不影响输入框与已附图
+
+## 编辑器「自动夹取」：把标注框换算成中心后下发 auto_grasp，板端自己完成夹取（不调云端 AI）。
+## 框选产物是**左上角+宽高**，板端要的是**中心**（见 grasp.h / track.h），故此处换算。
+func _on_editor_grasp_requested(ann: Dictionary) -> void:
+	if ann.is_empty():
+		_chat_panel.chat("提示", "请先拖出一个方框框住目标，再点「自动夹取」")
+		return
+	var w: float = float(ann.get("w", 0.0))
+	var h: float = float(ann.get("h", 0.0))
+	var cx: float = float(ann.get("x", 0.0)) + w * 0.5
+	var cy: float = float(ann.get("y", 0.0)) + h * 0.5
+	_end_edit()
+	if not DeviceConn.send_command(CP.auto_grasp(cx, cy, w, h)):
+		_chat_panel.chat("提示", "自动夹取未发送（当前离线）")
 
 ## 聊天区「图传」旁路请求（/stream 由 ChatPanel 解析后交给 Main 统一起停 UDP 接收）。
 func _on_chat_stream_requested(on: bool) -> void:
