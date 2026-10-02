@@ -409,6 +409,8 @@ static void send_move(const JsonObjectConst& p) {
   if (fabsf(st) > 0.001f) {
     float s = st; if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
     set_steer_pwm((int16_t)(STEER_CENTER + s * 30.0f));
+  } else {
+    set_steer_pwm(STEER_CENTER);   // 直行时回正：上一次带转向的 move 若不回正, 之后所有 move 都在画弧
   }
   s_spin = 0;  // 常规行驶（move）接管后清除原地旋转
   // 带 distance_cm = 定距微操：本板无里程计，按时长近似自停。实测 actual≈v·(t−死区)+c，

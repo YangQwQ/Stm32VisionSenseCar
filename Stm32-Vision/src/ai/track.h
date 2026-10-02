@@ -53,8 +53,7 @@ Result update_from_fb(const camera_fb_t* fb, bool light = false);
 void hint_motion(float du, float dv);
 
 void  stop();                 // 取消跟踪，回 Idle
-// 跟丢后是否允许"放宽搜索窗重捕"（默认允许）。grasp 闭环里关掉：重捕是**宽搜**，抓到什么都可能
-// （夹爪/反光），用户实测"跟丢后试图找回基本都是瞎跑"，不如直接判失败。
+// 跟丢后是否允许"放宽搜索窗重捕"(默认允许)。grasp 闭环里关掉: 重捕是宽搜, 抓到什么都可能。
 void  set_reacquire(bool on);
 bool  active();               // 是否在跟（非 Idle）
 State state();
@@ -66,6 +65,7 @@ float last_scale();                      // 上次搜索胜出的倍率（诊断
 // 最近一次 update 完成时的 millis()。夹取闭环靠它判断"有没有拿到**动作之后**拍的那帧" ——
 // 位置不再由夹取循环自己抓帧（那要等相机出帧，实测每步 ~600ms），而是图传任务持续喂帧、这里读最新值。
 unsigned long last_update_ms();
+unsigned long last_capture_ms();   // 最近一次被处理帧的"拍摄时刻"（进入处理前的 millis）：夹取闭环据此要求"画面拍摄于动作结束之后"，结果到达时刻会被流水线延迟骗过
 // 最近一帧是否**被采纳**（PSR 达标）。夹取闭环必须用它判断"手上这个位置是不是新鲜的"：
 // 光看 state==Tracking 不够 —— 被拒的帧状态仍是 Tracking、位置还是上一帧的旧值（真机实测会照着旧位置决策）。
 bool last_ok();

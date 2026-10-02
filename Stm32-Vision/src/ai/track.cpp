@@ -66,6 +66,8 @@ static volatile bool s_probe_on = false;
 static float s_p0u = 0, s_p0v = 0, s_p1u = 0, s_p1v = 0;
 static volatile float s_pa0 = 0, s_pa1 = 0;
 static volatile unsigned long s_last_upd_ms = 0;   // 上次 update 完成时刻（夹取闭环判断"动作后的新位置"用）
+static volatile unsigned long s_last_cap_ms = 0;   // 上次处理的帧的拍摄时刻（update 入口 stamp）：结果到达时刻
+                                                   // 含 ~280ms 解码+搜索延迟，判"画面是否动作后拍的"得以此为准
 static volatile bool s_last_ok = false;            // 最近一帧是否被采纳（PSR 达标）
 
 // 内部：从一帧一次抽出降采样 luma 与 chroma（任一可空）。
@@ -136,6 +138,7 @@ struct Tgt {
 
 Tgt s_t;
 static bool s_reacq = true;   // 跟丢后是否允许宽搜重捕（grasp 里关掉，见 track.h）
+static int  s_scale = TRACK_SCALE;   // 本次锁定的解码抽点（seed 时按目标大小自适应，见 seed）
 // 追踪状态互斥：update/seed/stop 会改 s_t 与全局像素缓冲（s_lum/s_chr…），
 // 而 update 现在可能被控制线程（grasp/AI）与图传线程（light 刷新）并发调用 —— 必须串行。
 // light 路径用 try-lock（拿不到即跳过），控制路径阻塞取锁。
@@ -263,13 +266,28 @@ static bool magic_range(const uint8_t* chr, int gw, int gh, int ccx, int ccy, in
           if (y < miny) miny = y; if (y > maxy) maxy = y;
         }
       }
-      blog::logf(blog::AI, "[track] 魔棒 pass%d tol=%d: 框%dx%d 背景色度=%d 主体=%d/%d (%d%%)",
-                 pass, ctol, bw, bh, ref, n, area, n * 100 / area);
-      if (n >= 12 && n * 3 <= area * 2) {               // 够大、又没把整框都当主体
+      if (n == 0) {   // 这一档一个主体都没有：直接换下一档。⚠️ 不能往下走 —— ax/n 会整数除零直接崩
+        blog::logf(blog::AI, "[track] 魔棒 pass%d tol=%d: 框%dx%d 背景色度=%d 主体=0/%d (0%%)",
+                   pass, ctol, bw, bh, ref, area);
+        continue;
+      }
+      const int bw2 = maxx - minx + 1, bh2 = maxy - miny + 1;   // 主体外接框
+      const int dx2 = ax / n - bw / 2, dy2 = ay / n - bh / 2;   // 主体质心相对框中心的偏移
+      blog::logf(blog::AI, "[track] 魔棒 pass%d tol=%d: 框%dx%d 背景色度=%d 主体=%d/%d (%d%%) 外接%dx%d 偏%+d,%+d",
+                 pass, ctol, bw, bh, ref, n, area, n * 100 / area, bw2, bh2, dx2, dy2);
+      // 接受三条（防两类坏结果）: ① 主体**实心**——填满自家外接框的三成(防零散噪声凑出个大外接框);
+      // ② 外接框宽高≥10px(防 5px 残条); ③ 外接框宽高≥原框一半 且 质心偏移≤1/4框(防中心跑偏)。
+      // 都不满足就沿用种子的框。
+      const bool big_enough = (n * 10 >= bw2 * bh2 * 3) && (bw2 >= 10) && (bh2 >= 10);
+      const bool shape_ok   = (bw2 * 2 >= bw) && (bh2 * 2 >= bh);
+      const bool centered   = (abs(dx2) * 4 <= bw) && (abs(dy2) * 4 <= bh);
+      if (big_enough && shape_ok && centered) {
         *ox = x0 + ax / n; *oy = y0 + ay / n;
-        *ow = maxx - minx + 1; *oh = maxy - miny + 1;
+        *ow = bw2; *oh = bh2;
         return true;
       }
+      blog::logf(blog::AI, "[track] 魔棒 pass%d tol=%d 不接受(%s%s%s), 换下一档",
+                 pass, ctol, big_enough ? "" : "主体太少", shape_ok ? "" : "只圈到一条边", centered ? "" : "质心偏太远");
     }
   }
   blog::logf(blog::AI, "[track] 魔棒: 两轮×四档阈值都没圈出合理主体, 沿用原框");
@@ -358,6 +376,15 @@ bool seed(const char* name, float cx, float cy, float w, float h) {
   s_t.su = cx; s_t.sv = cy; s_t.sw = w; s_t.sh = h;
   s_t.st = State::Locking;
   s_t.miss = 0; s_t.frames = 0; s_t.conf = 0;
+  // 解码抽点随目标大小自适应: 目标太小(远/小物件)时, 1/2 抽点下只剩十几个像素, 而 DCF 的模板/窗
+  // 有 20px 下限, 模板里大半是背景, 外观分在门槛边缘震荡, 车一动就跌破 ⇒ 降低抽点让目标够大。
+  // u/v 是归一化坐标, 抽点不影响几何; 代价是取图耗时和内存随抽点下降而增大(均走 PSRAM)。
+  {
+    const float full_px = w * 640.0f;                 // 全幅宽(VGA)下的目标边长
+    int sc = TRACK_SCALE;
+    while (sc > 0 && full_px / (float)(1 << sc) < 24.0f) sc--;
+    s_scale = sc;
+  }
   if (lk) xSemaphoreGive(s_mtx);
   cam::set_track_mode(true);   // 进入跟踪：相机切 RGB565（幂等，已切则不重开；阻塞百 ms 级）
   return true;
@@ -371,14 +398,15 @@ static Result update_locked(const camera_fb_t* fb, bool light) {
   // light（手机标记刷新）：只在已锁定的 Tracking 态补一刀位置；锁定/丢失态一律不碰（避免干扰控制线程）。
   if (light && s_t.st != State::Tracking) return r;
   if (!fb || !fb->buf || fb->width <= 0 || fb->height <= 0) return r;
+  s_last_cap_ms = millis();   // 喂帧侧 grab_fresh 排空后才取，此刻 ≈ 拍摄时刻（后面的解码+搜索延迟不算在内）
 
-  const int gw = ((int)fb->width + (1 << TRACK_SCALE) - 1) >> TRACK_SCALE;
-  const int gh = ((int)fb->height + (1 << TRACK_SCALE) - 1) >> TRACK_SCALE;
+  const int gw = ((int)fb->width + (1 << s_scale) - 1) >> s_scale;
+  const int gh = ((int)fb->height + (1 << s_scale) - 1) >> s_scale;
   if (!ensure(&s_lum, &s_lum_cap, (size_t)gw * gh)) return r;
   if (!ensure(&s_chr, &s_chr_cap, (size_t)gw * gh)) return r;
   int dw = 0, dh = 0;
-  if (decode_dual(fb, TRACK_SCALE, s_lum, s_chr, (int)s_lum_cap, &dw, &dh) != 0) {
-    blog::logf(blog::AI, "[track] 取图失败(scale=%d %ux%u)", TRACK_SCALE,
+  if (decode_dual(fb, s_scale, s_lum, s_chr, (int)s_lum_cap, &dw, &dh) != 0) {
+    blog::logf(blog::AI, "[track] 取图失败(scale=%d %ux%u)", s_scale,
                (unsigned)fb->width, (unsigned)fb->height);
     return r;
   }
@@ -567,6 +595,7 @@ void stop() {
   s_t.miss = 0;
   s_t.name[0] = 0;
   s_last_ok = false;
+  s_scale = TRACK_SCALE;        // 抽点回默认（下次 seed 按目标大小重选）
   dcf::stop();                  // 相关滤波状态一并清掉（下次要重新 start）
   if (lk) xSemaphoreGive(s_mtx);
   cam::set_track_mode(false);   // 跟踪结束：相机切回 JPEG 常态（幂等；未在跟踪时为空操作）
@@ -607,6 +636,7 @@ void  probe_off() { s_probe_on = false; }
 float probe_appear0() { return s_pa0; }
 float probe_appear1() { return s_pa1; }
 unsigned long last_update_ms() { return s_last_upd_ms; }
+unsigned long last_capture_ms() { return s_last_cap_ms; }
 bool last_ok() { return s_last_ok; }
 void search_radius(float* ru, float* rv) { dcf::radius_norm(ru, rv); }
 

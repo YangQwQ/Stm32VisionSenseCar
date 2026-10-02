@@ -347,8 +347,9 @@ void cmd::handle(const char* json, bool has_frames, ReplyFn reply, void* reply_c
 
   if (!strcmp(type, "mem")) {
     // 内部堆 region 全览（诊断，只读）：回各池空闲/最大连续块/谷底，判 DMA 池是被固定大块占住
-    // 还是运行时 churn 碎出的（前者 largest 恒小、后者谷底为 0）。串口再留一份 region 映射明细。
-    heap_caps_dump_all();
+    // 还是运行时 churn 碎出的（前者 largest 恒小、后者谷底为 0）。
+    // ⚠️ 这里只回 JSON 摘要，别调 heap_caps_dump_all() —— 它在 httpd 任务里走 UART 打印会空指针崩溃
+    // （实测：发 {"type":"mem"} 即触发中断狗复位）。
     auto fill = [](JsonObject o, uint32_t caps) {
       multi_heap_info_t hi;
       heap_caps_get_info(&hi, caps);

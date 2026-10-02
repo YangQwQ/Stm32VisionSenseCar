@@ -157,11 +157,20 @@ inline constexpr float GRASP_U_TOL_NEAR  = 0.030f;  // v = GRASP_V_TGT 时用（
 inline constexpr float GRASP_U_TOL_V_FAR = 0.30f;   // 从 v=此值开始线性收紧（≈距离 45~50cm）
 inline constexpr float GRASP_U_TOL_AIM   = 0.60f;   // "居中优先"：先朝 容差×此系数 收，连续没进展再退到整容差
 inline constexpr float GRASP_V_TOL     = 0.035f;
+inline constexpr float GRASP_CLOSE_U_MAX = 0.06f; // "爪口区就地合爪"的 u 前提：最后有效位置离 u_aim 的最大距离。
+                                                  // 合爪只发生在 u_aim 附近，u 还差得远时合的是空气
+                                                  // （实测 u 差 0.30 也去合，空合还上报"可能已夹取"）。
+inline constexpr float GRASP_CLOSE_V_LO = 0.08f;  // 爪口区下界 = V_TGT - 此值：跟踪丢失/冻结时最后位置在此带内才就地合爪
+inline constexpr float GRASP_CLOSE_V_HI = 0.06f;  // 上界 = V_TGT + 此值：比可夹点还近这么多仍没合的，说明是逼近过头，
+                                                  // 合爪只会把方块推走（实测 v=0.67 拿 stale 位置空合）—— 该退开重来
 inline constexpr int   GRASP_ALIGN_N   = 2;       // 连续 N 帧都对准才允许继续（防读到跳变帧就合爪）
 inline constexpr int   GRASP_MAX_ITERS = 60;      // 迭代上限
 inline constexpr int   GRASP_TIME_MS   = 60000;   // 总时限（防卡死）
-inline constexpr float GRASP_SPIN_GAIN = 150.0f;  // u 误差 → 转角(度)。实测每度只搬动 ~0.0055u（逼近时更大），
-                                                  // 原 45 太保守：|eu|=0.17 只敢转 7°，要 30° 才搬完，于是"小角度慢悠悠"。
+inline constexpr float GRASP_DU_PER_DEG_GEO = 0.0154f; // 转角 → Δu 的**几何**角速率 = 1/水平FOV（≈65°）。
+                                                       // 目标随车旋转的 bearing 变化 ≈ 转角本身（远处实测
+                                                       // 13°→Δu 0.2）。旧 GAIN=150 隐含 0.0067u/°，远场差
+                                                       // 2~3 倍 ⇒ 一步甩出搜索窗。近场因相机不在旋转轴上
+                                                       // 响应变小，步长偏小多转几脚即可，安全方向。
 inline constexpr int   GRASP_SPIN_MIN_DEG = 5;    // 最小转角。原 8°：u 分辨率 0.045 ÷ 0.0055u/° ≈ 8°，
                                                   // 4° 只搬 0.02u、低于噪声，故曾抬到 8。但 8° ⇒ 一步 0.044u，
                                                   // 是"近处容差(±0.018)的两倍多" ⇒ 永远迈不进容差带，车一步跨过
@@ -180,6 +189,9 @@ inline constexpr int   GRASP_MOVE_MAX_BACK_CM = 3; // 单步**后退**上限。�
                                                    // ② u 怎么转都不变（多半锁到随车一起动的东西）时先退一步换个视角。
                                                    //（旧策略是"只前进绝不后退"，用户实测"太近也不好"。）
 inline constexpr int   GRASP_BACK_MAX_N = 4;       // 一次夹取里最多后退几步，防前后来回蹭
+inline constexpr float GRASP_STEER_ALIGN = 0.5f;   // 近距纠 u 用的转向量(move 的 steering, 0~1):
+                                                   // 进了可夹纵深就**不再原地旋转**——目标离旋转轴近,
+                                                   // 原地转每转一下就把方块扫开(实测); 改用带转向的前进画弧对准。
 // 单步动作幅度还受**追踪器当前搜索半径**限制：预期位移(du/deg×角度、dv/cm×cm) ≤ 半径×此系数。
 // 半径本身受"输入窗归一化"约束（=2.5×目标尺寸），不能独立设定 —— 用这个系数把"动作幅度"压进半径里，
 // 就等价于"半径由预期位移决定"（真机实测：目标一大、s_obj 估计偏小，半径跟着小，25° 一步就出窗）。
@@ -191,18 +203,15 @@ inline constexpr float GRASP_RADIUS_FRAC = 0.70f;
 // 阈值（旧 GRASP_STUCK_EPS=0.005，已被抖动/透视漂移骗过）稳得多。
 inline constexpr int   GRASP_STUCK_N   = 3;
 inline constexpr float GRASP_THROTTLE  = 0.25f;
-inline constexpr int   GRASP_LOST_MAX  = 3;       // 连续跟丢帧数上限 → 中止。grasp 里**关掉了追踪器的重捕**
-                                                  // （track::set_reacquire(false)）：跟丢就是跟丢 —— 宽搜重捕抓到
-                                                  // 什么都可能（夹爪/反光），用户实测"跟丢后试图找回基本是瞎跑"，
-                                                  // 不如退一步、老实报失败。故只需覆盖重捕前的 TRACK_LOST_N 帧。
-inline constexpr int   GRASP_SPIN_BUDGET = 10;    // 对准阶段累计旋转上限：转这么多次 u 还收不进来 ⇒ 锁的不是
-                                                  // 能靠转身对准的东西（或目标贴在旋转轴上），别再无止境瞎转。
+inline constexpr int   GRASP_LOST_MAX  = 3;       // 连续跟丢帧数上限 → 中止(grasp 里已关追踪器重捕, 跟丢即失败)
+inline constexpr int   GRASP_SPIN_BUDGET = 10;    // 对准阶段累计旋转上限: 转身对不动就中止
 inline constexpr int   GRASP_NO_PROG_N = 5;       // 连续 N 次动作后误差没变小 → 中止（目标不随动作移动=多半跟错了/被遮挡）
 inline constexpr int   GRASP_MOTION_START_MS = 250; // 动作后等它真正起转的上限（act 后一拍才置位，直接 settle 会抓到动作前的旧画面）
 // 位置由**图传任务连续喂帧**（app_httpd 的 track_feed），夹取循环不再自己抓帧。动作完成后要等
-// "一帧动作之后的画面被处理过"再读位置 —— 比动作停止时刻再晚 MARGIN 一点，确保那帧是停稳后拍的；
-// WAIT 是上限（相机 ~5fps，别死等）。
-inline constexpr int   GRASP_FRESH_MARGIN_MS = 300;
+// "一帧**拍摄于**动作停稳之后"的画面被处理过再读位置 —— 判据用帧的**拍摄时刻**（track::last_capture_ms），
+// 不是结果到达时刻（那含 ~280ms 解码+搜索延迟，会放过"结果新、画面旧"的帧）。MARGIN 只需覆盖停稳后的
+// 机械抖动；WAIT 是上限（相机 ~5fps，别死等）。
+inline constexpr int   GRASP_FRESH_MARGIN_MS = 120;
 inline constexpr int   GRASP_FRESH_WAIT_MS   = 1600;
 
 // ---- 屏幕→地面 单应标定点（改镜头/移相机后重测此表） ----

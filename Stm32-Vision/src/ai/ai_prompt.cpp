@@ -82,7 +82,7 @@ const char* ai::tools_schema() {
 "light":{"type":"object","description":"车灯: front=前灯(白色, 照亮/判断颜色用它) / back=尾灯(红) / vibe=氛围灯(深蓝)","properties":{"kind":{"type":"string","enum":["front","back","vibe"]},"on":{"type":"boolean","description":"开启/关闭"}}}
 }}}},
 
-{"type":"function","function":{"name":"grasp","description":"自动夹取: 板端自己完成整套对准目标到grasp的流程\n当目标在画面上清晰可见、未被遮挡、不在画面边缘、也没小到看不清时直接用本工具并把当前看到的目标画面坐标填进去即可, 框的大小要能完整框住目标; 使用后需要手动检查是否真的成功夹住, 没夹住可以再试一次, 两次都没抓住就自己操作吧","parameters":{"type":"object","properties":{
+{"type":"function","function":{"name":"grasp","description":"自动夹取: 板端自己完成降臂、旋转对准、逼近、合爪整套流程\n只要目标在画面里认得出, 填当前看到的画面坐标直接用即可, 逼近由工具自己完成, 目标还远时也照常调它, 自己先一路开近反而容易把目标顶出画面; 框要贴着目标边缘, 框得太大模板里大半是地面, 跟踪会发飘\n回执带结果和原因, 如「跟丢目标」「目标不随动作移动」(多半锁错东西); 失败可以再试一次, 回执说「已夹取」或方块已在爪里就是夹住了, 两次都不成就如实说没夹住","parameters":{"type":"object","properties":{
 "grasp":{"type":"object","description":"目标在画面上的位置(归一化 0~1)","properties":{
 "x":{"type":"number","description":"目标画面横坐标 0~1"},
 "y":{"type":"number","description":"目标画面纵坐标 0~1"},
@@ -94,7 +94,7 @@ const char* ai::tools_schema() {
 
 {"type":"function","function":{"name":"mem","description":"物体记忆与小车姿态: 记录(observe)/删除(delete)目标位置, 或查询当前记忆。\n只给 observe/delete 时按给的内容返回执行回执; 什么都不给(或空对象)=查询小车全局坐标/朝向与已记忆的物体坐标。","parameters":{"type":"object","properties":{
 "observe":{"type":"array","description":"记录/刷新物体记忆的位置(即查询结果里的物体位置), 查看新画面且目标可见时可用用于检查位置, 在检查物体记忆前建议先observe; px/py 统一填物体底部中心在最新画面上的屏幕坐标(放大图也照常填 0~1, 程序会自动换算); 目标有明显边界时另给 w/h=目标画面框宽/高(0~1), 程序会据此锁定该目标并本地逐帧跟踪(比只给点稳, 之后靠近/对准不必每步重报); 请勿对着用户参考图或回看的旧图使用observe","items":{"type":"object","properties":{"name":{"type":"string"},"px":{"type":"number"},"py":{"type":"number"},"w":{"type":"number","description":"目标画面框宽 0~1(可省略)"},"h":{"type":"number","description":"目标画面框高 0~1(可省略)"}}}},
-"delete":{"type":"array","description":"删除已记忆的物体; 发现重复记录同一物体或记忆已无用时可用","items":{"type":"string"}}
+"delete":{"type":"array","description":"删除已记忆的物体; 发现重复记录同一物体、记忆已无用、或本地跟踪锁错了东西时可用, 删掉正在跟踪的目标会顺带停止跟踪","items":{"type":"string"}}
 }}}},
 
 {"type":"function","function":{"name":"task","description":"任务记账(纯记录, 不含动作): note 记要点 / todo 重写任务列表 / done 标记已完成项。","parameters":{"type":"object","properties":{

@@ -141,11 +141,8 @@ void unlock_jpeg_dec() {
   if (s_jpeg_dec_mtx) xSemaphoreGive(s_jpeg_dec_mtx);
 }
 
-// 一律不用 psram 直写。三条实证：① RGB565 整帧 614KB 直写 PSRAM 会丢字节 → 画面被横切成条；
-// ② SVGA 高清（约 130KB）同样丢字节 → 一帧都拿不到；③ psram 与非 psram 来回切之后，VGA 那路会
-// "init 报 OK 却再也取不到帧"（zoomshot 后再抓帧必失败，连自愈重开都救不回）。
-// 代价是常驻一块约 16KB 的内部 DMA（dma_buffer）—— 门槛已按 CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384
-// 压低，内部池够用；换来"相机任何时刻都能重开、画面干净"。参数保留仅为调用点可读。
+// psram 直写实测丢字节(RGB565 整帧 / SVGA 高清), 且与非 psram 来回切后 VGA 会取不到帧, 故恒关;
+// 代价是常驻约 16KB 内部 DMA(门槛已按 CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384 压低)。参数保留仅为调用点可读。
 static void set_psram_for(pixformat_t) {
   esp_camera_set_psram_mode(false);
 }
@@ -200,10 +197,8 @@ bool init() {
   return true;
 }
 
-// 相机自愈：连续抓帧失败到阈值就自动重开一次（deinit→init，用当前 framesize/格式）。只在 grab() 里调
-// （已持 s_cam_mtx，不自取锁）。实测有两类"init 报 OK 却不出帧"：① 高清往返之后 VGA 十几秒不出帧
-// （此时内存很宽裕，不是分配问题）；② 切格式失败把相机留在 deinit 态。两条都靠这里兜住 ——
-// 否则 AI 每次被卡都要干等（一次失败先在驱动里等 4s 超时），任务看起来就是"每轮几十秒"。
+// 连续抓帧失败到阈值就重开相机(deinit→init, 当前格式)。兜两类"init 报 OK 却不出帧":
+// 高清往返后 VGA 十几秒不出帧、切格式失败留在 deinit 态。只在 grab() 里调(已持 s_cam_mtx)。
 static void reinit_current() {
   // 非 psram 的 VGA JPEG 要一块 16KB 连续内部 DMA：先等池子够，免得重开失败又转一圈
   wait_dma_block(16384, 1500);
@@ -404,8 +399,7 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
                  (int)e_de, (int)e_lo_init, esp_err_to_name(e_lo_init));
       if (e_lo_init != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
       apply_sensor_calib();
-      // ★ init 报 OK ≠ 出帧：实测高清往返后 VGA 会"静默"十几秒（内存很宽裕，纯驱动/传感器侧）。
-      //   必须**取到帧**才算恢复，否则重开一次 —— 比干等那十几秒快。顺便喂 AWB/AEC 收敛。
+      // 高清往返后 VGA 会先静默十几秒(init 报 OK 但不出帧): 取到帧才算恢复, 否则重开。顺便喂 AWB/AEC 收敛。
       int got = 0;
       for (int i = 0; i < HI_WARM_RECONFIG; i++) {
         camera_fb_t* w = esp_camera_fb_get();

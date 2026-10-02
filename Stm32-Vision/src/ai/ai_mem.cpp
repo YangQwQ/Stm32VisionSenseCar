@@ -1,5 +1,6 @@
 #include "src/ai/ai_mem.h"
 #include "src/ai/ai_client.h"      // ai::logf(AI 调试日志)
+#include "src/ai/track.h"          // track::stop(删掉正在跟踪的目标时顺带释放)
 #include "src/ai/ground_proj.h"    // ground::screen_to_world(mem_observe_xy 用)
 #include "src/core/board_log.h"    // blog 类别(AI 日志经 ai::logf 内部使用)
 #include "src/core/utf8.h"         // utf8_clamp_tail(唯一还在用的地方: mem_feed 头一句被截断时)
@@ -251,6 +252,9 @@ bool mem_forget(const char* name) {
     g_mem[i].gx = 0; g_mem[i].gy = 0;
     any = true;
   }
+  // 删掉的目标若正是本地跟踪在锁的, 顺带释放跟踪: 否则这个锁会一直挂着 —— 相机停在 RGB565 跟踪
+  // 模式(手机画面一直是跟踪标记)、且每轮 AI 还会把它的位置自动 observe 进记忆, 锁错了就反复灌错值。
+  if (any && track::active() && name_same_obj(track::target_name(), name)) track::stop();
   return any;
 }
 
