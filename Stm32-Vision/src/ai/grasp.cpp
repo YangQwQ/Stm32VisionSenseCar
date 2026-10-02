@@ -23,6 +23,7 @@ namespace grasp {
 static SemaphoreHandle_t s_mtx = nullptr;
 static SemaphoreHandle_t s_notify = nullptr;
 static TaskHandle_t s_task = nullptr;
+static char s_last_result[64] = "尚未夹取过";   // 上次结果文本（AI 侧回执用，见 grasp.h）
 
 struct Req { bool pending; float x, y, w, h; char name[40]; };
 static Req s_req;
@@ -100,8 +101,12 @@ static R run(unsigned long gen) {
   ai::settle_arm(gen, 1500);
   if (gen != ai::generation()) return R::Interrupted;
 
+  // 本次夹取期间**禁用追踪器的宽搜重捕**：跟丢就是跟丢，别去瞎找回（见 track.h）。
+  track::set_reacquire(false);
+
   const uint32_t t0 = millis();
   int lost = 0, no_prog = 0;
+  int spins = 0;               // 自上次"已对准"以来累计转了几次（超 GRASP_SPIN_BUDGET = u 收不进来，别再瞎转）
   int aligned_n = 0;            // 连续"已对准"的帧数（见 GRASP_ALIGN_N）
   int last_dir = 0;             // 上次转向方向（用于反向减半的阻尼）
   float last_err = -1.0f;
@@ -259,6 +264,12 @@ static R run(unsigned long gen) {
     //   切换阶段时重置计数（新旧指标不可比）
     const bool aligning = !force_grasp && (fabsf(eu_aim) > u_tol_use);
     if (aligning) {
+      // ★ 旋转预算：转这么多次 u 还收不进来 ⇒ 锁的不是能靠转身对准的东西（或目标贴在旋转轴上）。
+      //   旧路径会一直转下去（真机实测转 38 次、车头 -54°→-114° 而 u 恒定 0.512），用户要的是"老实失败"。
+      if (++spins > GRASP_SPIN_BUDGET) {
+        ai::logf("[grasp] 已转 %d 次 u 仍对不上(%.3f) ⇒ 不再瞎转, 中止", spins, (double)fabsf(eu_aim));
+        return R::NoProgress;
+      }
       // 对准阶段：只跟踪 u 误差
       const float eu_err = fabsf(eu_aim);
       if (last_eu_err >= 0.0f && eu_err > last_eu_err - 0.003f) {
@@ -392,6 +403,7 @@ static R run(unsigned long gen) {
     }
     // 连续 GRASP_ALIGN_N 帧都对准才继续：单帧读数若是跳变/误匹配，会骗出"已对准"，导致在偏位合爪
     aligned_n++;
+    spins = 0;                   // 已对准 ⇒ 旋转预算清零（下一个"对准→前进"循环重新计）
     if (aligned_n < GRASP_ALIGN_N) {
       ai::logf("[grasp] 对准待确认(%d/%d 帧)", aligned_n, GRASP_ALIGN_N);
       continue;
@@ -525,7 +537,9 @@ static void worker(void*) {
                       res == R::Interrupted ? "被打断" : res == R::NoFrame ? "取帧失败" :
                       res == R::NoProgress ? "目标不随动作移动/后退超限, 中止" : "超时未到位";
     ai::logf("[grasp] 结束: %s", txt);
+    snprintf(s_last_result, sizeof(s_last_result), "%s", txt);   // 给 AI 侧当回执
     track::stop();          // 夹完/中止后不再跟踪该目标
+    track::set_reacquire(true);   // 恢复默认：AI/手机侧的单点跟踪仍允许重捕
     s_running = false;
   }
 }
@@ -570,5 +584,7 @@ bool busy() {
 }
 
 void cancel() { ai::cancel(ai::StopMode::All); }   // 代际号自增 → run 循环下一拍退出
+
+const char* last_result() { return s_last_result; }
 
 }  // namespace grasp

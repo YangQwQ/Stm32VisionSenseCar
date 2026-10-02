@@ -20,4 +20,9 @@ bool request(float x, float y, float w, float h, const char* name);
 bool busy();     // 是否有一次夹取在跑（含排队）
 void cancel();   // 中止当前夹取（内部走 ai::cancel → 代际号自增，循环下一拍即退出）
 
+// 上一次夹取的**结果文本**（给 AI 侧当回执用）。取值：
+//   "已夹取(可能)" / "确定未夹住(方块仍在地面原位)" / "跟丢目标" / "目标不随动作移动/后退超限, 中止" …
+// ⚠️ "已夹取(可能)" 只表示**没抓到"方块还在地上"的证据**，不等于一定夹住了；判定规则见 grasp.cpp 的 verify_grasp。
+const char* last_result();
+
 }  // namespace grasp

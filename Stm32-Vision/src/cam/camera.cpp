@@ -141,11 +141,31 @@ void unlock_jpeg_dec() {
   if (s_jpeg_dec_mtx) xSemaphoreGive(s_jpeg_dec_mtx);
 }
 
+// 一律不用 psram 直写。三条实证：① RGB565 整帧 614KB 直写 PSRAM 会丢字节 → 画面被横切成条；
+// ② SVGA 高清（约 130KB）同样丢字节 → 一帧都拿不到；③ psram 与非 psram 来回切之后，VGA 那路会
+// "init 报 OK 却再也取不到帧"（zoomshot 后再抓帧必失败，连自愈重开都救不回）。
+// 代价是常驻一块约 16KB 的内部 DMA（dma_buffer）—— 门槛已按 CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384
+// 压低，内部池够用；换来"相机任何时刻都能重开、画面干净"。参数保留仅为调用点可读。
+static void set_psram_for(pixformat_t) {
+  esp_camera_set_psram_mode(false);
+}
+
+// 切 RGB565 前等内部 DMA 池长出够一块连续缓冲（= 驱动的 dma_buffer；本板 CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384 ⇒ 15360）。
+// 图传刚开那几秒池子可能还没回收够，硬切会 init 失败并把相机留在 deinit 态。
+static void wait_dma_block(size_t need, int max_ms) {
+  for (int waited = 0; waited < max_ms &&
+       heap_caps_get_largest_free_block(MALLOC_CAP_DMA) < need; waited += 100) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 bool init() {
 #if defined(CAMERA_MODEL_ESP_EYE)
   pinMode(13, INPUT_PULLUP);
   pinMode(14, INPUT_PULLUP);
 #endif
+
+  set_psram_for(PIXFORMAT_JPEG);   // 常态 JPEG = psram 直写
 
   camera_config_t config = make_config(FRAMESIZE_VGA, PIXFORMAT_JPEG);
   esp_err_t err = esp_camera_init(&config);
@@ -180,6 +200,35 @@ bool init() {
   return true;
 }
 
+// 相机自愈：连续抓帧失败到阈值就自动重开一次（deinit→init，用当前 framesize/格式）。只在 grab() 里调
+// （已持 s_cam_mtx，不自取锁）。实测有两类"init 报 OK 却不出帧"：① 高清往返之后 VGA 十几秒不出帧
+// （此时内存很宽裕，不是分配问题）；② 切格式失败把相机留在 deinit 态。两条都靠这里兜住 ——
+// 否则 AI 每次被卡都要干等（一次失败先在驱动里等 4s 超时），任务看起来就是"每轮几十秒"。
+static void reinit_current() {
+  // 非 psram 的 VGA JPEG 要一块 16KB 连续内部 DMA：先等池子够，免得重开失败又转一圈
+  wait_dma_block(16384, 1500);
+  s_reconfig = true;
+  camera_config_t c = make_config(FRAMESIZE_VGA, s_vga_fmt);
+  esp_camera_return_all();
+  esp_camera_deinit();
+  set_psram_for(s_vga_fmt);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  esp_err_t e = esp_camera_init(&c);
+  if (e == ESP_OK) {
+    apply_sensor_calib();
+    for (int i = 0; i < HI_WARM_RECONFIG; i++) {   // 喂 AWB/AEC 收敛，别把偏色帧放出去
+      camera_fb_t* w = esp_camera_fb_get();
+      if (!w) break;
+      esp_camera_fb_return(w);
+    }
+  }
+  blog::logf(blog::CAM, "[cam] 连续抓帧失败 → 自愈重开: init=%d(%s)", (int)e, esp_err_to_name(e));
+  s_reconfig = false;
+}
+
+static int s_grab_fail = 0;              // 连续抓帧失败计数（自愈用）
+static const int kGrabFailReinit = 2;    // 到这个数就重开相机（一次失败已含驱动侧 4s 超时）
+
 camera_fb_t* grab() {
   if (!s_ready) return nullptr;
   // 抓帧持锁：与 request_hires / set_track_mode 的重开相机串行（见 s_cam_mtx 注释）。
@@ -206,18 +255,23 @@ camera_fb_t* grab() {
   } else {
     fb = esp_camera_fb_get();
     if (!fb) {
-      // ★ 抓帧失败时把内部/DMA 水位打出来：相机取不到帧**几乎总是内部 DMA 块被吃干**（真机实测：
-      //   卡死时 `DMA块 最低=0k`、`堆最低=7k`，重启即恢复）。这条日志能在下一次卡死时**当场点出**
-      //   是内存耗尽，而不是含糊的"相机没帧"。限频 3s，免得每帧刷屏。
+      // ★ 抓帧失败时把内部/DMA 水位打出来（限频 3s，免得每帧刷屏）。
       static uint32_t s_fail_ms = 0;
       const uint32_t now2 = (uint32_t)(esp_timer_get_time() / 1000);
       if ((uint32_t)(now2 - s_fail_ms) > 3000) {
         s_fail_ms = now2;
-        blog::logf(blog::CAM, "[cam] 抓帧失败! 内部堆=%u 最大块=%u | DMA 最大块=%u (DMA 被吃干?)",
+        blog::logf(blog::CAM, "[cam] 抓帧失败! 内部堆=%u 最大块=%u | DMA 最大块=%u",
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
       }
+      if (++s_grab_fail >= kGrabFailReinit) {
+        s_grab_fail = 0;
+        reinit_current();
+        fb = esp_camera_fb_get();     // 重开后立刻再试一次；拿不到就交给下一次调用
+      }
+    } else {
+      s_grab_fail = 0;
     }
   }
   if (s_cam_mtx) xSemaphoreGive(s_cam_mtx);
@@ -269,6 +323,8 @@ size_t latest_copy(uint8_t* out, size_t cap, uint32_t* age_ms) {
 camera_fb_t* request_hires(framesize_t hires, int* ok) {
   if (ok) *ok = 0;
   if (!s_ready || !s_cam_mtx) return nullptr;
+  // 高清段（非 psram）重开要一块 16KB 连续内部 DMA：先等池子够再取锁，别拿着相机锁干等（grab 只等 1200ms）
+  wait_dma_block(16384, 1500);
   // 带超时取锁（同 grab 的说明）：拿不到就整条失败，别把自己僵在 portMAX_DELAY 上。
   if (xSemaphoreTake(s_cam_mtx, pdMS_TO_TICKS(1500)) != pdTRUE) {
     blog::logf(blog::CAM, "[cam] request_hires 放弃: 等相机锁超时(1500ms)");
@@ -285,6 +341,9 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
   camera_config_t hc = make_config(hires, PIXFORMAT_JPEG);
   esp_camera_return_all();                // 清在途帧，避免 deinit 撞上未归还的缓冲
   esp_err_t e_de = esp_camera_deinit();
+  // 高清段走内部乒乓缓冲：psram 直写 SVGA（约 130KB/帧）和 RGB565 一样会丢字节 ⇒ 一帧都拿不到
+  // （实测 /zoomshot 必失败、且之后相机取不到帧）。
+  esp_camera_set_psram_mode(false);
   vTaskDelay(pdMS_TO_TICKS(50));          // 等 SCCB 总线释放、XCLK 停稳
   esp_err_t e_hi_init = esp_camera_init(&hc);
   blog::logf(blog::CAM, "[cam] reconfig hires: deinit=%d init=%d", (int)e_de, (int)e_hi_init);
@@ -338,23 +397,28 @@ camera_fb_t* request_hires(framesize_t hires, int* ok) {
     for (int attempt = 1; attempt <= 3; attempt++) {
       esp_camera_return_all();
       e_de = esp_camera_deinit();
+      set_psram_for(s_vga_fmt);         // 回常态格式：JPEG=psram / RGB565=内部缓冲
       vTaskDelay(pdMS_TO_TICKS(50));     // 等 SCCB 总线释放、XCLK 停稳（同高清段）
       e_lo_init = esp_camera_init(&vc);
       blog::logf(blog::CAM, "[cam] reconfig 回VGA: 第%d次 deinit=%d init=%d(%s)", attempt,
                  (int)e_de, (int)e_lo_init, esp_err_to_name(e_lo_init));
-      if (e_lo_init == ESP_OK) break;
-      vTaskDelay(pdMS_TO_TICKS(200));    // 给刚释放的内部 DMA 块回收/合并留窗口，再试
-    }
-    if (e_lo_init == ESP_OK) {
+      if (e_lo_init != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
       apply_sensor_calib();
-      // 回 VGA 同样是"重开相机"：AWB/AEC 又被重置，立即放行会让 zoom 之后的整幅帧头几帧偏绿。
-      // 同高清段一样固定取帧丢弃喂收敛，收敛后再恢复分发（仍在 s_cam_mtx 锁内，图传会再停一拍）。
+      // ★ init 报 OK ≠ 出帧：实测高清往返后 VGA 会"静默"十几秒（内存很宽裕，纯驱动/传感器侧）。
+      //   必须**取到帧**才算恢复，否则重开一次 —— 比干等那十几秒快。顺便喂 AWB/AEC 收敛。
+      int got = 0;
       for (int i = 0; i < HI_WARM_RECONFIG; i++) {
         camera_fb_t* w = esp_camera_fb_get();
         if (!w) break;
+        got++;
         esp_camera_fb_return(w);
       }
-    } else {
+      if (got > 0) break;
+      blog::logf(blog::CAM, "[cam] reconfig 回VGA: init OK 但一帧都取不到, 重开");
+      e_lo_init = ESP_FAIL;
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (e_lo_init != ESP_OK) {
       blog::logf(blog::CAM, "[cam] 回VGA 连续失败, 相机停在 deinit 态: 后续取帧会一直失败");
     }
   }
@@ -383,10 +447,12 @@ bool set_track_mode(bool on) {
   if (s_vga_fmt == want) { xSemaphoreGive(s_cam_mtx); return true; }   // 幂等：已是目标模式
   s_reconfig = true;                          // 重建窗口：grab() 暂停分发（旧缓冲悬垂）
   camera_config_t nc = make_config(FRAMESIZE_VGA, want);
+  if (on) wait_dma_block(15360, 3000);        // 切 RGB565 要连续内部 DMA，先等池子够（见 wait_dma_block）
   esp_err_t e_init = ESP_FAIL;
   for (int attempt = 1; attempt <= 3; attempt++) {
     esp_camera_return_all();
     esp_err_t e_de = esp_camera_deinit();
+    set_psram_for(want);                      // RGB565=内部缓冲 / JPEG=psram
     vTaskDelay(pdMS_TO_TICKS(50));            // 等 SCCB 总线释放、XCLK 停稳（同 request_hires）
     e_init = esp_camera_init(&nc);
     blog::logf(blog::CAM, "[cam] 切%s: 第%d次 deinit=%d init=%d(%s)",

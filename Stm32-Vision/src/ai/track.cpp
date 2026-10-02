@@ -135,6 +135,7 @@ struct Tgt {
 };
 
 Tgt s_t;
+static bool s_reacq = true;   // 跟丢后是否允许宽搜重捕（grasp 里关掉，见 track.h）
 // 追踪状态互斥：update/seed/stop 会改 s_t 与全局像素缓冲（s_lum/s_chr…），
 // 而 update 现在可能被控制线程（grasp/AI）与图传线程（light 刷新）并发调用 —— 必须串行。
 // light 路径用 try-lock（拿不到即跳过），控制路径阻塞取锁。
@@ -516,7 +517,15 @@ static Result update_locked(const camera_fb_t* fb, bool light) {
       r.ok = true;
     } else {
       s_t.miss++;
-      if (s_t.st != State::Lost && s_t.miss >= TRACK_LOST_N) {
+      if (!s_reacq && s_t.miss >= TRACK_LOST_N) {
+        // 不允许重捕：跟丢即终止，不做宽搜（grasp 闭环用 —— 宽搜抓到什么都可能，不如老实失败）
+        if (s_t.st != State::Idle) {
+          blog::logf(blog::AI, "[track] '%s' 丢失(PSR=%.1f), 已禁用重捕 → 停止跟踪", s_t.name, (double)du.psr);
+          s_t.st = State::Idle;
+          dcf::stop();
+          cam::set_track_mode(false);   // 跟踪结束：相机切回 JPEG 常态
+        }
+      } else if (s_t.st != State::Lost && s_t.miss >= TRACK_LOST_N) {
         s_t.st = State::Lost;
         blog::logf(blog::AI, "[track] '%s' 丢失(PSR=%.1f), 放宽搜索窗重捕", s_t.name, (double)du.psr);
       } else if (s_t.st == State::Lost && s_t.miss >= TRACK_LOST_N + TRACK_REACQ_MAX) {
@@ -564,6 +573,7 @@ void stop() {
 }
 
 bool active() { return s_t.st != State::Idle; }
+void set_reacquire(bool on) { s_reacq = on; }
 State state() { return s_t.st; }
 const char* target_name() { return s_t.name; }
 

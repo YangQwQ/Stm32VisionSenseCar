@@ -191,10 +191,12 @@ inline constexpr float GRASP_RADIUS_FRAC = 0.70f;
 // 阈值（旧 GRASP_STUCK_EPS=0.005，已被抖动/透视漂移骗过）稳得多。
 inline constexpr int   GRASP_STUCK_N   = 3;
 inline constexpr float GRASP_THROTTLE  = 0.25f;
-inline constexpr int   GRASP_LOST_MAX  = 12;      // 连续跟丢帧数上限 → 中止。**必须 ≥ 追踪器的重捕预算**
-                                                  // （TRACK_LOST_N 3 + TRACK_REACQ_MAX 15，最多 18 帧）才有意义：
-                                                  // 定太小会在追踪器"丢失→全图重捕"还没跑完时就放弃夹取
-                                                  // （真机实测 4 帧就中止，表现为"转一下就不动了"）。
+inline constexpr int   GRASP_LOST_MAX  = 3;       // 连续跟丢帧数上限 → 中止。grasp 里**关掉了追踪器的重捕**
+                                                  // （track::set_reacquire(false)）：跟丢就是跟丢 —— 宽搜重捕抓到
+                                                  // 什么都可能（夹爪/反光），用户实测"跟丢后试图找回基本是瞎跑"，
+                                                  // 不如退一步、老实报失败。故只需覆盖重捕前的 TRACK_LOST_N 帧。
+inline constexpr int   GRASP_SPIN_BUDGET = 10;    // 对准阶段累计旋转上限：转这么多次 u 还收不进来 ⇒ 锁的不是
+                                                  // 能靠转身对准的东西（或目标贴在旋转轴上），别再无止境瞎转。
 inline constexpr int   GRASP_NO_PROG_N = 5;       // 连续 N 次动作后误差没变小 → 中止（目标不随动作移动=多半跟错了/被遮挡）
 inline constexpr int   GRASP_MOTION_START_MS = 250; // 动作后等它真正起转的上限（act 后一拍才置位，直接 settle 会抓到动作前的旧画面）
 // 位置由**图传任务连续喂帧**（app_httpd 的 track_feed），夹取循环不再自己抓帧。动作完成后要等

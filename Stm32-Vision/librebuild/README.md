@@ -9,8 +9,8 @@
 
 ## 一、要改什么（定制配置）
 
-四处定制。**库侧**的三处已落到下面的 `configs/`（不再只是某次生成物里手改，重建不会丢）；
-**第四处是生效头文件里的缓冲区个数**，它不走库、overlay 也不覆盖，见本节末的
+五处定制。**库侧**的四处已落到下面的 `configs/`（不再只是某次生成物里手改，重建不会丢）；
+**第五处是生效头文件里的缓冲区个数**，它不走库、overlay 也不覆盖，见本节末的
 「但"缓冲区个数"不在 defconfig 里」。
 
 | 配置 | 作用 | 不做会怎样 |
@@ -19,6 +19,7 @@
 | `CONFIG_MBEDTLS_SSL_IN/OUT_CONTENT_LEN=8192`（+ `ASYMMETRIC_CONTENT_LEN=y`） | 减小握手所需的内部 RAM **连续块** | 握手失败 `-32512` / `-17040` |
 | `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` + `CACHE_TX_BUFFER_NUM=32`（**PSRAM**，静态 TX 缓冲**保持 8 不动**） | UDP 图传突发不再被 8 个静态 TX 缓冲卡死（一帧 20~29KB ≈ 15~21 个 1400B 包）；cache 队列是驱动 TX 池满时的溢出吸收路径 | `enomem ≈ 2~2.4× sendOk`，帧发不完、帧率忽高忽低、速率被拖到 MCS0 |
 | `CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768`、`TCP_WND_DEFAULT=16384` | 流模式下 40KB 级请求体 `write()` 才不超时 | 大请求体发送超时 |
+| `CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384`（默认 32768） | esp32-camera 重开相机要的那块**连续内部 DMA** = 此值/2（VGA RGB565：32768→30720，16384→15360，见 `ll_cam_calc_rgb_dma`） | 图传开着时内部池凑不出 30720 ⇒ 切跟踪失败（`init=-1`，相机留在 deinit 态）；代价是 RGB 多占 ≈16KB 内部 RAM，相当于 psram 直写省下的那块 |
 
 > ⚠️ **TX 突发该调 `CACHE` 而不是加大 `STATIC_TX`**：静态池是"上层来一帧就拷一份进去"，池满
 > 就没了；cache 队列是驱动拿不到静态缓冲时的**排队待发**路径，正是为吸收突发设计的。
@@ -203,6 +204,21 @@ uv run tools/carctl.py build --clean --flash
   时，`$T` 会变空，报 `目标 '/configs/' 不存在`（命令串被 Git Bash 先吃了一遍）。
   **两种安全写法**：① 先 `wsl` 进交互会话，在里面 `export`（变量活在 WSL 侧，本文档「二」用的就是这种）；
   ② 或用字面绝对路径。**只有"每条命令都从 Git Bash 起一次 `wsl -lc`"才不能用变量**。
+- **组件管理器会因 esp_video 的版本上界缺失而死循环**：`main/idf_component.yml` 里
+  `espressif/esp_video: ">=2.3.0"` 不设上界 ⇒ 管理器去评估新版 manifest 里那条引用了
+  `ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION`（esp_h264 的符号，S3 上不装它）的 if 规则 ⇒
+  `kconfig_ctx.missed_keys` 非空 ⇒ `prepare.py` 每轮 `sys.exit(10)`，CMake 重跑一次仍为 10 ⇒
+  `FATAL_ERROR: Missing required kconfig option after retry.`（`run-idflibs.sh` 的 3 次重试
+  每次都 `rm -rf build sdkconfig`，永远收敛不了）。`run-idflibs.sh` 已在开头把它钉到锁文件里
+  已有的 `2.4.1`（那段 sed + 校验），本工程不用 esp_video。
+- **esp32-camera 必须用含 `jpeg_buffer_size` 的版本**：`src/cam/camera.cpp` 用 `config.jpeg_buffer_size`
+  把 VGA JPEG 的 `recv_size` 抬到 256KB 防 FB-OVF。旧版没有这字段 ⇒ 草图直接编译报错
+  `'struct camera_config_t' has no member named 'jpeg_buffer_size'`；而且旧版默认
+  `recv_size = w*h/5 ≈ 60KB`，高熵 VGA 帧会溢出 → `ll_cam_stop` 冻住图传。
+  `dependencies.lock` 里钉的 `202df95d` 就是没这字段的旧提交（master 上的 `2bba0d1d` 有）。
+  注意 `main/idf_component.yml` 里这条依赖写的是 `version: "master"`（上游写法）——**别改成 commit**，
+  组件管理器解析不了会报 `Failed to resolve component 'espressif__esp32-camera' ... unknown name`。
+  `run-idflibs.sh` 检测到拉下来的组件缺 `jpeg_buffer_size` 时，会删掉 lock 里这一条强制重解析。
 - **升级内核版本后**：`ESP32_CORE_VER`（`overlay-libs.sh` 的目标版本，默认 `3.3.11`）、
   `patches/` 的两份变体补丁、以及 `Stm32-Vision/CLAUDE.md` §构建要点 的 fqbn 都要同步核对。
 
@@ -210,7 +226,7 @@ uv run tools/carctl.py build --clean --flash
 
 | 路径 | 说明 |
 |---|---|
-| `run-idflibs.sh` | 【WSL】编库入口（重试 3 次 + 校验 8192）；路径未配置则开头提问 |
+| `run-idflibs.sh` | 【WSL】编库入口（钉 esp_video 版本 + 重试 3 次 + 校验 8192）；路径未配置则开头提问 |
 | `overlay-libs.sh` | 【WSL】产物覆盖到 Arduino15（含套嵌清理 + 统计 + `Y/n` 确认）；路径未配置则开头提问 |
 | `configs/defconfig.common` | 定制：mbedTLS + lwIP TCP 缓冲 |
 | `configs/defconfig.esp32s3` | 定制：WiFi TX 缓冲池（带源码级注释） |

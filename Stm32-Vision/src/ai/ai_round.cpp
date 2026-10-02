@@ -11,6 +11,7 @@
 #include "src/ai/magnify.h"     // 放大镜: 把目标附近裁出来放大重编码(AI 的"凑近看")
 #include "src/ai/ground_proj.h" // 屏幕→地面单应(观测解算)
 #include "src/ai/track.h"       // 本地目标追踪: 标注/observe 标范围 → 逐轮刷新目标坐标
+#include "src/ai/grasp.h"       // 本地自动夹取: grasp 工具启动它、并把板端结果回给模型
 #include "Calibration.h"        // TRACK_SEED_H 等追踪常量
 #include "src/net/config.h"
 #include "src/net/wifi_net.h"
@@ -1417,6 +1418,51 @@ static void do_car(RoundCtx& c, const char* args, char* out, size_t cap) {
   land_car(c, cmdD, out, cap);
 }
 
+// grasp: **板端本地自动夹取**（自己 arm low → 转正对准 → 边前进边对准 → 合爪）。
+// 跑完把板端的结果回给模型（"已夹取(可能)" / "确定未夹住(方块仍在地面原位)" / 中止原因）—— 这是模型
+// 判断"要不要再来一次"的依据，比让它自己看图猜可靠。
+// ⚠️ 它会自己降爪并开动轮子，所以**同一条消息里先跑过 car 动作**时就别夹了：车一挪，模型手上那批
+//    画面坐标就过时了，按它去 seed 会种到旧位置（与 approach+合爪 的拦截同一个道理）。
+#define AI_GRASP_WAIT_MS 50000   // 等本地闭环跑完的上限（夹取自身 60s 超时，这里兜底别把整轮卡死）
+static void do_grasp(RoundCtx& c, const char* args, char* out, size_t cap) {
+  JsonDocument cmdD(&g_js_alloc);
+  char verr[128];
+  const char* e = ai::validate_cmd(args[0] ? args : "{}", cmdD, verr, sizeof(verr));
+  if (e) {
+    snprintf(out, cap, "[执行结果] | [grasp] 参数未通过校验(%s) —— 本次未执行, 请修正后重新调用 grasp。", e);
+    return;
+  }
+  JsonObjectConst g = cmdD["grasp"].is<JsonObject>() ? cmdD["grasp"].as<JsonObjectConst>() : JsonObjectConst();
+  const float x = g["x"] | -1.0f, y = g["y"] | -1.0f;
+  const float w = g["w"] | 0.0f, h = g["h"] | 0.0f;
+  const char* nm = g["name"] | "";
+  if (!(x >= 0.0f && x <= 1.0f) || !(y >= 0.0f && y <= 1.0f)) {
+    snprintf(out, cap, "[执行结果] | [grasp] 缺 x/y = 目标画面位置(0~1)，本次未执行。");
+    return;
+  }
+  if (c.acted) {
+    snprintf(out, cap, "[执行结果] | [grasp] 本回合已执行过 car 动作(车可能已移动) ⇒ 你手上的画面坐标已过时，"
+                       "本次未夹取; 请**下一条消息单独调用 grasp**。");
+    return;
+  }
+  if (!grasp::request(x, y, w, h, nm)) {
+    snprintf(out, cap, "[执行结果] | [grasp] 启动失败: 已有一次夹取在跑, 或参数非法。");
+    return;
+  }
+  c.acted = true;
+  c.last_act_ms = (unsigned long)(esp_timer_get_time() / 1000);
+  ai::logf("[ai] grasp 启动: 画面(%.3f,%.3f) 框(%.3f,%.3f) 名字「%s」",
+           (double)x, (double)y, (double)w, (double)h, nm[0] ? nm : "目标");
+  const uint32_t t0 = millis();
+  while (grasp::busy() && (uint32_t)(millis() - t0) < AI_GRASP_WAIT_MS) {
+    if (c.t.generation != ai::generation()) { c.interrupted = true; c.done = true; break; }   // 被接管
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  const bool still = grasp::busy();
+  snprintf(out, cap, "[执行结果] | [grasp] %s%s", grasp::last_result(),
+           still ? "（仍在跑、已到等待上限；结果以板端日志为准）" : "");
+}
+
 // 渲染「当前可查看图片」一行: 实景帧环 + (本回合新拍、即将进环的 cur) + 用户参考图池, 按编号升序去重。
 // 每条都标来源(实景/参考图), 别让 AI 拿参考图编号当实景或反之。已有实拍画面时参考图只列一张
 // (取编号最大的那张当代表), 免得刷屏; 其余参考图编号仍见首轮提示, 要看得凭编号 look。
@@ -1614,7 +1660,7 @@ static void dispatch_calls(RoundCtx& c) {
     const char* rc = c.calls["reasoning"] | "";
     if (rc[0]) tn->reasoning = ps_dup(rc);
   } else ai::logf("[ai] 历史环不可用, 本回合的调用不记入历史");
-  static const char* kOrder[] = { "mem", "task", "say", "car", "look", "compact", "goal" };
+  static const char* kOrder[] = { "mem", "task", "say", "car", "grasp", "look", "compact", "goal" };
   const int kOrderN = (int)(sizeof(kOrder) / sizeof(kOrder[0]));
   const int cap_n = n < 16 ? n : 16;   // 超出部分直接不记(assistant 只列我们记下的, 不会产生孤儿)
   bool handled[16] = {false};
@@ -1639,6 +1685,7 @@ static void dispatch_calls(RoundCtx& c) {
     else if (!strcmp(kOrder[oi], "task")) do_task(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "say"))  do_say(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "car"))  do_car(c, args, res, sizeof(res));
+    else if (!strcmp(kOrder[oi], "grasp")) do_grasp(c, args, res, sizeof(res));
     else if (is_look)                     ok = do_look(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "compact")) do_compact(c, args, res, sizeof(res));
     else                                  do_goal(c, args, res, sizeof(res));

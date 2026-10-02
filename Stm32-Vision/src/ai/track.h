@@ -53,6 +53,9 @@ Result update_from_fb(const camera_fb_t* fb, bool light = false);
 void hint_motion(float du, float dv);
 
 void  stop();                 // 取消跟踪，回 Idle
+// 跟丢后是否允许"放宽搜索窗重捕"（默认允许）。grasp 闭环里关掉：重捕是**宽搜**，抓到什么都可能
+// （夹爪/反光），用户实测"跟丢后试图找回基本都是瞎跑"，不如直接判失败。
+void  set_reacquire(bool on);
 bool  active();               // 是否在跟（非 Idle）
 State state();
 const char* target_name();

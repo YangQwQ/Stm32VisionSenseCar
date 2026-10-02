@@ -62,13 +62,16 @@ static void sanitize_ws_utf8(char* s) {
 
 void ai::enqueue_result(const char* text, cmd::ReplyFn fn, void* ctx) {
   size_t n = strlen(text);
-  ResultItem* it = (ResultItem*)malloc(sizeof(ResultItem) + n + 1);   // 结构体 + 文本一块分配
+  // ★ 走 PSRAM：这条**每轮 AI 要发十几~几十条**、文本变长（任务面板/记忆快照可到 KB 级），队列深 8
+  //   ⇒ 未消费前多个大块并存。落在默认(内部)堆时，实测把内部 DMA 池的"最大连续块"打到 1KB 上下
+  //   （AI 任务期间 `[水位] 内部DMA块告急` 几乎持续不断）。消费方 ai::update 用同一个 heap_caps_free。
+  ResultItem* it = (ResultItem*)heap_caps_malloc(sizeof(ResultItem) + n + 1, MALLOC_CAP_SPIRAM);
   if (!it) return;
   memcpy(it->text, text, n + 1);
   sanitize_ws_utf8(it->text);   // 统一 WS 文本消毒: 任何 enqueue 出口都走这里, 防 1007 断链
   it->fn = fn;
   it->fd = ctx ? *(int*)ctx : -1;   // WS: 本次结果的 fd 拷贝(loop 发送后随整块释放); BLE 无 fd
-  if (xQueueSend(g_result_q, &it, 0) != pdTRUE) free(it);
+  if (xQueueSend(g_result_q, &it, 0) != pdTRUE) heap_caps_free(it);
 }
 
 // AI 调试日志: 经 board_log(blog::AI)统一输出; /log ai(或 all)时转发手机。
@@ -91,7 +94,7 @@ void ai::update() {
   while (g_result_q && xQueueReceive(g_result_q, &it, 0) == pdTRUE) {
     if (it) {
       if (it->fn) it->fn(it->fd >= 0 ? (void*)&it->fd : nullptr, it->text);
-      free(it);
+      heap_caps_free(it);   // 配 enqueue_result 的 MALLOC_CAP_SPIRAM
     }
   }
 }

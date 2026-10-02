@@ -35,6 +35,22 @@ cd "$LIB_BUILDER" || { echo "LIB_BUILDER_NOT_FOUND: $LIB_BUILDER"; exit 2; }
 command -v idf.py >/dev/null || { echo "IDF_NOT_FOUND: $IDF_PATH（检查 esp-idf 路径，或先手动 . export.sh）"; exit 2; }
 echo "idf.py: $(command -v idf.py)"
 
+# esp_video 的 version 不设上界时，组件管理器会去评估新版 manifest：其中 esp_h264 依赖规则的 if 用了
+# ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION（该符号由 esp_h264 定义，S3 上不装它）⇒ kconfig missed_keys
+# 非空 ⇒ 管理器永远 sys.exit(10) ⇒ CMake 重跑一次后 FATAL。钉到锁文件里已有的版本即收敛（本工程不用 esp_video）。
+sed -i 's@version: ">=2.3.0"@version: "2.4.1"@' main/idf_component.yml
+grep -A1 'espressif/esp_video:' main/idf_component.yml | grep -q '2\.4\.1' \
+  || echo "⚠️ esp_video 版本没钉住（main/idf_component.yml 变了？），组件管理器可能 exit(10) 死循环" >&2
+
+# esp32-camera 必须是**含 jpeg_buffer_size 的版本**：camera.cpp 用它把 VGA JPEG 的 recv_size 抬到 256KB
+# 防 FB-OVF（旧版没这字段 ⇒ 草图编译报错；且默认 recv_size = w*h/5 ≈ 60KB，高熵帧溢出会 ll_cam_stop 停图传）。
+# dependencies.lock 里可能钉着那个旧提交，检测到就删掉这条，让管理器按 manifest 的 master 重新解析。
+CAM_HDR=managed_components/espressif__esp32-camera/driver/include/esp_camera.h
+if [ -f "$CAM_HDR" ] && ! grep -q jpeg_buffer_size "$CAM_HDR"; then
+  echo "== esp32-camera 是缺 jpeg_buffer_size 的旧版：删 lock 条目强制重解析 =="
+  L=$(mktemp) && awk '/^  espressif\/esp32-camera:$/{s=1;next} s&&/^  [^ ]/{s=0} !s' dependencies.lock > "$L" && mv "$L" dependencies.lock
+fi
+
 CFG="configs/defconfig.common;configs/defconfig.esp32s3;configs/defconfig.debug_default;configs/defconfig.qio;configs/defconfig.80m;configs/defconfig.qio_ram"
 LOG="${IDFLIBS_LOG:-$LIB_BUILDER/idflibs.log}"
 O="$LIB_BUILDER/out/tools/esp32-arduino-libs/esp32s3"

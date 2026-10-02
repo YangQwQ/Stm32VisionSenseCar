@@ -71,9 +71,10 @@ const char* parse_finish(JsonVariantConst root, JsonDocument& dst, char* err, si
 const char* parse_note(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);      // t_tasks.cpp
 const char* parse_todo(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);      // t_tasks.cpp
 const char* parse_done(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);      // t_tasks.cpp
+const char* parse_grasp(JsonVariantConst root, JsonDocument& dst, char* err, size_t cap);     // t_grasp.cpp
 
 // registry.cpp 里的有序表。顺序只决定**校验顺序**(validate_cmd 按表序逐项跑 parse), 落地顺序在 ai_round.cpp
-// 的 dispatch_calls(mem → task → say → car → look → compact → goal)与 land_car。返回数组首址并写回项数。
+// 的 dispatch_calls(mem → task → say → car → grasp → look → compact → goal)与 land_car。返回数组首址并写回项数。
 // 数组是文件级 `const` 常量, 只在启动时构造一次, 无动态分配。
 const ToolSpec* tools(int* n);
 

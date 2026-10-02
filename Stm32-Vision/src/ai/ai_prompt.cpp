@@ -76,11 +76,21 @@ const char* ai::tools_schema() {
 "value":{"type":"integer","description":"forward/backward: 移动距离, 单位cm(可省略, 默认8); spin_left/spin_right: 旋转角度(可省略, 默认30)"},
 "target":{"type":"string","description":"approach: 记忆里的目标名(可省略, 缺省=最近目标)"}}},
 
-"arm":{"type":"object","description":"机械臂/夹爪, 每次只用一个 type(x/h 仅 pose 有效, 其它时候不写):\nlow 夹爪降到贴地准备位; 目标在画面上不处于[左指]上方时需先后退, 避免压住目标\nraise 抬到高位; 压住物体或物体可能在车头近处时用, 找回目标后应先旋转对准\ngrasp 合爪并抬臂; 夹取目标时用, 之后记得 look 确认是否夹住\nclip / release 合上 / 松开夹爪; 需要手动控制夹取流程时用\nfold 收臂折叠, 避免遮挡; 疑似压住物体或机械臂遮挡视野时用\npose 移动夹爪到指定坐标","properties":{
+"arm":{"type":"object","description":"机械臂/夹爪, 每次只用一个 type(x/h 仅 pose 有效, 其它时候不写):\nlow 夹爪降到贴地准备位; 目标在画面上不处于[左指]上方时需先后退, 避免压住目标\nraise 抬到高位; 压住物体或物体可能在车头近处时用, 找回目标后应先旋转对准\ngrasp 合爪并抬臂(车不动, 只合爪; 目标已对准且够近时用); **只是合爪**, 整套「逼近+对准+夹取」请优先用 grasp 工具\nclip / release 合上 / 松开夹爪; 需要手动控制夹取流程时用\nfold 收臂折叠, 避免遮挡; 疑似压住物体或机械臂遮挡视野时用\npose 移动夹爪到指定坐标","properties":{
 "type":{"type":"string","enum":["low","raise","fold","grasp","clip","release","pose"]},"x":{"type":"number","description":"pose: 轴前 cm(7~13)(可省略)"},"h":{"type":"number","description":"pose: 离地 cm(1~12)(可省略)"}}},
 
 "light":{"type":"object","description":"车灯: front=前灯(白色, 照亮/判断颜色用它) / back=尾灯(红) / vibe=氛围灯(深蓝)","properties":{"kind":{"type":"string","enum":["front","back","vibe"]},"on":{"type":"boolean","description":"开启/关闭"}}}
 }}}},
+
+{"type":"function","function":{"name":"grasp","description":"自动夹取: 板端自己完成整套对准目标到grasp的流程\n当目标在画面上清晰可见、未被遮挡、不在画面边缘、也没小到看不清时直接用本工具并把当前看到的目标画面坐标填进去即可, 框的大小要能完整框住目标; 使用后需要手动检查是否真的成功夹住, 没夹住可以再试一次, 两次都没抓住就自己操作吧","parameters":{"type":"object","properties":{
+"grasp":{"type":"object","description":"目标在画面上的位置(归一化 0~1)","properties":{
+"x":{"type":"number","description":"目标画面横坐标 0~1"},
+"y":{"type":"number","description":"目标画面纵坐标 0~1"},
+"w":{"type":"number","description":"目标画面框宽 0~1(可省略, 有则锁得更稳)"},
+"h":{"type":"number","description":"目标画面框高 0~1(可省略)"},
+"name":{"type":"string","description":"目标名(可省略)"}}
+}}}}},
+
 
 {"type":"function","function":{"name":"mem","description":"物体记忆与小车姿态: 记录(observe)/删除(delete)目标位置, 或查询当前记忆。\n只给 observe/delete 时按给的内容返回执行回执; 什么都不给(或空对象)=查询小车全局坐标/朝向与已记忆的物体坐标。","parameters":{"type":"object","properties":{
 "observe":{"type":"array","description":"记录/刷新物体记忆的位置(即查询结果里的物体位置), 查看新画面且目标可见时可用用于检查位置, 在检查物体记忆前建议先observe; px/py 统一填物体底部中心在最新画面上的屏幕坐标(放大图也照常填 0~1, 程序会自动换算); 目标有明显边界时另给 w/h=目标画面框宽/高(0~1), 程序会据此锁定该目标并本地逐帧跟踪(比只给点稳, 之后靠近/对准不必每步重报); 请勿对着用户参考图或回看的旧图使用observe","items":{"type":"object","properties":{"name":{"type":"string"},"px":{"type":"number"},"py":{"type":"number"},"w":{"type":"number","description":"目标画面框宽 0~1(可省略)"},"h":{"type":"number","description":"目标画面框高 0~1(可省略)"}}}},
