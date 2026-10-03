@@ -205,6 +205,8 @@ inline constexpr float GRASP_RADIUS_FRAC = 0.70f;
 // 阈值（旧 GRASP_STUCK_EPS=0.005，已被抖动/透视漂移骗过）稳得多。
 inline constexpr int   GRASP_STUCK_N   = 2;       // 3→2(用户实测)：锁到夹爪/反光后连续 2 次后退 v 纹丝不动
                                                   // 就该中止，退满 3~4 次是在拿车头反复怼目标
+inline constexpr int   PLACE_BACK_CM   = 5;        // arm place_done(放置收尾一段式)的后退距离：松爪→抬臂→
+                                                   // 后退此距离→收臂折叠，一个动作完成最终放置
 inline constexpr float GRASP_THROTTLE  = 0.25f;
 inline constexpr int   GRASP_LOST_MAX  = 3;       // 连续跟丢帧数上限 → 中止(grasp 里已关追踪器重捕, 跟丢即失败)
 inline constexpr int   GRASP_SPIN_BUDGET = 10;    // 对准阶段累计旋转上限: 转身对不动就中止

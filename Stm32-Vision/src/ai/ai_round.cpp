@@ -1052,19 +1052,20 @@ static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap)
   const char* nav_tgt = mv["target"] | "";
   // ---- approach(轮子自动靠近): 本地巡航, 不点云端。与合爪同一回合时拦下(导航后车动、坐标过时) ----
   if (is_ap) {
-    // ⚠️ 只拦 approach+**合爪**(grasp/clip): approach 会挪车、坐标过时, 拿旧坐标合爪必空夹。
+    // ⚠️ 只拦 approach+**合爪/放收**(grasp/clip/place_done): approach 会挪车、坐标过时, 拿旧坐标合爪必空夹;
+    //   place_done 内含 release, 靠近途中就松爪会把东西掉在半路, 同样必须拦。
     //   approach+**降爪**(arm low)不拦 —— 降爪落到标定固定点, 坐标过时只影响之后的横向微调。
-    if (has_arm && (!strcmp(act, "grasp") || !strcmp(act, "clip"))) {
+    if (has_arm && (!strcmp(act, "grasp") || !strcmp(act, "clip") || !strcmp(act, "place_done"))) {
       JsonDocument cmdF(&g_js_alloc);
       cmdF["type"] = "approach";
-      cmdF["reason"] = "approach 与合爪不能同一条 car 里: 先只 approach, 下一回合 look 看画面确认对齐后再夹; arm low/fold/raise/light 可与 approach 并行";
+      cmdF["reason"] = "approach 与合爪/放置收尾不能同一条 car 里: 先只 approach, 下一回合 look 看画面确认对齐后再夹; arm low/fold/raise/light 可与 approach 并行";
       cmdF["params"]["target"] = nav_tgt[0] ? nav_tgt : "(最近)";
       String fb = build_feedback(c.t.id, cmdF);
       ai::enqueue_result(fb.c_str(), c.t.fn, c.t.ctx);
       snprintf(emv, sizeof(emv), "approach %s", nav_tgt[0] ? nav_tgt : "(最近)");
-      snprintf(out, out_cap, "[执行结果] | [move] %s 被拦: 与合爪(grasp/clip)不能同一条 car 里 —— 先只做 approach, "
+      snprintf(out, out_cap, "[执行结果] | [move] %s 被拦: 与合爪/放置收尾(grasp/clip/place_done)不能同一条 car 里 —— 先只做 approach, "
                              "下一回合 look 看画面确认是否对准, 再决定夹取。本轮其它动作也未执行。", emv);
-      notify_tool(c, "car approach 被拦(与合爪冲突, 本轮未执行)");
+      notify_tool(c, "car approach 被拦(与合爪/放置收尾冲突, 本轮未执行)");
       return;
     }
     float tx, ty;
@@ -1120,6 +1121,23 @@ static void land_car(RoundCtx& c, JsonDocument& cmdD, char* out, size_t out_cap)
     if (!strcmp(act, "low"))        ok = exec::arm_low();
     else if (!strcmp(act, "raise")) ok = exec::arm_raise();
     else if (!strcmp(act, "pose"))  ok = exec::arm_pose(acv["x"] | 0.0f, acv["h"] | 0.0f);
+    else if (!strcmp(act, "place_done")) {
+      // 放置收尾一段式: 松爪(放下方块) → 抬臂 → 后退(车离开放置点) → 收臂折叠。
+      // ⚠️ 抬臂只能走 exec::arm_raise() 专用入口 —— exec 的通用 arm act 分发里没有 "raise" 分支,
+      //    拼 {"act":"raise"} 会静默空转(实测: 臂没抬就后退, 蹭着盒子走)。同理通用路径的 act 串
+      //    写的是距离单位的 distance_cm, 写成 float 会被 is_continuous 当成持续动作一路倒车不停。
+      JsonDocument a(&g_js_alloc);
+      a["act"] = "release"; ok = exec::act("arm", a.as<JsonObjectConst>());
+      ai::settle_arm(c.t.generation, 1200);
+      ok &= exec::arm_raise();                       // 抬到高位, 让方块脱离盒口
+      ai::settle_arm(c.t.generation, 1500);          // S 形缓动, 默认 700ms 上限会半途就开始退
+      JsonDocument m(&g_js_alloc);
+      m["type"] = "throttle"; m["throttle"] = -0.25f; m["steering"] = 0.0f; m["distance_cm"] = PLACE_BACK_CM;
+      ok &= exec::act("move", m.as<JsonObjectConst>());
+      ai::settle_wheels(c.t.generation, 3000);       // 等退完再收臂
+      a["act"] = "fold";    ok &= exec::act("arm", a.as<JsonObjectConst>());
+      ai::settle_arm(c.t.generation, 1500);
+    }
     else {   // grasp/clip/release/fold
       JsonDocument a(&g_js_alloc); a["act"] = act;
       ok = exec::act("arm", a.as<JsonObjectConst>());

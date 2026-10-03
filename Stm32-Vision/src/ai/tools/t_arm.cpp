@@ -10,12 +10,12 @@ const char* ai::parse_arm(JsonVariantConst root, JsonDocument& dst, char* err, s
   if (!root["arm"].is<JsonObjectConst>()) return nullptr;
   JsonObjectConst src = root["arm"].as<JsonObjectConst>();
   const char* act = src["type"] | "";
-  static const char* acts[] = {"low", "raise", "fold", "grasp", "clip", "release", "pose", nullptr};
+  static const char* acts[] = {"low", "raise", "fold", "grasp", "clip", "release", "pose", "place_done", nullptr};
   bool good = false;
   for (int i = 0; acts[i]; i++) if (!strcmp(act, acts[i])) { good = true; break; }
   if (!good) {
     snprintf(err, cap,
-             "AI arm 非法 type=%s(可用 low/raise/fold/grasp/clip/release/pose; 持续抬落/伸缩已移除)", act);
+             "AI arm 非法 type=%s(可用 low/raise/fold/grasp/clip/release/pose/place_done; 持续抬落/伸缩已移除)", act);
     return err;
   }
   JsonObject a = dst["arm"].to<JsonObject>();

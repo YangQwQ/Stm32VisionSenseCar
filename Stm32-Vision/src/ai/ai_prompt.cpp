@@ -76,21 +76,21 @@ const char* ai::tools_schema() {
 "value":{"type":"integer","description":"forward/backward: 移动距离, 单位cm(可省略, 默认8); spin_left/spin_right: 旋转角度(可省略, 默认30)"},
 "target":{"type":"string","description":"approach: 记忆里的目标名(可省略, 缺省=最近目标)"}}},
 
-"arm":{"type":"object","description":"机械臂/夹爪, 每次只用一个 type(x/h 仅 pose 有效, 其它时候不写):\nlow 夹爪降到贴地准备位; 目标在画面上不处于[左指]上方时需先后退, 避免压住目标\nraise 抬到高位; 压住物体或物体可能在车头近处时用, 找回目标后应先旋转对准\ngrasp 合爪并抬臂(车不动, 只合爪; 目标已对准且够近时用); **只是合爪**, 整套「逼近+对准+夹取」请优先用 grasp 工具\nclip / release 合上 / 松开夹爪; 需要手动控制夹取流程时用\nfold 收臂折叠, 避免遮挡; 疑似压住物体或机械臂遮挡视野时用\npose 移动夹爪到指定坐标","properties":{
-"type":{"type":"string","enum":["low","raise","fold","grasp","clip","release","pose"]},"x":{"type":"number","description":"pose: 轴前 cm(7~13)(可省略)"},"h":{"type":"number","description":"pose: 离地 cm(1~12)(可省略)"}}},
+"arm":{"type":"object","description":"机械臂/夹爪, 每次只用一个 type(x/h 仅 pose 有效, 其它时候不写):\nlow 夹爪降到贴地准备位; 目标在画面上不处于[左指]上方时需先后退, 避免压住目标\nraise 抬到高位; 压住物体或物体可能在车头近处时用, 找回目标后应先旋转对准\ngrasp 合爪并抬臂(车不动, 只合爪; 目标已对准且够近时用); 只是合爪, 整套「逼近+对准+夹取」请优先用 auto_grasp 工具\nclip / release 合上 / 松开夹爪; 需要手动控制夹取流程时用\nplace_done 放置收尾一段式: 松爪→抬臂→后退离开放置点→收臂折叠, 一个调用完成最终放置, 需要放置物体时使用, 不必再自己后退和抬臂收臂\nfold 收臂折叠, 避免遮挡; 疑似压住物体或机械臂遮挡视野时用\npose 移动夹爪到指定坐标","properties":{
+"type":{"type":"string","enum":["low","raise","fold","grasp","clip","release","pose","place_done"]},"x":{"type":"number","description":"pose: 轴前 cm(7~13)(可省略)"},"h":{"type":"number","description":"pose: 离地 cm(1~12)(可省略)"}}},
 
 "light":{"type":"object","description":"车灯: front=前灯(白色, 照亮/判断颜色用它) / back=尾灯(红) / vibe=氛围灯(深蓝)","properties":{"kind":{"type":"string","enum":["front","back","vibe"]},"on":{"type":"boolean","description":"开启/关闭"}}}
 }}}},
 
-{"type":"function","function":{"name":"auto_grasp","description":"自动夹取: 板端自己完成降臂、旋转对准、逼近、合爪整套流程\n只要目标在画面里认得出, 填当前看到的画面坐标直接用即可, 逼近由工具自己完成, 目标还远时也照常调它, 自己先一路开近反而容易把目标顶出画面; 框要贴着目标边缘, 但是需要能够完全包住目标; 如果提示区域太素无法跟踪, 可以先approach靠近到能看得更清楚的位置; 如果\n回执带结果和原因, 如「跟丢目标」「目标不随动作移动」(多半锁错东西); 失败可以再试一次, 回执说「已夹取」或方块已在爪里就是夹住了, 两次都不成就如实说没夹住; 仅在夹取物体时使用, 靠近某个位置请用approach","parameters":{"type":"object","properties":{
-"x":{"type":"number","description":"目标画面横坐标 0~1"},
-"y":{"type":"number","description":"目标画面纵坐标 0~1"},
-"w":{"type":"number","description":"目标画面框宽 0~1(可省略, 有则锁得更稳)"},
-"h":{"type":"number","description":"目标画面框高 0~1(可省略)"},
+{"type":"function","function":{"name":"auto_grasp","description":"自动夹取: 板端自己完成降臂、旋转对准、逼近、合爪整套流程\n目标需要在画面里清晰可见未被遮挡, 如果被夹爪等部分遮挡可先适当后撤; 画框要能够完全包住目标并且不会把夹爪或机械臂结构也框入范围, 同时尽可能小, 控制在0.125宽度以内, 避免使其跟踪到错误目标; 如果提示区域太素无法跟踪, 可以先approach靠近到能看得更清楚的位置; 如果\n回执带结果和原因, 但是提示可能夹住时还是需要你自行确认情况; 仅在夹取物体时使用, 靠近某个位置请用approach","parameters":{"type":"object","properties":{
+"x":{"type":"number","description":"目标中心在画面上的px坐标 0~1"},
+"y":{"type":"number","description":"目标中心在画面上的py坐标 0~1"},
+"w":{"type":"number","description":"目标画面框宽 0~1"},
+"h":{"type":"number","description":"目标画面框高 0~1"},
 "name":{"type":"string","description":"目标名(可省略)"}}
 }}},
 
-{"type":"function","function":{"name":"mem","description":"物体记忆与小车姿态: 记录(observe)/删除(delete)目标位置, 或查询当前记忆。\n只给 observe/delete 时按给的内容返回执行回执; 什么都不给(或空对象)=查询小车全局坐标/朝向与已记忆的物体坐标。","parameters":{"type":"object","properties":{
+{"type":"function","function":{"name":"mem","description":"物体记忆与小车姿态: 记录(observe)/删除(delete)目标位置, 或查询当前记忆。\n只给 observe/delete 时按给的内容返回执行回执; 什么都不给(或空对象)=查询小车朝向与已记忆的物体坐标, 寻找或确认先前记录过的物体的方位时使用","parameters":{"type":"object","properties":{
 "observe":{"type":"array","description":"记录/刷新物体记忆的位置(即查询结果里的物体位置), 查看新画面且目标可见时可用用于检查位置, 在检查物体记忆前建议先observe; px/py 统一填物体底部中心在最新画面上的屏幕坐标(放大图也照常填 0~1, 程序会自动换算); 请勿对着用户参考图或回看的旧图使用observe","items":{"type":"object","properties":{"name":{"type":"string"},"px":{"type":"number"},"py":{"type":"number"}}}},
 "delete":{"type":"array","description":"删除已记忆的物体; 发现重复记录同一物体、记忆已无用、或本地跟踪锁错了东西时可用, 删掉正在跟踪的目标会顺带停止跟踪","items":{"type":"string"}}
 }}}},
@@ -111,7 +111,7 @@ const char* ai::tools_schema() {
 "image":{"type":"array","description":"回看先前给过的画面(含用户发送的参考图), 填编号数组","items":{"type":"integer"}}
 }}}},
 
-{"type":"function","function":{"name":"compact","description":"压缩历史上下文: 对话轮数变多时(状态块会提醒)用一段摘要概括此前进展; 调用后更早的对话被清空, 只留这条摘要开始的后续部分。目标/任务列表/任务笔记/物体记忆/车位姿都不受影响, 但可回看的旧画面(含用户参考图)会一并清空, 要看东西需重新 look","parameters":{"type":"object","properties":{
+{"type":"function","function":{"name":"compact","description":"压缩历史上下文: 对话轮数变多时(状态块会提醒)用一段摘要总结此前进展; 调用后更早的对话被清空, 只留这条摘要开始的后续部分。目标/任务列表/任务笔记/物体记忆/车位姿都不受影响, 但可回看的旧画面(含用户参考图)会一并清空, 要看东西需重新 look","parameters":{"type":"object","properties":{
 "summary":{"type":"string","description":"用中文写给之后的自己看: 摘要只写已确认事实、后续步骤、需要注意的事或总结出的经验, 不写未证实的猜测; 清空后你只能靠这段文字回忆之前做过什么"}},
 "required":["summary"]}}},
 
@@ -177,7 +177,7 @@ static constexpr char kSysSrc[] = R"PROMPT(
 
 # 画面相关定义及可见内容
 	- 屏幕坐标系: 描述物体在画面上的位置时使用。(px, py)为基于画面的归一化坐标, 左上(0,0), 右下(1,1)。小车朝向在[画面上]表现为从(0.625,1)朝向(0.375,0), 画面中心点约小车正前14cm
-	- 车头坐标系: 以车头为原点, 单位为cm的小车局部坐标系。车正前为x轴正向, 车正右为y轴正向, h 为离地高度。系统表示物体记忆坐标用(x,y), 表示夹爪位置用(x,h), 但是表示小车位置和角度时以任务初始位置为原点, 如果发生碰撞或无效旋转等可能误差极大
+	- 车头坐标系: 以车头为原点, 单位为cm的小车局部坐标系。车正前为x轴正向, 车正右为y轴正向, h 为离地高度。系统表示物体记忆坐标用(x,y), 表示夹爪位置用(x,h)
 	- 旋转时画面大致以底部中心为圆心旋转, 车及机械臂的部分保持不动, 可以借此判断旋转是否会撞到物体, 物体在[左指]左侧时左转对准, 处于右侧时右转对准
 	- 画面上总是可见夹爪左指, 夹爪左前端向左上伸出的黑色细棍的平直段为[左指], 长约2.5cm, 在画面上可视为以其左上角为顶点的0.03x0.06的矩形(尺寸已根据画面归一化), 强调[左指]时, 只考虑其与物体在画面上的上下左右关系, 不考虑其朝向
 	- 机械臂和夹爪部分只存在黑色及纸质的暗黄色部分, 以及一些银白色的螺丝, 不存在其它颜色, 除此之外, 车体上的左右各有一个带有紫色标签的部分, 其余你看到的颜色都不来自小车和机械臂
@@ -207,6 +207,7 @@ static constexpr char kSysSrc[] = R"PROMPT(
 				- default: 可能为 偏左/偏右/过近 , 需要先对准
 
 # 行为建议
+	- 夹爪高度低于5cm时, 如果应该固定不动的东西, 如放置点一直跟随移动, 需要注意抬臂并绕开
 	- look的使用时机:
 		+ 在 grasp或者clip之前先检查物体是否在合适的位置, 同时夹取后也可以方便对比前后帧确认是否夹住, 其它单步动作通常情况下无需带上上一帧
 		+ 在观察完一次画面后, 下次查看可以在一系列动作结束后, 比如执行完 前进, 右转, 降臂 后再带上先前帧确认当前位置
@@ -214,6 +215,7 @@ static constexpr char kSysSrc[] = R"PROMPT(
 		+ 如果机械臂高度较高造成遮挡可以先arm low或fold, 如果arm low之后物体被遮挡, 此时可能距离太近, 建议适当后退
 		+ 可原地旋转搜索目标, 每步旋转不超过60度以免错过, 期间可以用observe标注一些开阔地带的位置, 旋转一周后仍未发现目标可前往开阔地带重新搜索
 	- 需要夹取物体时:
+		+ 优先使用auto_grasp夹取物体, 手动对准并不可靠
 		+ 如果夹爪高度大于2且[左指]正下方无其它物体, 那么先arm low一次到位方便对准和避免遮挡(不要分多次逐步降臂)
 		+ 如果上一轮执行了后退, 那么本轮应当旋转对准而不是重新前进, 重新前进不能帮助你对准
 		+ 微调对准先用比较接近的角度, 如果过头再逐轮砍半角度反向转
