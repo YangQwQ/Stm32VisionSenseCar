@@ -32,7 +32,8 @@ func set_active(on: bool) -> void:
 		_snap_disp()  # 重新显示时直接落位，不补间
 	queue_redraw()
 
-## 应用一份板端快照（params:{objs:[{name,r,f,stale}], car:{x,y,hd}}）。整份替换物体表。
+## 应用一份板端快照（params:{objs:[{name,r,f,stale}], hd:车头朝向}）。整份替换物体表。
+## 车自身的全局 x/y 板端已不再上报（里程会漂，喂给 AI 反而误导），这里也用不到。
 func apply(params: Variant) -> void:
 	if not (params is Dictionary):
 		return

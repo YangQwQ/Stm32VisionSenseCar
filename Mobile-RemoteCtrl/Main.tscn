@@ -2145,7 +2145,7 @@ text = "云端 AI"
 custom_minimum_size = Vector2(0, 80)
 layout_mode = 2
 theme_override_font_sizes/font_size = 42
-placeholder_text = "AI 接口 URL (如 https://api.xxx.com/v1)"
+placeholder_text = "AI 接口 URL (如 https://api.xxx.com/v1，模型名自动获取)"
 
 [node name="Key" type="LineEdit" parent="PopupWindow/VBox/TabContainer/WifiCfg" unique_id=1423959171]
 custom_minimum_size = Vector2(0, 80)
@@ -2154,11 +2154,15 @@ theme_override_font_sizes/font_size = 42
 placeholder_text = "API Key"
 secret = true
 
-[node name="Model" type="LineEdit" parent="PopupWindow/VBox/TabContainer/WifiCfg" unique_id=749644005]
+[node name="Model" type="OptionButton" parent="PopupWindow/VBox/TabContainer/WifiCfg" unique_id=749644005]
 custom_minimum_size = Vector2(0, 80)
 layout_mode = 2
 theme_override_font_sizes/font_size = 42
-placeholder_text = "模型名"
+
+[node name="ModelHttp" type="HTTPRequest" parent="PopupWindow" unique_id=1748392011]
+
+[node name="ModelFetchTimer" type="Timer" parent="PopupWindow" unique_id=1748392012]
+one_shot = true
 
 [node name="Message" type="Label" parent="PopupWindow/VBox/TabContainer" unique_id=479078159]
 visible = false
@@ -2209,3 +2213,6 @@ text = "连接"
 [connection signal="visibility_changed" from="PopupWindow" to="." method="_sync_modal_dim"]
 [connection signal="pressed" from="PopupWindow/VBox/Btns/Cancel" to="PopupWindow" method="_on_cancel_pressed"]
 [connection signal="pressed" from="PopupWindow/VBox/Btns/Confirm" to="PopupWindow" method="_on_confirm_pressed"]
+[connection signal="text_changed" from="PopupWindow/VBox/TabContainer/WifiCfg/Url" to="PopupWindow" method="_on_ai_endpoint_changed"]
+[connection signal="text_changed" from="PopupWindow/VBox/TabContainer/WifiCfg/Key" to="PopupWindow" method="_on_ai_endpoint_changed"]
+[connection signal="item_selected" from="PopupWindow/VBox/TabContainer/WifiCfg/Model" to="PopupWindow" method="_on_model_selected"]
