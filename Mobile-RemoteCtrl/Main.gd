@@ -688,6 +688,12 @@ func _on_stream_toggled(on: bool) -> void:
 ## st=idle / 无坐标：跟踪已停，清掉十字；novid=1：跟踪期板端不推视频，显"标尺网格 + 跟踪点"占位。
 func _apply_track(data: Dictionary) -> void:
 	var st_t := str(data.get("st", ""))
+	if st_t == "seed":
+		# auto_grasp 播种前板端报来 AI 标的框：此刻视频还在推(消息不带 novid)，画框即可，
+		# 跟踪点/网格一概不动。框会自行过期或被随后的跟踪消息顶掉。
+		_video.call("set_seed_box", float(data.get("bx", 0.0)), float(data.get("by", 0.0)),
+			float(data.get("bw", 0.0)), float(data.get("bh", 0.0)))
+		return
 	_video.call("set_track_novid", bool(data.get("novid", false)))
 	if st_t == "idle" or not data.has("u"):
 		_video.call("clear_track")

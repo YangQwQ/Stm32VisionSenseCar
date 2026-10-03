@@ -661,6 +661,27 @@ float probe_appear0() { return s_pa0; }
 float probe_appear1() { return s_pa1; }
 unsigned long last_update_ms() { return s_last_upd_ms; }
 unsigned long last_capture_ms() { return s_last_cap_ms; }
+
+// 种子框(AI 标的位置): auto_grasp 播种前登记, 供 app_httpd 周期上报 —— 让手机在切跟踪画面**之前**
+// 的最后一帧上把框画出来, 人能看见 AI 到底标到了哪(标歪/标大时一眼看出, 不必等夹空)。
+static float s_seed[4] = { 0, 0, 0, 0 };
+static uint32_t s_seed_ms = 0;
+
+void set_seed_box(float u, float v, float w, float h) {
+  s_seed[0] = u; s_seed[1] = v; s_seed[2] = w; s_seed[3] = h;
+  s_seed_ms = (uint32_t)(esp_timer_get_time() / 1000);
+  blog::logf(blog::AI, "[track] AI 标框 (%.3f,%.3f) %.3fx%.3f → 手机将在切跟踪画面前画出", (double)u, (double)v, (double)w, (double)h);
+}
+
+bool seed_box(float* u, float* v, float* w, float* h) {
+  const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+  if (s_seed_ms == 0 || (uint32_t)(now - s_seed_ms) > 4000) return false;   // 覆盖松爪+降臂+播种重初始化整个准备期
+  if (u) *u = s_seed[0];
+  if (v) *v = s_seed[1];
+  if (w) *w = s_seed[2];
+  if (h) *h = s_seed[3];
+  return true;
+}
 bool last_ok() { return s_last_ok; }
 void search_radius(float* ru, float* rv) { dcf::radius_norm(ru, rv); }
 

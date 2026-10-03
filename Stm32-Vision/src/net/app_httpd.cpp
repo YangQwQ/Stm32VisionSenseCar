@@ -553,6 +553,22 @@ static void maybe_send_track_pos(void)
     static uint32_t s_last_ms = 0;
     static bool s_sent_active = false;
     const bool act = track::active();
+    // auto_grasp 播种前: 把 AI 标的框报出去。此时**视频还在推**(所以不带 novid), 手机在切换跟踪画面
+    // 前的最后一帧上把它画出来 —— 标歪/标大时一眼看得见, 不必等夹空才知道。4s 内有效。
+    if (!act) {
+        float su = 0, sv = 0, sw = 0, sh = 0;
+        if (track::seed_box(&su, &sv, &sw, &sh)) {
+            const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+            if ((uint32_t)(now - s_last_ms) < 100) return;
+            char sbuf[128];
+            snprintf(sbuf, sizeof(sbuf),
+                     "{\"type\":\"track\",\"st\":\"seed\",\"bx\":%.4f,\"by\":%.4f,\"bw\":%.4f,\"bh\":%.4f}",
+                     (double)su, (double)sv, (double)sw, (double)sh);
+            ws_send_text_to_ws_clients(sbuf);
+            s_last_ms = now;
+            return;
+        }
+    }
     if (act) {
         const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if ((uint32_t)(now - s_last_ms) < 100) return;

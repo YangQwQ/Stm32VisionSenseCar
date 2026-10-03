@@ -689,6 +689,9 @@ static void worker(void*) {
     const unsigned long gen = ai::generation();
     ai::logf("[grasp] 开始: 目标「%s」画面(%.3f,%.3f) 框(%.3f,%.3f)",
              r.name, (double)r.x, (double)r.y, (double)r.w, (double)r.h);
+    // 先把 AI 标的框报给手机(切跟踪画面**之前**就在实时画面上画出来): 登记放在松爪/降臂之前,
+    // 这样整个准备过程(约 3s, 视频仍在推)黄框一直挂着, 而不是只剩播种前那一秒 —— 太短会看漏。
+    track::set_seed_box(r.x, r.y, r.w, r.h);
     // ① 机械臂先到位（松爪 + 降臂）**再**锁定目标：track 的模板取自"当前画面"，先锁定后降臂的话,
     //    降臂把夹爪带进画面、场景一变，模板立刻过期 ⇒ u/v 漂移、外观崩（实测）。
     { JsonDocument p(&g_js_alloc); p["act"] = "release"; exec::act("arm", p.as<JsonObjectConst>()); }

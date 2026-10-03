@@ -54,6 +54,10 @@ void hint_motion(float du, float dv);
 // 同 hint_motion，但之后两帧用**宽窗多尺度**（重捕那套窗/门）：给"预期会有大位移"的动作后用
 // （如超近距离的后退，1cm 的画面位移就能超出正常窗）。窗心仍在 hint 位置 —— 是预期位移补偿，非丢后重捕。
 void hint_wide(float du, float dv);
+// auto_grasp 起跟**之前**登记 AI 标的那个框：由 app_httpd 的周期上报捎给手机，在切换跟踪画面前的
+// 最后一帧上画出来（那几帧视频还在推，所以不带 novid）。有效期 4s，跟丢/切回常态自然消失。
+void set_seed_box(float u, float v, float w, float h);
+bool seed_box(float* u, float* v, float* w, float* h);   // 有未过期的种子框则 true
 
 void  stop();                 // 取消跟踪，回 Idle
 // 跟丢后是否允许"放宽搜索窗重捕"(默认允许)。grasp 闭环里关掉: 重捕是宽搜, 抓到什么都可能。

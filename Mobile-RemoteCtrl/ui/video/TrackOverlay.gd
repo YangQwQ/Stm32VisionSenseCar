@@ -11,11 +11,68 @@ var target_conf := 0.0
 var target_st := ""
 
 func set_target(u: float, v: float, conf: float, state: String) -> void:
+	clear_seed_box()
 	target_u = u
 	target_v = v
 	target_conf = conf
 	target_st = state
 	queue_redraw()
+
+## auto_grasp 播种前登记的"AI 标的框"：切跟踪画面**之前**的那一帧上画个黄框，人能直接看出
+## AI 标到了哪(标歪/框太大时不必等夹空才发现)。2.5s 自过期，跟踪点来了也让位。
+var seed_u := -1.0
+var seed_v := -1.0
+var seed_w := 0.0
+var seed_h := 0.0
+var seed_until := 0
+
+func set_seed_box(u: float, v: float, w: float, h: float) -> void:
+	seed_u = u
+	seed_v = v
+	seed_w = w
+	seed_h = h
+	seed_until = Time.get_ticks_msec() + 2500
+	queue_redraw()
+
+func clear_seed_box() -> void:
+	seed_u = -1.0
+	queue_redraw()
+
+## 画 AI 的标框。内容矩形(KEEP_ASPECT_CENTERED)自己算一遍 —— 此刻可能还没有跟踪点。
+func _draw_seed_box() -> void:
+	if seed_u < 0.0 or _feed == null:
+		return
+	if Time.get_ticks_msec() > seed_until:
+		seed_u = -1.0
+		return
+	var fsz := size
+	if fsz.x <= 0.0 or fsz.y <= 0.0:
+		return
+	var ar_tex := 4.0 / 3.0
+	var tex: Texture2D = _feed.texture
+	if tex != null and tex.get_width() > 0 and tex.get_height() > 0:
+		ar_tex = float(tex.get_width()) / float(tex.get_height())
+	var ar_box := fsz.x / fsz.y
+	var cw := fsz.x
+	var ch := fsz.y
+	if ar_tex > ar_box:
+		ch = fsz.x / ar_tex
+	else:
+		cw = fsz.y * ar_tex
+	var rect := Rect2((fsz - Vector2(cw, ch)) / 2.0, Vector2(cw, ch))
+	# 板端给的是目标中心 + 框宽高(归一化)
+	var p0 := rect.position + Vector2(rect.size.x * (seed_u - seed_w * 0.5), rect.size.y * (seed_v - seed_h * 0.5))
+	var sz := Vector2(rect.size.x * seed_w, rect.size.y * seed_h)
+	var col := Color(1, 0.85, 0, 0.95)
+	draw_rect(Rect2(p0, sz), col, false, 2.0)
+	# 四角加粗，远看也清楚
+	var cs := [Vector2(p0.x, p0.y), Vector2(p0.x + sz.x, p0.y), Vector2(p0.x, p0.y + sz.y), Vector2(p0.x + sz.x, p0.y + sz.y)]
+	for idx in 4:
+		var c: Vector2 = cs[idx]
+		var cx := -1.0 if (idx == 1 or idx == 3) else 1.0
+		var cy := -1.0 if idx >= 2 else 1.0
+		draw_line(c, c + Vector2(12.0 * cx, 0), col, 4.0)
+		draw_line(c, c + Vector2(0, 12.0 * cy), col, 4.0)
 
 func clear_target() -> void:
 	target_u = -1.0
@@ -25,6 +82,7 @@ func clear_target() -> void:
 	queue_redraw()
 
 func _draw() -> void:
+	_draw_seed_box()   # AI 标框与跟踪点各自独立: 框只在播种前那几帧出现
 	if target_u < 0.0 or target_v < 0.0 or target_st == "idle" or _feed == null:
 		return
 	var fsz := size

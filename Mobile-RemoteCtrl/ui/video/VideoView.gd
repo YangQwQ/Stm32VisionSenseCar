@@ -36,6 +36,10 @@ func set_track_target(u: float, v: float, conf: float, state: String) -> void:
 func clear_track() -> void:
 	_track.call("clear_target")
 
+## auto_grasp 播种前：把 AI 标的框交给叠加层画在当前这一帧上（切跟踪画面之前那几帧视频还在推）。
+func set_seed_box(u: float, v: float, w: float, h: float) -> void:
+	_track.call("set_seed_box", u, v, w, h)
+
 ## 跟踪期板端不推视频（track 消息带 novid=1）：藏掉冻结的旧画面，自动开"标尺网格"，
 ## 由 TrackOverlay 在图内画跟踪点。跟踪结束（novid=0 / idle）恢复原状。
 ## 注：Feed 只是隐藏、texture 保留 —— 网格与十字都要用它算 KEEP_ASPECT 的内容矩形。
