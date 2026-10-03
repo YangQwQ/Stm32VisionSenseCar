@@ -2,14 +2,11 @@
 
 一套 **AI 视觉 + 手机遥控 + 直驱运动控制** 的智能小车工程：ESP32-S3-CAM 采集画面，板载直调云端多模态模型解析目标并生成控制指令，经软件 I2C **直接驱动**哪吒扩展板的电机与舵机，手机 App 负责图传、操控与 AI 目标下发。
 
-```
-手机 App ──BLE 配网 / WiFi 图传+指令──▶ 视觉大脑板(ESP32-S3) ──软件 I2C──▶ 哪吒扩展板 ──▶ 电机/舵机/灯
-        ◀──────────── WS 状态 / exec_status 上行 ────────────────┘
-```
+<p align="center">
+  <img src="docs/img/diagrams/overview.svg" alt="全链路总览：手机 App ⇄ 视觉大脑板 ⇄ 哪吒扩展板 → 执行机构，云端模型由大脑板直调" width="100%">
+</p>
 
-> 当前为**开发进行中**版本：BLE 配网、WS 指令/状态、UDP 图传、软件 I2C 直驱（四轮电机 / 四个舵机 / 三路灯光）均已接通可跑；板载 DIRECT AI（`ai_goal`）已实现，任务级闭环真机联调中。
->
-> ⚠️ 本项目**已取消独立的 STM32 执行板**（原 `Stm32-Executor/`，因硬件问题裁撤），改由视觉板直驱。旧的 UART 帧协议与双板架构只存在于 git 历史。
+<p align="center"><sub>全链路只有一块可编程板：大脑板既是视觉/控制大脑，也是执行器。完整链路说明见 <a href="#2-系统架构">§2 系统架构</a>。</sub></p>
 
 ---
 
@@ -19,6 +16,9 @@
 - 🎮 **遥控操控**：虚拟摇杆 + 指令面板，小车前进/后退/转向（可切换**原地旋转**式转向）、机械臂升降/移爪/夹爪、三路灯光开关、一键回正。
 - 🎯 **指定点移动 / 插话**：`/move to <x> <y> [global]`（词表 `goto`）让板子自行导航到地面坐标；AI 任务进行中输入非空文本即为**插话**（`ai_chat`），补充要求而不打断闭环。
 - 🧠 **板载 AI 视觉控制**：手机下发文字/区域目标 → 板子直调云端多模态模型 → 指令 → **直驱落地**（任务级迭代闭环，`ai_goal` / `ai_oneshot`）。板端维护**画面标定（单应）+ 物体空间记忆 + 车姿态累积**，并按需带上上一帧做运动对比。
+- ✋ **本地自动夹取（不经 AI）**：在画面上**框选一个目标** → 板端自己用相关滤波跟住它，再闭环完成「降臂 → 旋转对准 → 边前进边对准 → 合爪」（词表 `auto_grasp`）。比"每轮问一次云端"快一个数量级，也是 AI 工具之一。
+- 🗺️ **记忆地图 / 轨迹可视化**：App 画面源可切「图传 ↔ 车头系俯视图」，实时看小车记住的物体位置；本地追踪期间板端不推视频，改显标尺网格 + 跟踪十字。
+- ⏪ **会话回放**：一次任务从下发到收尾的全过程（聊天/决策/画面/轨迹）按**逻辑时钟**录下来，可在 App 里逐步回看、拖进度、单步前进后退。
 - 🧭 **标定网格**：图传可叠加标定网格（`/grid`），配合板端单应标定读屏幕 (u,v) 与实测地面距离取标定点。
 - 🦾 **机械臂二连杆 IK**：给末端目标位姿（轴前方 cm + 地面以上 cm），板载反解并联动左右两舵机。
 - 📶 **BLE 一次性配网**：App 扫描广播名 `VisionS3` 后写入 WiFi 账号，板子 NVS 存储、在线换网生效（不重启）。
@@ -26,52 +26,52 @@
 
 ## 2. 系统架构
 
-整体角色与通信链路如下（详见各子工程 CLAUDE.md）：
+<p align="center">
+  <img src="docs/img/diagrams/architecture.svg" alt="系统架构：手机 App 经 BLE、WebSocket、UDP 与视觉控制大脑板通信；大脑板直调云端多模态模型，经软件 I2C 驱动哪吒扩展板，再驱动电机与舵机" width="100%">
+</p>
 
-```
-┌────────────────────┐    ① BLE 配网 / 兜底控制（GATT，广播名 VisionS3）
-│  手机 App           │ ◀───────────────────────────────────────┐
-│ Mobile-RemoteCtrl  │   ② WiFi WebSocket（端口 81）：           │
-│  (Godot / Android) │      指令 JSON / 状态 / 消息（文本）        │
-│                    │   ③ WiFi UDP：图传 JPEG 分片（二进制）      │
-└────────────────────┘ ◀───────────────────────────────────────▶│
-                                                                 ▼
-┌──────────────────────────┐         ┌──────────────────────────────────────┐
-│  云端多模态 AI             │ ④ai_goal │ 视觉/控制大脑板 Stm32-Vision           │
-│  (DeepSeek 等，可配)       │ ────────▶│ ESP32-S3-CAM(N16R8) + OV3660         │
-│                          │          │ 抓帧 · 图传 · 配网 · 词表分发          │
-│                          │          │ 板载 AI 闭环 · exec 直驱执行层         │
-└──────────────────────────┘          └────────────────┬─────────────────────┘
-                                                       ⑤ 软件 I2C（SCL=GPIO47 / SDA=GPIO14）
-                                                          从机 0x80，无 MCU 中转
-                                                       ▼
-                                       ┌──────────────────────────────────────────┐
-                                       │ 哪吒（NeZha）扩展板                        │
-                                       │ 4 路电机 PWM · 4 路舵机 PWM · 灯带          │
-                                       │ → 4×N20 四轮 · 4×MG90S(转向+机械臂)        │
-                                       └──────────────────────────────────────────┘
-```
+### 两条视觉闭环
+
+板上有**两条并行的视觉链路**，共用同一颗摄像头与同一套执行机构，但决策者不同：
+
+<p align="center">
+  <img src="docs/img/diagrams/vision-loops.svg" alt="两条视觉闭环对比：左侧 AI 闭环由云端模型逐轮决策，右侧本地闭环由板端相关滤波逐帧跟踪并闭环夹取" width="100%">
+</p>
 
 | # | 链路 | 说明 |
 |---|---|---|
 | ① | BLE | 手机 → 大脑板：一次性配网（WiFi SSID/密码、AI 接口参数）+ 兜底控制。连接后让出 2.4G 射频，断线自动恢复 |
-| ② | WiFi WebSocket | 大脑板 ⇄ 手机：指令 JSON 下行 + `status`/`ai_result`/`exec_status`/`log`（调试）/`state`（查询回包）上行 |
+| ② | WiFi WebSocket | 大脑板 ⇄ 手机：指令 JSON 下行 + `status`/`ai_result`/`ai_tool`/`ai_task`/`ai_mem`/`track`/`log`（调试）/`state`（查询回包）上行 |
+| ③ | WiFi UDP | 大脑板 → 手机：JPEG 图传分片（每数据报 14B 大端头 + 载荷） |
+| ④ | 云端 AI | 大脑板 ⇄ 模型：DIRECT 直调（板子自己上传画面、解析指令、执行闭环） |
+| ⑤ | 软件 I2C | 大脑板 → 哪吒板：舵机/电机/灯光命令，**本板即执行器** |
+
+| # | 链路 | 说明 |
+|---|---|---|
+| ① | BLE | 手机 → 大脑板：一次性配网（WiFi SSID/密码、AI 接口参数）+ 兜底控制。连接后让出 2.4G 射频，断线自动恢复 |
+| ② | WiFi WebSocket | 大脑板 ⇄ 手机：指令 JSON 下行 + `status`/`ai_result`/`ai_tool`/`ai_task`/`ai_mem`/`track`/`log`（调试）/`state`（查询回包）上行 |
 | ③ | WiFi UDP | 大脑板 → 手机：JPEG 图传分片（每数据报 14B 大端头 + 载荷） |
 | ④ | 云端 AI | 大脑板 ⇄ 模型：DIRECT 直调（板子自己上传画面、解析指令、执行闭环） |
 | ⑤ | 软件 I2C | 大脑板 → 哪吒板：舵机/电机/灯光命令，**本板即执行器** |
 
 > 词表 JSON（`CommandProto`）只由手机 App 持有；「词表 → 哪吒 I2C 命令」的翻译在大脑板 `command` + `direct_exec` 模块。
+>
+> 另有一条**不联网的本地闭环**：手机框选 → 词表 `auto_grasp` → 大脑板 `track`（相关滤波逐帧跟）+ `grasp`（自己降臂/对准/前进/合爪）。它与 AI 闭环共用电机/舵机与相机，但**不调云端、也不用单应/全局坐标**，只用画面归一化坐标。
 
 ### 软件构成
 
 | 仓库目录 | 角色 | 语言 / 工具链 | 说明 |
 |---|---|---|---|
-| [`Stm32-Vision/`](Stm32-Vision/CLAUDE.md) | 视觉大脑板 **兼执行器** | C++ · Arduino IDE / arduino-cli（esp32 core 3.3.x） | 摄像头抓帧、WS/UDP 图传、BLE 配网、词表分发、板载 AI、软件 I2C 直驱 |
-| [`Mobile-RemoteCtrl/`](Mobile-RemoteCtrl/CLAUDE.md) | 手机遥控 App | GDScript · Godot 4.7.1 mono（Android） | 三通道通信、虚拟摇杆、图传显示、图片标注、BLE 配网界面、聊天指令区 |
+| [`Stm32-Vision/`](Stm32-Vision/CLAUDE.md) | 视觉大脑板 **兼执行器** | C++ · Arduino IDE / arduino-cli（esp32 core 3.3.x） | 摄像头抓帧、WS/UDP 图传、BLE 配网、词表分发、板载 AI、**本地目标追踪与自动夹取**、软件 I2C 直驱 |
+| [`Mobile-RemoteCtrl/`](Mobile-RemoteCtrl/CLAUDE.md) | 手机遥控 App | GDScript · Godot 4.7.1 mono（Android） | 三通道通信、虚拟摇杆、图传显示、图片标注与一键自动夹取、记忆地图/追踪可视化、**会话录制与回放**、BLE 配网界面、聊天指令区 |
 
-> ⚠️ **大脑板依赖自编译内核库**（esp32 core 3.3.11，用 esp32-arduino-lib-builder 在 WSL 自编译后覆盖到 Arduino15）：
+> ⚠️ **大脑板依赖自编译内核库**（esp32 core 3.3.11，用 esp32-arduino-lib-builder 在 WSL 自编译后覆盖到 Arduino15），共五处定制：
 > ① mbedTLS SSL 收发缓冲设 8192B（`CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN` / `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN`），否则 AI 直连 TLS 握手因内部堆碎片化失败（-17040/-32512）；
-> ② lwIP TCP 缓冲上调（`CONFIG_TCP_SND_BUF_DEFAULT`=32768 / `CONFIG_TCP_WND_DEFAULT`=16384），否则 40KB 级请求体发送 `write()` 超时。
+> ② mbedTLS 缓冲改走 PSRAM（`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`），否则内部堆碎片化时 AI 请求报 -3；
+> ③ lwIP TCP 缓冲上调（`CONFIG_TCP_SND_BUF_DEFAULT`=32768 / `CONFIG_TCP_WND_DEFAULT`=16384），否则 40KB 级请求体发送 `write()` 超时；
+> ④ WiFi TX cache 缓冲加到 32（`CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM`），否则图传突发丢帧；
+> ⑤ esp32-camera 的 `CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX` 降到 16384 —— 硬切 RGB565 追目标时需要一块 15360 字节的连续内部 DMA，默认 32768（半缓冲 30720）在图传开着时凑不出来，相机会留在 deinit 态。
+> 重编流程与定制清单见 [`Stm32-Vision/librebuild/`](Stm32-Vision/librebuild/README.md)。
 
 ## 3. 硬件选型（BOM）
 
@@ -123,50 +123,75 @@
 **② 小车 / 机械臂套件（驱动板 + 骨架 + 电机 + 舵机）**
 <p align="center"><img src="docs/img/hardware/kit.png" width="280" alt="小车机械臂套件商品页截图"></p>
 
-## 4. 成品实拍（预留）
+## 4. 成品实拍
 
-把整车/细节照片以对应文件名存入 `docs/img/build/` 即替换占位。
+**整车正视图**
+<p align="center"><img src="docs/img/product/正视图.jpg" width="320" alt="整车正视图"></p>
 
-**整车正面**（`docs/img/build/car-front.png`）
-<p align="center"><img src="docs/img/build/car-front.png" width="320" alt="整车正面照（预留）"></p>
+**整车侧视图**
+<p align="center"><img src="docs/img/product/侧视图.jpg" width="320" alt="整车侧视图"></p>
 
-**整车侧面**（`docs/img/build/car-side.png`）
-<p align="center"><img src="docs/img/build/car-side.png" width="320" alt="整车侧面照（预留）"></p>
+**整车俯视图**
+<p align="center"><img src="docs/img/product/俯视图.jpg" width="320" alt="整车俯视图"></p>
 
-**内部走线 / 板载布置**（`docs/img/build/car-internal.png`）
-<p align="center"><img src="docs/img/build/car-internal.png" width="320" alt="内部走线与板载布置（预留）"></p>
+## 5. App 界面
 
-**动作演示抓取**（`docs/img/build/car-action.png`）
-<p align="center"><img src="docs/img/build/car-action.png" width="320" alt="动作演示（预留）"></p>
+**主控制页**
+<p align="center"><img src="docs/img/mobile-app/主控制页展示.jpg" width="260" alt="App 主控制页"></p>
 
-**App 界面（遥控 / 图传）**（`docs/img/build/app-screenshot.png`）
-<p align="center"><img src="docs/img/build/app-screenshot.png" width="260" alt="App 截图（预留）"></p>
+**图片标注**
+<p align="center"><img src="docs/img/mobile-app/图片标注展示.jpg" width="260" alt="图片标注与自动夹取入口"></p>
 
-## 5. 部署与校准（装机后按实际重校）
+**附加图片**（从系统图库选图 → 压缩 → 可选标注后随 `ai_goal` 上行，最多 3 张）
+<p align="center"><img src="docs/img/mobile-app/附加图片展示.jpg" width="260" alt="附加图片与附件列表"></p>
+
+**会话回放**（当前会话 + 归档会话列表，`Session1` 为进行中的那一趟）
+<p align="center"><img src="docs/img/mobile-app/会话回放页面.jpg" width="260" alt="会话回放列表"></p>
+
+**回放进行中**（底部控制条：上一步 / 播放暂停 / 下一步 + 进度拖动；回放期间输入与下发全部禁用）
+<p align="center"><img src="docs/img/mobile-app/会话回放演示.jpg" width="260" alt="回放进行中"></p>
+
+**设备连接配置**（BLE 扫描后确认 WiFi 与云端 AI 接口，模型名从服务端拉列表后下拉选）
+<p align="center"><img src="docs/img/mobile-app/设备连接配置.jpg" width="260" alt="设备连接配置弹窗"></p>
+
+**关于页**
+<p align="center"><img src="docs/img/mobile-app/关于页面展示.jpg" width="260" alt="关于页设置项"></p>
+
+## 6. 演示视频
+
+> GitHub 的 README 会剥掉 `<video>` 标签，附件链接也只按下载处理，所以这里用普通链接（点开即在新标签页播放）。
+
+- **[AI 夹取任务演示](https://github.com/user-attachments/assets/b705907e-5b11-46ff-b3a7-8009f90ea83e)** —— 云端多模态模型逐轮决策 → 词表指令 → 直驱落地（横屏，约 3 分钟）
+- **[手动控制演示](https://github.com/user-attachments/assets/030118ea-cccd-4614-9c40-c62b92951e69)** —— 摇杆驱车、机械臂与灯光直控（竖屏手机录制，约 43 秒）
+
+## 7. 部署与校准（装机后按实际重校）
 
 固件内置的是**默认出厂实测值**；换镜头、移相机、换电机/舵机、改底盘后，以下几处**手动校准**需要重做。所有校准数据集中在 `Stm32-Vision/Calibration.h`（`Calibration.cpp` 提供机械臂散点接入），**改完重新编译烧录即生效**（数据只进 flash、不占运行内存），无需动其它源文件。
 
 | 校准项 | 为什么需要手动校准 | 在哪改（`Calibration.h`） |
 |---|---|---|
 | **画面坐标 ↔ 实际坐标映射** | 屏幕归一化像素 (u,v) 与车头系地面厘米依靠实测标定点拟合**单应**；相机角度/高度或换镜头都会变，标定不准会让 AI 的像素观测失真 | `kGroundCal`：每行 `{u, v, x右, y前}`，≥4 点、尽量覆盖整个屏幕 |
-| **机械臂移动** | 机械臂夹心目标位姿(x,h) ⇄ 移爪/抬落两舵机 PWM 是**非线性**映射，靠实测散点做 IDW 插值；舵机压力/装配都会影响，错位或末端对不准要重测 | `kArmPts`：每点 `{移爪PWM, 抬落PWM, x车前, h离地}`；连续动作步长与定距在 `ARM_STEP_CM`、`ARM_CNT_PER_CM` |
+| **机械臂移动** | 机械臂夹心目标位姿(x,h) ⇄ 移爪/抬落两舵机 PWM 是**非线性**映射，靠实测散点做 IDW 插值；舵机压力/装配都会影响，错位或末端对不上要重测 | `kArmPts`：每点 `{移爪PWM, 抬落PWM, x车前, h离地}`；连续动作步长与定距在 `ARM_STEP_CM`、`ARM_CNT_PER_CM` |
 | **小车定距前进** | 电机**无编码器**，`move distance_cm` 只能按**时长近似**，需按油门实测车速与起停余量 | `MV_SPEED_X/Y`、`MV_COAST_X/Y`（按油门插值表） |
-| **小车定角原地转向** | 同理，`spin angle_deg` 按时长近似，需按转速实测毫秒/度 | `SPIN_MSDEG_X/Y`、必要时调整 `SPIN_MIN_SPEED` |
+| **小车定角原地转向** | 同理，`spin angle_deg` 按时长近似，需按转速实测毫秒/度 | `SPIN_TBL_DEG/MS`（查表插值）、必要时调整 `SPIN_MIN_SPEED` |
+| **本地追踪与自动夹取** | 闭环靠"目标在画面上挪多少"驱动，而画面挪多少取决于**相机装姿、底盘、目标实际尺寸**；换硬件或改车后这套判据要重新标 | `GRASP_*`（对准目标点 u/v 与随距离收紧的容差、最小/最大转角、每 cm 前进的横向漂移预算、卡死判据的期望位移比例）与 `TRACK_*`（种子框尺寸、PSR 门、搜索半径相关项）。⚠️ 这些值的注释里记着"为什么是这个数"的真机实测，**先读再改** |
 
 > 🔧 **校准提示**
 > - 舵机限位/回中也在此文件：`STEER/REACH/GRIP/LIFT_*_CENTER/_LO/_HI`，首次装机或换舵机后按实际行程复核。
 > - **画面标定点**：App 图传开 `/grid` 叠加网格，读网格交点屏幕坐标 (u,v)，再用直尺/米测出对应地面 (x,y) 填入 `kGroundCal`。
 > - **机械臂标定点**：把臂摆到若干到位姿，记录两个舵机 PWM 与实测夹心 (x 车前、h 离地) 填入 `kArmPts`。
-> - **定距/定角**：让车前进设定距离、原地旋转设定角度，实测实际位移/转角，按油门/转速填 `MV_*` / `SPIN_MSDEG_*` 表。
+> - **定距/定角**：让车前进设定距离、原地旋转设定角度，实测实际位移/转角，按油门/转速填 `MV_*` / `SPIN_TBL_*` 表。
 > - 上表均有默认值可直接跑；仅当某处行为不对或硬件变更时才需重校。
 
-## 6. 上手流程
+## 8. 上手流程
 
 1. **烧录大脑板** → 上电后板子广播 BLE `VisionS3`。
-2. **App 配网**：连接该广播，写入 WiFi 账号密码与 AI 接口参数（URL/Key/模型）。
+2. **App 配网**：连接该广播，写入 WiFi 账号密码与 AI 接口参数（URL/Key/模型，模型名从服务端拉列表后下拉选）。
 3. **连上 WiFi**：App 经 WebSocket（端口 81）取得指令/状态通道，按需开启图传（UDP）。
 4. **遥控**：摇杆驱车（可在「关于」页切换为原地旋转式转向）、按钮控机械臂/灯光；或在聊天区直接输入文字下发 AI 目标。
-5. **调试**：`/log exec on` 看板端状态推送与执行日志、`/log ai on` 看 AI 时序日志、`/log all on` 转发板端全部串口输出（聊天区内容统一落盘 `user://logs/app.log`）、`/grid on` 叠加图传标定网格。
+5. **本地夹取**：切到「AI 接管」模式 → 点标注按钮框住目标 → 「自动夹取」。板端会自己跟住目标并完成整套夹取动作，App 上能看到跟踪十字与板端每一步的回执。
+6. **调试**：`/log exec on` 看板端状态推送与执行日志、`/log ai on` 看 AI 时序日志、`/log all on` 转发板端全部串口输出（聊天区内容统一落盘 `user://logs/app.log`）、`/grid on` 叠加图传标定网格。
+7. **回放**：一次任务做完（或随时 `/clear` 归档）后，从「AI 接管」栏的会话按钮打开列表，可逐步回看整趟过程。回放是只读的，其间不能下发任何指令。
 
 ---
 

@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 640" width="1000" height="640" role="img" aria-label="两条视觉闭环对比：左侧 AI 闭环由云端多模态模型逐轮决策，每轮数秒；右侧本地闭环由板端相关滤波逐帧跟踪并闭环夹取，每步约 0.5 秒，不经云端。两者共享同一套相机与执行机构。">
+  <style>
+    .bg   { fill:#ffffff; stroke:#d0d7de; }
+    .lane { fill:none; stroke:#d0d7de; stroke-dasharray:6 4; }
+    .boxA { fill:#ddf4ff; stroke:#54aeff; }
+    .boxB { fill:#dafbe1; stroke:#4ac26b; }
+    .boxS { fill:#fff8c5; stroke:#d4a72c; }
+    .t    { font:12px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1f2328; }
+    .tb   { font:600 13px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1f2328; }
+    .laneT{ font:600 16px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; }
+    .mut  { font:11px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#59636e; }
+    .acc  { stroke:#0969da; fill:none; stroke-width:2; }
+    .grn  { stroke:#1a7f37; fill:none; stroke-width:2; }
+    @media (prefers-color-scheme: dark) {
+      .bg   { fill:#0d1117; stroke:#30363d; }
+      .lane { stroke:#30363d; }
+      .boxA { fill:#121d2f; stroke:#1f6feb; }
+      .boxB { fill:#0f2417; stroke:#238636; }
+      .boxS { fill:#241f08; stroke:#9e6a03; }
+      .t, .tb { fill:#e6edf3; }
+      .mut { fill:#9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9 z" fill="#0969da"/>
+    </marker>
+    <marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9 z" fill="#1a7f37"/>
+    </marker>
+  </defs>
+
+  <!-- 分道 -->
+  <rect class="lane" x="20" y="52" width="460" height="500" rx="14"/>
+  <rect class="lane" x="500" y="52" width="480" height="500" rx="14"/>
+
+  <text class="laneT" x="40" y="36" fill="#0969da">① AI 闭环 · 云端逐轮决策</text>
+  <text class="mut" x="232" y="36">每轮数秒，适合语义任务、搜寻、跨目标搬运</text>
+  <text class="laneT" x="520" y="36" fill="#1a7f37">② 本地闭环 · 板端逐帧跟踪</text>
+  <text class="mut" x="730" y="36">每步约 0.5 秒，适合单个清晰目标的逼近 + 夹取</text>
+
+  <!-- 左泳道 -->
+  <rect class="boxA" x="135" y="66" width="230" height="62" rx="9"/>
+  <text class="tb" x="151" y="90">① 输入目标</text>
+  <text class="mut" x="151" y="110">手机发文字 / 区域（ai_goal）</text>
+  <text class="mut" x="151" y="124">任务进行中可插话（ai_chat）</text>
+
+  <line class="acc" x1="250" y1="128" x2="250" y2="152" marker-end="url(#a)"/>
+
+  <rect class="boxA" x="135" y="152" width="230" height="62" rx="9"/>
+  <text class="tb" x="151" y="176">② 取图与换算</text>
+  <text class="mut" x="151" y="196">停稳后抓帧 → 像素 ⇄ 单应 ⇄ 车头系</text>
+  <text class="mut" x="151" y="210">画面像素观测记入物体记忆</text>
+
+  <line class="acc" x1="250" y1="214" x2="250" y2="238" marker-end="url(#a)"/>
+
+  <rect class="boxA" x="135" y="238" width="230" height="62" rx="9"/>
+  <text class="tb" x="151" y="262">③ 云端模型推理</text>
+  <text class="mut" x="151" y="282">看图后给工具调用（8 个工具）</text>
+  <text class="mut" x="151" y="296">需要新画面时用 look 索取</text>
+
+  <line class="acc" x1="250" y1="300" x2="250" y2="324" marker-end="url(#a)"/>
+
+  <rect class="boxA" x="135" y="324" width="230" height="62" rx="9"/>
+  <text class="tb" x="151" y="348">④ 工具落地</text>
+  <text class="mut" x="151" y="368">次序固定：mem→task→say→car</text>
+  <text class="mut" x="151" y="382">→auto_grasp→look→compact→goal</text>
+
+  <line class="acc" x1="250" y1="386" x2="250" y2="410" marker-end="url(#a)"/>
+
+  <rect class="boxA" x="135" y="410" width="230" height="62" rx="9"/>
+  <text class="tb" x="151" y="434">⑤ 直驱与回执</text>
+  <text class="mut" x="151" y="454">exec → 哪吒 I2C → 电机/舵机</text>
+  <text class="mut" x="151" y="468">结果文本回喂模型，任务面板同步</text>
+
+  <path class="acc" d="M135 441 L60 441 L60 97 L131 97" marker-end="url(#a)" fill="none"/>
+  <text class="mut" x="50" y="286" transform="rotate(-90 50 286)">下一轮：新画面 + 状态行 + 记忆</text>
+
+  <!-- 右泳道 -->
+  <rect class="boxB" x="625" y="66" width="230" height="62" rx="9"/>
+  <text class="tb" x="641" y="90">① 标一个框</text>
+  <text class="mut" x="641" y="110">手机标注工具条「自动夹取」</text>
+  <text class="mut" x="641" y="124">下发 auto_grasp（不经云端）</text>
+
+  <line class="grn" x1="740" y1="128" x2="740" y2="152" marker-end="url(#g)"/>
+
+  <rect class="boxB" x="625" y="152" width="230" height="62" rx="9"/>
+  <text class="tb" x="641" y="176">② 起跟</text>
+  <text class="mut" x="641" y="196">相机硬切 RGB565（幂等，失败重试）</text>
+  <text class="mut" x="641" y="210">模板取自降臂后的画面</text>
+
+  <line class="grn" x1="740" y1="214" x2="740" y2="238" marker-end="url(#g)"/>
+
+  <rect class="boxB" x="625" y="238" width="230" height="62" rx="9"/>
+  <text class="tb" x="641" y="262">③ 逐帧定位</text>
+  <text class="mut" x="641" y="282">相关滤波一次 FFT 出整幅响应图</text>
+  <text class="mut" x="641" y="296">PSR 门 + 种子外观门 + 车身 mask</text>
+
+  <line class="grn" x1="740" y1="300" x2="740" y2="324" marker-end="url(#g)"/>
+
+  <rect class="boxB" x="625" y="324" width="230" height="62" rx="9"/>
+  <text class="tb" x="641" y="348">④ 闭环逼近</text>
+  <text class="mut" x="641" y="368">降臂 → 转正对准 u → 前进到 v</text>
+  <text class="mut" x="641" y="382">单步幅度受搜索半径限幅</text>
+
+  <line class="grn" x1="740" y1="386" x2="740" y2="410" marker-end="url(#g)"/>
+
+  <rect class="boxB" x="625" y="410" width="230" height="62" rx="9"/>
+  <text class="tb" x="641" y="434">⑤ 物理判据与合爪</text>
+  <text class="mut" x="641" y="454">「动作后目标必须动」判据</text>
+  <text class="mut" x="641" y="468">连续不动即中止；进可夹纵深就合爪</text>
+
+  <path class="grn" d="M625 441 L550 441 L550 97 L621 97" marker-end="url(#g)" fill="none"/>
+  <text class="mut" x="540" y="286" transform="rotate(-90 540 286)">喂帧：图传任务连续供帧，位置连续更新</text>
+
+  <!-- 共享底座 -->
+  <rect class="boxS" x="20" y="568" width="960" height="58" rx="10"/>
+  <text class="tb" x="40" y="592">共享底座：同一颗 ESP32-S3-CAM、同一个机械臂与四轮、同一套词表与直驱层</text>
+  <text class="mut" x="40" y="614">因此两条链路可以接力：AI 用 auto_grasp 工具调本地闭环；本地夹取完成后，AI 接着做放置（place_done 一段式收尾）</text>
+</svg>

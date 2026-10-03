@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" width="1000" height="600" role="img" aria-label="系统架构图：手机 App 经 BLE、WebSocket、UDP 三条链路与视觉控制大脑板通信；大脑板直调云端多模态模型获取决策，经软件 I2C 驱动哪吒扩展板，再驱动电机与舵机。">
+  <style>
+    .bg   { fill:#ffffff; stroke:#d0d7de; }
+    .bgb  { fill:#ddf4ff; stroke:#54aeff; }
+    .bgg  { fill:#dafbe1; stroke:#4ac26b; }
+    .bgy  { fill:#fff8c5; stroke:#d4a72c; }
+    .t    { font:12px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1f2328; }
+    .tb   { font:600 14px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1f2328; }
+    .tt   { font:600 17px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1f2328; }
+    .mut  { font:11px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#59636e; }
+    .acc  { stroke:#0969da; fill:none; stroke-width:2; }
+    .grn  { stroke:#1a7f37; fill:none; stroke-width:2; }
+    .gry  { stroke:#8c959f; fill:none; stroke-width:2; }
+    .lbl  { font:11px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#0969da; }
+    .lblg { font:11px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1a7f37; }
+    .lblo { font:11px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#9a6700; }
+    .num  { font:600 11px "Noto Sans CJK SC",sans-serif; fill:#ffffff; }
+    .circ { fill:#0969da; }
+    @media (prefers-color-scheme: dark) {
+      .bg  { fill:#0d1117; stroke:#30363d; }
+      .bgb { fill:#121d2f; stroke:#1f6feb; }
+      .bgg { fill:#0f2417; stroke:#238636; }
+      .bgy { fill:#241f08; stroke:#9e6a03; }
+      .t, .tb, .tt { fill:#e6edf3; }
+      .mut { fill:#9198a1; }
+      .circ { fill:#1f6feb; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9 z" fill="#0969da"/>
+    </marker>
+    <marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9 z" fill="#1a7f37"/>
+    </marker>
+    <marker id="y" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9 z" fill="#8c959f"/>
+    </marker>
+  </defs>
+
+  <!-- ① ② ③ 手机 ⇄ 大脑板 -->
+  <rect class="bg" x="24" y="52" width="200" height="140" rx="10"/>
+  <text class="tt" x="42" y="84">手机 App</text>
+  <text class="mut" x="42" y="106">Godot 4.7 / Android</text>
+  <text class="mut" x="42" y="124">图传 · 遥控 · 标注 · 回放</text>
+  <text class="mut" x="42" y="142">配网 · 会话录制与回放</text>
+  <text class="mut" x="42" y="164">CommandProto 为唯一命令词表</text>
+  <text class="mut" x="42" y="182">AI 接管 / 手动控制两种模式</text>
+
+  <line class="acc" x1="224" y1="96" x2="336" y2="96" marker-start="url(#a)" marker-end="url(#a)"/>
+  <circle class="circ" cx="280" cy="96" r="9"/><text class="num" x="280" y="100" text-anchor="middle">1</text>
+  <text class="lbl" x="280" y="80" text-anchor="middle">BLE 配网 / 兜底</text>
+
+  <line class="acc" x1="224" y1="142" x2="336" y2="142" marker-start="url(#a)" marker-end="url(#a)"/>
+  <circle class="circ" cx="280" cy="142" r="9"/><text class="num" x="280" y="146" text-anchor="middle">2</text>
+  <text class="lbl" x="280" y="125" text-anchor="middle">WS :81 指令/状态</text>
+
+  <line class="acc" x1="224" y1="188" x2="336" y2="188" marker-start="url(#a)" marker-end="url(#a)"/>
+  <circle class="circ" cx="280" cy="188" r="9"/><text class="num" x="280" y="192" text-anchor="middle">3</text>
+  <text class="lbl" x="280" y="172" text-anchor="middle">UDP 图传</text>
+
+  <!-- ④ 云端 AI -->
+  <rect class="bgy" x="24" y="212" width="200" height="88" rx="10"/>
+  <text class="tb" x="42" y="242">云端多模态 AI</text>
+  <text class="mut" x="42" y="262">DeepSeek 配网时填 URL/Key</text>
+  <text class="mut" x="42" y="282">大脑板自己上传画面并决策</text>
+
+  <line class="acc" x1="224" y1="256" x2="336" y2="256" marker-start="url(#a)" marker-end="url(#a)"/>
+  <circle class="circ" cx="280" cy="256" r="9"/><text class="num" x="280" y="260" text-anchor="middle">4</text>
+  <text class="lbl" x="280" y="240" text-anchor="middle">DIRECT 直调</text>
+
+  <!-- 大脑板 -->
+  <rect class="bgb" x="336" y="34" width="330" height="424" rx="12"/>
+  <text class="tt" x="360" y="66">视觉 / 控制大脑板</text>
+  <text class="t" x="360" y="88">Stm32-Vision · ESP32-S3-CAM (N16R8)</text>
+
+  <rect class="bg" x="356" y="100" width="290" height="102" rx="8"/>
+  <text class="tb" x="372" y="122">词表分发 command</text>
+  <text class="mut" x="372" y="142">手动指令先打断 AI，再落地</text>
+  <text class="mut" x="372" y="160">状态位图唯一出口 → 三类回执都带 bits</text>
+  <text class="mut" x="372" y="178">ai_goal / ai_chat / ai_clear</text>
+  <text class="mut" x="372" y="194">goto / auto_grasp（本地夹取）</text>
+
+  <rect class="bgb" x="356" y="212" width="290" height="118" rx="8"/>
+  <text class="tb" x="372" y="234">AI 闭环（ai_*）</text>
+  <text class="mut" x="372" y="254">单应标定 + 物体空间记忆 + 车姿态累积</text>
+  <text class="mut" x="372" y="272">会话上下文跨任务保留，只由 /clear 重置</text>
+  <text class="mut" x="372" y="290">11 键工具表 → 给模型 8 个工具</text>
+  <text class="mut" x="372" y="310">上行 ai_result / ai_tool / ai_task</text>
+  <text class="mut" x="372" y="326">/ ai_mem（回放与记忆地图的数据源）</text>
+
+  <rect class="bgg" x="356" y="340" width="290" height="86" rx="8"/>
+  <text class="tb" x="372" y="362">本地追踪与自动夹取</text>
+  <text class="mut" x="372" y="382">track 相关滤波逐帧跟（DCF + PSR + 外观门）</text>
+  <text class="mut" x="372" y="400">grasp 闭环：降臂 → 对准 → 逼近 → 合爪</text>
+  <text class="mut" x="372" y="418">纯画面坐标，不经 AI、不用单应</text>
+
+  <!-- ⑤ I2C -->
+  <line class="grn" x1="500" y1="458" x2="500" y2="506" marker-start="url(#g)" marker-end="url(#g)"/>
+  <circle cx="500" cy="482" r="9" fill="#1a7f37"/><text class="num" x="500" y="486" text-anchor="middle">5</text>
+  <text class="lblg" x="516" y="486">软件 I2C：SCL=GPIO47 / SDA=GPIO14，从机 0x80</text>
+
+  <!-- 哪吒 -->
+  <rect class="bgg" x="356" y="506" width="290" height="72" rx="10"/>
+  <text class="tb" x="372" y="530">哪吒（NeZha）扩展板</text>
+  <text class="mut" x="372" y="550">4 路电机 PWM · 4 路舵机 PWM · 灯带</text>
+  <text class="mut" x="372" y="568">无 MCU 中转，本板即执行器</text>
+
+  <!-- 执行机构 -->
+  <rect class="bg" x="720" y="506" width="258" height="72" rx="10"/>
+  <text class="tb" x="736" y="530">执行机构</text>
+  <text class="mut" x="736" y="550">4×N20 四轮（无编码器 → 无里程计）</text>
+  <text class="mut" x="736" y="568">4×MG90S：转向 / 移爪 / 夹爪 / 抬落</text>
+
+  <line class="grn" x1="646" y1="542" x2="716" y2="542" marker-end="url(#g)"/>
+  <text class="lblg" x="654" y="534">PWM</text>
+
+  <!-- 链路清单 -->
+  <rect class="bg" x="700" y="34" width="278" height="436" rx="10"/>
+  <text class="tb" x="716" y="60">链路说明</text>
+  <text class="mut" x="716" y="88">① BLE（GATT，广播名 VisionS3）</text>
+  <text class="mut" x="716" y="106">一次性配网（WiFi、AI 接口）</text>
+  <text class="mut" x="716" y="124">+ 兜底控制；连上 WS 后让出射频</text>
+  <text class="mut" x="716" y="154">② WebSocket（端口 81，文本 JSON）</text>
+  <text class="mut" x="716" y="172">下行：指令 JSON</text>
+  <text class="mut" x="716" y="190">上行：status / state / pong（带 bits）</text>
+  <text class="mut" x="716" y="208">ai_result / ai_tool / ai_task / ai_mem</text>
+  <text class="mut" x="716" y="226">track（跟踪可视化）/ log / exec_status</text>
+  <text class="mut" x="716" y="256">③ UDP 图传</text>
+  <text class="mut" x="716" y="274">JPEG 分片，每数据报 14B 头 + 载荷</text>
+  <text class="mut" x="716" y="292">低延迟、缺片自愈；跟踪期不推流</text>
+  <text class="mut" x="716" y="322">④ 云端 AI（DIRECT）</text>
+  <text class="mut" x="716" y="340">不经手机：板子自己上传、决策、执行</text>
+  <text class="mut" x="716" y="370">⑤ 软件 I2C</text>
+  <text class="mut" x="716" y="388">舵机 / 电机 / 灯光命令直下，无 MCU 中转</text>
+  <text class="mut" x="716" y="418">改动此表须两侧同步（见 CLAUDE.md 铁律）</text>
+  <text class="mut" x="716" y="450">本板即执行器 —— 全链路只有一块可编程板</text>
+</svg>

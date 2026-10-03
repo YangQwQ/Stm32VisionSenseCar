@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 240" width="1000" height="240" role="img" aria-label="全链路总览：手机 App 与视觉大脑板双向经 BLE 配网、WebSocket 指令状态、UDP 图传通信；大脑板经软件 I2C 驱动哪吒扩展板，再驱动电机与舵机；云端多模态模型由大脑板直调。">
+  <style>
+    .bg   { fill:#ffffff; stroke:#d0d7de; }
+    .t    { font:13px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1f2328; }
+    .tb   { font:600 15px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1f2328; }
+    .mut  { font:11px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#59636e; }
+    .acc  { stroke:#0969da; fill:none; stroke-width:2; }
+    .accl { stroke:#0969da; fill:none; stroke-width:2; stroke-dasharray:5 4; }
+    .grn  { stroke:#1a7f37; fill:none; stroke-width:2; }
+    .lbl  { font:11px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#0969da; }
+    .lblg { font:11px "Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; fill:#1a7f37; }
+    @media (prefers-color-scheme: dark) {
+      .bg  { fill:#0d1117; stroke:#30363d; }
+      .t, .tb { fill:#e6edf3; }
+      .mut { fill:#9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9 z" fill="#0969da"/>
+    </marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9 z" fill="#1a7f37"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="12" y="30" width="186" height="86" rx="9"/>
+  <text class="tb" x="28" y="52">手机 App</text>
+  <text class="mut" x="28" y="72">图传 · 遥控 · 标注 · 回放</text>
+  <text class="mut" x="28" y="90">配网 · 会话录制</text>
+  <text class="mut" x="28" y="108">Mobile-RemoteCtrl</text>
+
+  <rect class="bg" x="278" y="16" width="206" height="100" rx="9"/>
+  <text class="tb" x="294" y="40">视觉大脑板</text>
+  <text class="mut" x="294" y="60">ESP32-S3-CAM (N16R8)</text>
+  <text class="mut" x="294" y="78">+ OV3660 摄像头</text>
+  <text class="mut" x="294" y="100">抓帧 · 图传 · 词表 · 直驱</text>
+
+  <rect class="bg" x="562" y="30" width="186" height="86" rx="9"/>
+  <text class="tb" x="578" y="52">哪吒扩展板</text>
+  <text class="mut" x="578" y="72">4 路电机 + 4 路舵机 + 灯</text>
+  <text class="mut" x="578" y="90">I2C 从机 0x80，无中转</text>
+  <text class="mut" x="578" y="108">SCL=GPIO47 / SDA=GPIO14</text>
+
+  <rect class="bg" x="820" y="30" width="168" height="86" rx="9"/>
+  <text class="tb" x="836" y="52">执行机构</text>
+  <text class="mut" x="836" y="72">4×N20 四轮</text>
+  <text class="mut" x="836" y="90">无编码器 → 无里程计</text>
+  <text class="mut" x="836" y="108">4×MG90S 舵机</text>
+
+  <!-- App ⇄ 板 -->
+  <line class="acc" x1="198" y1="52" x2="274" y2="52" marker-start="url(#ab)" marker-end="url(#ab)"/>
+  <line class="acc" x1="198" y1="76" x2="274" y2="76" marker-start="url(#ab)" marker-end="url(#ab)"/>
+  <line class="acc" x1="198" y1="100" x2="274" y2="100" marker-start="url(#ab)" marker-end="url(#ab)"/>
+  <text class="lbl" x="204" y="47">BLE 配网</text>
+  <text class="lbl" x="204" y="71">WS 指令/状态</text>
+  <text class="lbl" x="204" y="95">UDP 图传</text>
+
+  <!-- 板 ⇄ 哪吒 -->
+  <line class="grn" x1="484" y1="60" x2="558" y2="60" marker-start="url(#ag)" marker-end="url(#ag)"/>
+  <text class="lblg" x="490" y="54">软件 I2C</text>
+
+  <!-- 哪吒 → 执行 -->
+  <line class="grn" x1="748" y1="60" x2="816" y2="60" marker-start="url(#ag)" marker-end="url(#ag)"/>
+  <text class="lblg" x="766" y="54">PWM</text>
+
+  <!-- 云端 -->
+  <rect class="bg" x="278" y="136" width="206" height="42" rx="8" stroke-dasharray="4 3"/>
+  <text class="t" x="294" y="162">云端多模态模型（可配）</text>
+  <line class="accl" x1="381" y1="136" x2="381" y2="122" marker-start="url(#ab)" marker-end="url(#ab)"/>
+  <text class="mut" x="494" y="162">DIRECT 直调：画面与决策都不经手机</text>
+
+  <!-- 脚注：放在云端盒子下方，避免与盒子重叠 -->
+  <text class="mut" x="12" y="204">上行：status · ai_result · ai_tool · ai_task · ai_mem · track · exec_status · state · log</text>
+  <text class="mut" x="12" y="224">全链路只有一块可编程板 —— 大脑板既是视觉/控制大脑，也是执行器</text>
+</svg>
