@@ -22,7 +22,7 @@ const ai::ToolSpec kTools[] = {
   { "note",    nullptr,  0,  ai::parse_note,       nullptr, nullptr, nullptr },
   { "todo",    nullptr,  0,  ai::parse_todo,       nullptr, nullptr, nullptr },
   { "done",    nullptr,  0,  ai::parse_done,       nullptr, nullptr, nullptr },
-  { "grasp",   nullptr,  0,  ai::parse_grasp,     nullptr, nullptr, nullptr },
+  { "auto_grasp", nullptr, 0, ai::parse_grasp,     nullptr, nullptr, nullptr },
   { "set",     nullptr,  0,  ai::parse_set,        nullptr, nullptr, nullptr },
   { "finish",  nullptr,  0,  ai::parse_finish,     nullptr, nullptr, nullptr },
 };

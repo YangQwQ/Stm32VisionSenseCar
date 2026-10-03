@@ -7,7 +7,7 @@ extends Node
 ## 落盘（依次追加，不在内存里堆整趟）：
 ##   user://sessions/index.json          # [{id,title,created_ms,dur_ms,n_events,n_frames}] 新→旧, ≤9
 ##   user://sessions/<id>/meta.json
-##   user://sessions/<id>/events.jsonl   # 每行 {t, k, ...}；k=chat|task|frame
+##   user://sessions/<id>/events.jsonl   # 每行 {t, k, ...}；k=chat|task|frame|track
 ##   user://sessions/<id>/frames/<seq>.jpg
 ## 当前趟先写 user://sessions/_cur/，归档时整体改名到 <id>/。
 ##
@@ -31,6 +31,7 @@ const _DIR := "user://sessions"
 const _CUR := "user://sessions/_cur"
 const _MAX_SESSIONS := 9   # 归档条数上限（面板 Session1 = 当前会话，2..10 共 9 行给归档）
 const _FRAME_MIN_GAP_MS := 100   # 录制帧率上限（≈10fps），与"隔帧存一帧"叠加
+const _TRACK_MIN_GAP_MS := 100   # 跟踪点录制上限（板端 10Hz 上报，同频不丢动作）
 const _ID_CUR := -1
 
 # ============================== 录制状态 ==============================
@@ -45,6 +46,8 @@ var _n_frames := 0
 var _cur_frames := 0
 var _frame_parity := 0     # 隔帧计数
 var _last_frame_lt := -100000
+var _last_track_lt := -100000
+var _track_novid := false   # 上次录下的跟踪期状态（用于识别 novid 翻转，不被限频丢掉）
 
 # ============================== 回放状态 ==============================
 
@@ -116,6 +119,27 @@ func record_frame(jpeg: PackedByteArray) -> void:
 	if _append({"t": _lt_ms, "k": "frame", "f": name}):
 		_n_frames += 1
 		_write_file_async(_CUR + "/frames/" + name, jpeg)
+
+## 跟踪叠加层（板端 track 上行）：夹取/跟踪期板端**不推视频**，画面全靠这层
+## "标尺网格 + 跟踪点"。不录它 ⇒ 回放时那段既没帧也没状态，画面冻在夹取前一张。
+## 键名与板端 track 消息保持一致（u/v/conf/st/novid），回放端同一段代码两边通用。
+func record_track(u: float, v: float, conf: float, st: String, novid: bool) -> void:
+	var flip := novid != _track_novid
+	_track_novid = novid
+	# novid 翻转（跟踪开始/结束）必须落盘：它决定回放是显示跟踪画面还是真实画面，丢了就卡死在另一种。
+	# 收尾那条（flip 到不 novid）即便已退出录制态也要录：中止/掉线时 AI 先停、板端后补 idle，
+	# 漏掉它回放会永远停在跟踪画面。逻辑时钟已冻结 ⇒ t 就是最后一刻，正好接在夹取段末尾。
+	if not _ai_running and not flip:
+		return
+	if not flip and _lt_ms - _last_track_lt < _TRACK_MIN_GAP_MS:
+		return
+	_last_track_lt = _lt_ms
+	var ev := {"t": _lt_ms, "k": "track", "st": st, "novid": novid}
+	if st != "idle":
+		ev["u"] = u
+		ev["v"] = v
+		ev["conf"] = conf
+	_append(ev)
 
 ## 归档当前趟（/clear 调用）。没跑过 AI 则整趟丢弃。
 func archive_current() -> void:
@@ -294,6 +318,8 @@ func _reset_current() -> void:
 	_cur_frames = 0
 	_frame_parity = 0
 	_last_frame_lt = -100000
+	_last_track_lt = -100000
+	_track_novid = false
 
 ## 追加一条事件。返回是否真的写进去了（写失败不计数，免得 meta 与内容对不上）。
 func _append(ev: Dictionary) -> bool:

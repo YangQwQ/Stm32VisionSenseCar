@@ -897,14 +897,9 @@ static void land_observe_one(RoundCtx& c, JsonObjectConst ob) {
                fwd >= 0 ? "前" : "后", fwd >= 0 ? fwd : -fwd);
       size_t used = strlen(c.obs_echo);
       if (used + strlen(one) < sizeof(c.obs_echo)) memcpy(c.obs_echo + used, one, strlen(one) + 1);
-      // 标范围: 若 AI 给了框宽高 w/h(归一化), 用"底部中心"换算框中心种给本地追踪器。
-      // 放大图时框尺寸也按裁框比例换回全幅(与 px/py 同源); 未给框则用缺省框高, 仍按底部中心折算。
-      float bw = ob["w"] | 0.0f, bh = ob["h"] | 0.0f;
-      if (c.sent_zoomed) { bw *= (c.sent_x1 - c.sent_x0); bh *= (c.sent_y1 - c.sent_y0); }
-      if (bh <= 0.0f) bh = TRACK_SEED_H;
-      track::seed(nm, px, py - bh * 0.5f, bw, bh);
-      ai::logf("[track] observe 定范围: '%s' 中心(%.3f,%.3f) 框(%.3f,%.3f) → 已锁定",
-               nm, (double)px, (double)(py - bh * 0.5f), (double)bw, (double)bh);
+      // observe 只记录坐标，不再种本地跟踪（跟踪锁定收敛到 auto_grasp 一处）：AI 隔几轮就要 look 看
+      // 画面，若 observe 锁了跟踪，相机就得在 RGB565/JPEG 间来回重切（每次 ~1s + AWB 重暖），且手机
+      // 端会"莫名其妙"停在跟踪画面。原 here 处的 track::seed 已删。
     } else {
       ai::logf("[ai] 观测「%s」像素(%.2f,%.2f)不可用(越界/解算失败), 未记录", nm, px, py);
     }
@@ -1429,7 +1424,7 @@ static void do_grasp(RoundCtx& c, const char* args, char* out, size_t cap) {
   char verr[128];
   const char* e = ai::validate_cmd(args[0] ? args : "{}", cmdD, verr, sizeof(verr));
   if (e) {
-    snprintf(out, cap, "[执行结果] | [grasp] 参数未通过校验(%s) —— 本次未执行, 请修正后重新调用 grasp。", e);
+    snprintf(out, cap, "[执行结果] | [auto_grasp] 参数未通过校验(%s) —— 本次未执行, 请修正后重新调用 auto_grasp。", e);
     return;
   }
   JsonObjectConst g = cmdD["grasp"].is<JsonObject>() ? cmdD["grasp"].as<JsonObjectConst>() : JsonObjectConst();
@@ -1437,12 +1432,12 @@ static void do_grasp(RoundCtx& c, const char* args, char* out, size_t cap) {
   const float w = g["w"] | 0.0f, h = g["h"] | 0.0f;
   const char* nm = g["name"] | "";
   if (!(x >= 0.0f && x <= 1.0f) || !(y >= 0.0f && y <= 1.0f)) {
-    snprintf(out, cap, "[执行结果] | [grasp] 缺 x/y = 目标画面位置(0~1)，本次未执行。");
+    snprintf(out, cap, "[执行结果] | [auto_grasp] 缺 x/y = 目标画面位置(0~1)，本次未执行。");
     return;
   }
   if (c.acted) {
     snprintf(out, cap, "[执行结果] | [grasp] 本回合已执行过 car 动作(车可能已移动) ⇒ 你手上的画面坐标已过时，"
-                       "本次未夹取; 请**下一条消息单独调用 grasp**。");
+                       "本次未夹取; 请下一条消息单独调用 auto_grasp。");
     return;
   }
   if (!grasp::request(x, y, w, h, nm)) {
@@ -1660,7 +1655,7 @@ static void dispatch_calls(RoundCtx& c) {
     const char* rc = c.calls["reasoning"] | "";
     if (rc[0]) tn->reasoning = ps_dup(rc);
   } else ai::logf("[ai] 历史环不可用, 本回合的调用不记入历史");
-  static const char* kOrder[] = { "mem", "task", "say", "car", "grasp", "look", "compact", "goal" };
+  static const char* kOrder[] = { "mem", "task", "say", "car", "auto_grasp", "look", "compact", "goal" };
   const int kOrderN = (int)(sizeof(kOrder) / sizeof(kOrder[0]));
   const int cap_n = n < 16 ? n : 16;   // 超出部分直接不记(assistant 只列我们记下的, 不会产生孤儿)
   bool handled[16] = {false};
@@ -1685,7 +1680,7 @@ static void dispatch_calls(RoundCtx& c) {
     else if (!strcmp(kOrder[oi], "task")) do_task(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "say"))  do_say(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "car"))  do_car(c, args, res, sizeof(res));
-    else if (!strcmp(kOrder[oi], "grasp")) do_grasp(c, args, res, sizeof(res));
+    else if (!strcmp(kOrder[oi], "auto_grasp")) do_grasp(c, args, res, sizeof(res));
     else if (is_look)                     ok = do_look(c, args, res, sizeof(res));
     else if (!strcmp(kOrder[oi], "compact")) do_compact(c, args, res, sizeof(res));
     else                                  do_goal(c, args, res, sizeof(res));

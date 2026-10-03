@@ -42,7 +42,7 @@ struct Upd {
 // wide=true 时用更大的尺度候选（=更宽的搜索半径），供"丢失后重捕"用。
 // need_psr：**本帧的最低可信度**。不达标就当作"本帧没跟上"：位置、尺度、滤波器**一律不动**
 // —— 这一条是防死亡螺旋的关键（曾经只挡训练、位置/尺度照更新 ⇒ 一帧坏匹配把窗口缩小，越缩越小）。
-Upd update(const uint8_t* gray, const uint8_t* chr, int gw, int gh, float pred_u, float pred_v, bool wide, float need_psr);
+Upd update(const uint8_t* gray, const uint8_t* chr, int gw, int gh, float pred_u, float pred_v, bool wide, float need_psr, bool size_fix);
 
 void stop();          // 清状态（下次要重新 start）
 bool active();        // 是否处于跟踪中

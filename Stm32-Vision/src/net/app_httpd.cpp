@@ -566,7 +566,8 @@ static void maybe_send_track_pos(void)
                      (double)u, (double)v, (double)track::last_conf(), track::state_name(track::state()));
         } else {
             // 尚无有效中心(仍在锁定中)：只报状态、不带坐标，手机据此清掉旧标记，避免残留在左上角。
-            snprintf(buf, sizeof(buf), "{\"type\":\"track\",\"st\":\"%s\"}",
+            // novid=1 照旧带上：跟踪期一律不推视频，漏了它手机会把冻结的旧画面放回来（起跟瞬间闪一下）。
+            snprintf(buf, sizeof(buf), "{\"type\":\"track\",\"st\":\"%s\",\"novid\":1}",
                      track::state_name(track::state()));
         }
         ws_send_text_to_ws_clients(buf);

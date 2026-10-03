@@ -69,6 +69,7 @@ static volatile unsigned long s_last_upd_ms = 0;   // 上次 update 完成时刻
 static volatile unsigned long s_last_cap_ms = 0;   // 上次处理的帧的拍摄时刻（update 入口 stamp）：结果到达时刻
                                                    // 含 ~280ms 解码+搜索延迟，判"画面是否动作后拍的"得以此为准
 static volatile bool s_last_ok = false;            // 最近一帧是否被采纳（PSR 达标）
+static int s_wide_left = 0;                        // "预期宽窗"剩余帧数（hint_wide 设置，用完即回正常窗）
 
 // 内部：从一帧一次抽出降采样 luma 与 chroma（任一可空）。
 // 返回 0 成功；-1 参数非法；-2 输出缓冲不够；-4 帧不是 RGB565（如高清 JPEG 快照）。
@@ -256,12 +257,12 @@ static bool magic_range(const uint8_t* chr, int gw, int gh, int ccx, int ccy, in
     const int tols[4] = { TRACK_MAGIC_TOL, 25, 15, 8 };
     for (int ti = 0; ti < 4; ti++) {
       const int ctol = tols[ti];
-      int n = 0, ax = 0, ay = 0, minx = bw, maxx = -1, miny = bh, maxy = -1;
+      int n = 0, ax = 0, ay = 0, minx = bw, maxx = -1, miny = bh, maxy = -1, achr = 0;
       for (int y = 0; y < bh; y++) {
         const uint8_t* r = chr + (size_t)(y0 + y) * gw + x0;
         for (int x = 0; x < bw; x++) {
           if (abs((int)r[x] - ref) <= ctol) continue;   // 像四周 ⇒ 不算主体
-          n++; ax += x; ay += y;
+          n++; ax += x; ay += y; achr += (int)r[x];
           if (x < minx) minx = x; if (x > maxx) maxx = x;
           if (y < miny) miny = y; if (y > maxy) maxy = y;
         }
@@ -284,6 +285,10 @@ static bool magic_range(const uint8_t* chr, int gw, int gh, int ccx, int ccy, in
       if (big_enough && shape_ok && centered) {
         *ox = x0 + ax / n; *oy = y0 + ay / n;
         *ow = bw2; *oh = bh2;
+        // 种子质量自证：主体色度均值须明显高于环带。真彩色方块 25~60 vs 地面 ~10；
+        // 两者几乎无差 = 圈到的是地面纹理（实测锁错后整场跟的都是错的东西，外观自洽无从察觉）。
+        blog::logf(blog::AI, "[track] 魔棒接受: 主体色度均值=%d 背景=%d%s",
+                   achr / n, ref, (achr / n - ref >= 12) ? "" : " (主体与背景几乎无色差, 种子可疑!)");
         return true;
       }
       blog::logf(blog::AI, "[track] 魔棒 pass%d tol=%d 不接受(%s%s%s), 换下一档",
@@ -360,6 +365,14 @@ void hint_motion(float du, float dv) {
   if (s_mtx && xSemaphoreTake(s_mtx, 0) != pdTRUE) return;   // 拿不到就算了（下次 update 仍走图像预测）
   s_t.pred_u = du; s_t.pred_v = dv;
   s_t.has_pred = true;
+  if (s_mtx) xSemaphoreGive(s_mtx);
+}
+void hint_wide(float du, float dv) {
+  ensure_mtx();
+  if (s_mtx && xSemaphoreTake(s_mtx, 0) != pdTRUE) return;
+  s_t.pred_u = du; s_t.pred_v = dv;
+  s_t.has_pred = true;
+  s_wide_left = 3;                              // 接下来三帧走宽窗+恢复期门槛（预期大位移，非丢后重捕）
   if (s_mtx) xSemaphoreGive(s_mtx);
 }
 
@@ -498,11 +511,19 @@ static Result update_locked(const camera_fb_t* fb, bool light) {
     // 再叠加图像位移预测。相关滤波只需要一个"目标大概在哪"的窗心。
     float pu = s_t.raw_u, pv = s_t.raw_v;
     if (s_t.has_pred) { pu += s_t.pred_u; pv += s_t.pred_v; }
-    const bool wide = (s_t.st == State::Lost);
+    // wide：丢失重捕，或 grasp 宣告的"预期宽窗"（近场后退/大转角后的一两帧——窗心已在 hint
+    // 位置，宽窗只为容住比预测更大的实际位移；不是丢后瞎找）。
+    const bool wide_frame = s_wide_left > 0;
+    const bool wide = (s_t.st == State::Lost) || wide_frame;
+    if (wide_frame) s_wide_left--;
     // 接收门限：PSR。已在跟(keep)比重新捕获(lost 放宽窗重捕)松一些。**低于门限的帧在 dcf 内部就被
     // 整个丢弃**（位置/尺度/滤波器都不动），所以这里只看 du.ok。
+    // 预期宽窗帧与正常跟踪同一门槛（TRACK_PSR_KEEP 已按恢复期校准）：大转角/大位移后响应要几帧才恢复锐利
     const float need_psr = (s_t.st == State::Tracking) ? TRACK_PSR_KEEP : TRACK_PSR_LO;
-    dcf::Upd du = dcf::update(s_lum, s_chr, gw, gh, pu, pv, wide, need_psr);
+    // 尺寸修正只给"丢失重捕"的宽窗：预期宽窗（自己动作后的恢复期）失败时位置本就在原地，
+    // 按 best_scale 放缩会让 s_obj 两帧翻 4 倍（实测 39→109px）
+    const bool lost_wide = wide && (s_t.st == State::Lost);
+    dcf::Upd du = dcf::update(s_lum, s_chr, gw, gh, pu, pv, wide, need_psr, lost_wide);
     s_us_search = (int)(esp_timer_get_time() - t0d);
     s_last_scale = du.scale;
     s_last_obj = du.obj_px;      // 诊断：本帧目标边长(px)
@@ -543,6 +564,8 @@ static Result update_locked(const camera_fb_t* fb, bool light) {
       s_t.st = State::Tracking;
       s_t.frames++;
       r.ok = true;
+    } else if (wide_frame) {
+      // 预期宽窗恢复期：PSR 还没恢复锐利是正常的，不计 miss、不判丢（宽窗帧用完自然回到正常门）
     } else {
       s_t.miss++;
       if (!s_reacq && s_t.miss >= TRACK_LOST_N) {
@@ -595,6 +618,7 @@ void stop() {
   s_t.miss = 0;
   s_t.name[0] = 0;
   s_last_ok = false;
+  s_wide_left = 0;
   s_scale = TRACK_SCALE;        // 抽点回默认（下次 seed 按目标大小重选）
   dcf::stop();                  // 相关滤波状态一并清掉（下次要重新 start）
   if (lk) xSemaphoreGive(s_mtx);

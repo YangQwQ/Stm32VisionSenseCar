@@ -9,7 +9,10 @@
 namespace dcf {
 
 // ---- 可调参数（调这些就够，别动结构） ----
-static const int   N        = 64;      // 频域网格边长（必须是 2 的幂）
+static const int   N        = 32;      // 频域网格边长（必须是 2 的幂）。64→32：搜索/FFT 4 倍提速，
+                                       // 换取跟踪帧率 ~2 倍 —— 大转角不再是"一次 0.2u 的瞬移"，滤波器
+                                       // 能骑上平滑旋转（实测大转角跟丢的主因就是帧间跳变太大）。
+                                       // 代价：响应图/外观分辨率减半，亚像素拟合补偿，PSR 门待验证。
 static const int   NN       = N * N;
 static const float K_WIN    = 6.0f;    // 源窗边长 = 目标边长 × 此倍数 ⇒ 搜索半径 ≈ 2.5×目标。
                                       // ⚠️ 必须罩住"一步动作的位移"：原地转 25° 位移≈0.15归一化(=48px@320)，
@@ -43,13 +46,17 @@ static const float APPEAR_MIN = 0.45f;
 // （run9 `#15 外观0.43` 就是靠它救的）。但不能太松：臂/夹爪最高能到 0.43，0.35 会把臂也放进来
 // （run11 重捕抓到臂上、外观 0.36~0.43）。取 0.40。
 static const float APPEAR_MIN_REACQ = 0.40f;
-// 锚定自适应：appear ≥ 这个值才允许把锚定往当前外观带（慢，APPEAR_ETA/帧）。见 seed_blend 的说明。
-static const float APPEAR_LEARN = 0.70f;
-static const float APPEAR_ETA   = 0.06f;
+// 锚定自适应：appear ≥ 这个值才允许把锚定往当前外观带（APPEAR_ETA/帧）。见 seed_blend 的说明。
+// 0.70→0.45：短距离逼近时外观每步掉 ~0.2（视角+遮挡），旧值 0.70 让锚定在 0.7 以下就冻结，
+// 冻结的锚定追不上衰减 ⇒ 门 0.45 击穿 ⇒ 收官必丢。降到与门同高 = 每个采纳帧都跟着衰减走；
+// "锁到别的东西"的突变仍会被门拦住（一步掉到门下），锚定来不及学进去。
+static const float APPEAR_LEARN = 0.45f;
+static const float APPEAR_ETA   = 0.15f;
 
 static bool  s_on = false;
 static int   s_gw = 0, s_gh = 0;
-static float s_obj = 0;          // 目标在灰度图中的边长(px)，随尺度搜索缓慢更新
+static float s_obj = 0;           // 目标在灰度图中的边长(px)，随尺度搜索缓慢更新
+static float s_prev_obj = 0;      // 上一**采纳**帧的 s_obj：尺寸跳变否决用（刚体一帧不会翻倍）
 static float s_cx = 0, s_cy = 0; // 目标中心(平面 px)
 static float s_scale = 1.0f;     // 相对起跟时的尺度（对外报告）
 static float s_appear = 0.0f;    // 最近一次算出的"与起跟外观的 NCC"（被拒帧/重捕帧沿用，避免日志里出现 0 被误读）
@@ -166,7 +173,8 @@ static void extract(const uint8_t* g, float cx, float cy, float W) {
 // —— 两者重叠、阈值根本分不开）。目标本体只占中心 ±(N/2)/K_WIN ≈ ±5 格，所以只取中心这块比。
 // 记下"起跟时目标本来的样子"：把该区存成**零均值、单位模**，之后每帧与它做 NCC。
 // 区外留 0，于是点积可以照常走满 N×N（区外两边都乘了 0）。
-static const int APPEAR_R = 6;   // 中心区半宽（格）：13×13，覆盖目标本体（±N/(2*K_WIN)≈±5.3）
+static const int APPEAR_R = N / 12 + 1;   // 中心区半宽（格）：目标本体占 ±N/(2*K_WIN)≈±N/12，外扩 1 格。
+                                          // 随 N 缩放（64→6、32→3），保证外观比的是"目标本体"而不是混进背景
 
 static void seed_capture() {
   const int c = N / 2, R = APPEAR_R;
@@ -291,6 +299,7 @@ bool start(const uint8_t* gray, const uint8_t* chr, int gw, int gh, float u, flo
   s_chrp = chr; s_chrw = gw; s_chrh = gh;   // 供色度门采样（可为空）
 
   s_obj = obj_norm * (float)(gw > gh ? gw : gh);          // 目标边长(px)
+  s_prev_obj = 0;                                         // 新目标：首帧无否决基准
   if (s_obj < 20.0f) s_obj = 20.0f;   // 目标尺寸下限：远距离框小 ⇒ s_obj 小 ⇒ 窗小 ⇒ 搜索半径不够、一步就出窗（用户实测"拉框小了容易跟丢"）。20px 保证半径≥2.5×20=50px
   s_cx = u * (float)gw; s_cy = v * (float)gh;
   s_scale = 1.0f;
@@ -439,7 +448,7 @@ static bool correlate(const uint8_t* g, float cx, float cy, float W,
   return true;
 }
 
-Upd update(const uint8_t* gray, const uint8_t* chr, int gw, int gh, float pred_u, float pred_v, bool wide, float need_psr) {
+Upd update(const uint8_t* gray, const uint8_t* chr, int gw, int gh, float pred_u, float pred_v, bool wide, float need_psr, bool size_fix) {
   Upd r = { false, pred_u, pred_v, 0.0f, s_scale, s_obj, 0.0f, s_appear };
   if (!s_on || !gray || gw != s_gw || gh != s_gh || s_obj <= 0.0f) return r;
   s_chrp = chr; s_chrw = gw; s_chrh = gh;   // 本帧的饱和度平面（色度门用）
@@ -488,7 +497,9 @@ Upd update(const uint8_t* gray, const uint8_t* chr, int gw, int gh, float pred_u
     // 但**重捕档要允许只修正目标尺寸**，否则会死锁：逼近中目标变大 ⇒ s_obj 偏小 ⇒ 目标在网格里过大 ⇒
     // 匹配不上 ⇒ PSR 不达标 ⇒ 尺寸不许更新 ⇒ 永远修不回来（真机实测：倍率掉到 0.28、全图重捕也找不到）。
     // 这里只动尺寸（不动位置、不训练），下一帧就能拿对的尺寸重新匹配。
-    if (wide) {
+    // 尺寸修正只属于"丢失重捕"：预期宽窗（自己动作后的恢复期）PSR 失败时目标位置本就该在原地，
+    // 此时按 best_scale 放缩会让 s_obj 两帧翻 4 倍（实测 39→109px），把后续跟踪全带歪。
+    if (wide && size_fix) {
       float f = best_scale;
       if (f < 0.5f) f = 0.5f; else if (f > 2.0f) f = 2.0f;
       s_obj *= f;
@@ -518,6 +529,14 @@ Upd update(const uint8_t* gray, const uint8_t* chr, int gw, int gh, float pred_u
     if (s_obj < 20.0f) s_obj = 20.0f;   // 目标尺寸下限：远距离框小 ⇒ s_obj 小 ⇒ 窗小 ⇒ 搜索半径不够、一步就出窗。20px 保证半径≥2.5×20=50px
     const float max_obj = (float)(gw < gh ? gw : gh) * 0.6f;
     if (s_obj > max_obj) s_obj = max_obj;
+  }
+  // ★ 尺寸跳变否决：目标本体是刚体，自己动作引起的尺寸变化每帧有限(±25%)。宽窗帧里峰值滑到
+  // 旁边的大块纹理（臂架/箱体）时 best_scale 会翻倍 —— 尺寸跳变就是"不是同一个刚体"的指纹
+  // （实测 38→76→152px 三帧滑上臂架，外观 0.5~0.6 的门拦不住）。丢失重捕档除外（它本来就要
+  // 跨尺度找回）。按未跟上报，位置/尺寸/滤波器全部不动。
+  if (!size_fix && s_prev_obj > 1.0f && s_obj > s_prev_obj * 1.6f) {
+    s_cx = old_cx; s_cy = old_cy; s_obj = old_obj; s_scale = old_scale;
+    return r;
   }
 
   // 学习门①（防漂移）：峰值离窗心太远（> 半径的 0.6）说明"目标已经贴到窗边"——多半是锁到了别的物体。
@@ -558,6 +577,7 @@ Upd update(const uint8_t* gray, const uint8_t* chr, int gw, int gh, float pred_u
   }
 
   r.ok = true;
+  s_prev_obj = s_obj;   // 只有"确认采纳"的帧才更新尺寸基准（被外观门/尺寸否决回滚的不算）
   r.obj_px = s_obj;
   r.u = s_cx / (float)gw;
   r.v = s_cy / (float)gh;

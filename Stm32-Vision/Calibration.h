@@ -116,7 +116,10 @@ inline constexpr int   TRACK_TW_MAX       = 48;
 // ---- 相关滤波（dcf）的 PSR 门限 ----
 // PSR = (峰值 − 旁瓣均值) / 旁瓣标准差。MOSSE 类方法的通用经验：>20 非常可信、7~20 良好、<7 多半被遮挡/丢失。
 // 保持门比捕获门松，避免"分刚好卡在门限下就永远救不回"（NCC 时代真机踩过这个坑）。
-inline constexpr float TRACK_PSR_KEEP     = 6.0f;    // 已在跟时用
+inline constexpr float TRACK_PSR_KEEP     = 4.5f;    // 已在跟时用（含预期宽窗恢复期，两档合一）。N 64→32 后 PSR
+                                                     // 分布下移 ~1 分、短距离外观衰减再压一截（实测正确锁定
+                                                     // 在 PSR 4.7 被旧门 5.0 拒掉）；锁错的甄别主要靠外观门
+                                                     // + 动作响应判据，PSR 门只做连续性检查
 inline constexpr float TRACK_PSR_LO       = 8.0f;    // 从锁定/丢失重捕时用
 inline constexpr float TRACK_SNAP_WIN   = 0.12f;   // 种子吸附搜索窗（归一化）：标记只是"大致位置"，板端在此窗口内
                                                   // 用色度峰值把种子精确吸到目标上（实测手标常偏 30px，不吸附就锁到地面）
@@ -143,8 +146,8 @@ inline constexpr int   TRACK_REFRESH_MS   = 80;      // 喂帧下限间隔(ms)�
 
 // ---- 本地自动夹取（标位置 → arm low → 对准 u → 前进到 v → 合爪；纯画面闭环，不经 AI）----
 // 实现见 src/ai/grasp.cpp。全程只看画面里目标的归一化坐标 (u,v)，不用单应/全局坐标。
-inline constexpr float GRASP_U_TGT     = 0.49f;  // 对准目标：物体应到的画面 u
-inline constexpr float GRASP_V_TGT     = 0.575f;   // 到位目标：物体应到的画面 v
+inline constexpr float GRASP_U_TGT     = 0.485f;  // 对准目标：物体应到的画面 u
+inline constexpr float GRASP_V_TGT     = 0.579f;   // 到位目标：物体应到的画面 v
 // ⚠️ 容差必须**大于**执行器最小可分辨位移，否则闭环必然来回摆动（实测：最小可分辨转角≈4° ⇒ Δu≈0.036，
 // 容差设 0.025 时车左右转过头、永远收敛不了，最后停在一次跳变帧上合爪 → 横向偏约 10°）。
 inline constexpr float GRASP_U_TOL     = 0.045f;  // u 对准容差（**中距**参考值；实际用的容差按距离插值，见下）
@@ -157,9 +160,8 @@ inline constexpr float GRASP_U_TOL_NEAR  = 0.030f;  // v = GRASP_V_TGT 时用（
 inline constexpr float GRASP_U_TOL_V_FAR = 0.30f;   // 从 v=此值开始线性收紧（≈距离 45~50cm）
 inline constexpr float GRASP_U_TOL_AIM   = 0.60f;   // "居中优先"：先朝 容差×此系数 收，连续没进展再退到整容差
 inline constexpr float GRASP_V_TOL     = 0.035f;
-inline constexpr float GRASP_CLOSE_U_MAX = 0.06f; // "爪口区就地合爪"的 u 前提：最后有效位置离 u_aim 的最大距离。
-                                                  // 合爪只发生在 u_aim 附近，u 还差得远时合的是空气
-                                                  // （实测 u 差 0.30 也去合，空合还上报"可能已夹取"）。
+inline constexpr float GRASP_CLOSE_U_MAX = 0.035f; // "可夹"的 u 偏差上限（可夹即收/爪口就地合爪共用）。
+                                                   // 实测边界：u 差 0.003~0.031 全部夹住，0.044/0.057 空夹。
 inline constexpr float GRASP_CLOSE_V_LO = 0.08f;  // 爪口区下界 = V_TGT - 此值：跟踪丢失/冻结时最后位置在此带内才就地合爪
 inline constexpr float GRASP_CLOSE_V_HI = 0.06f;  // 上界 = V_TGT + 此值：比可夹点还近这么多仍没合的，说明是逼近过头，
                                                   // 合爪只会把方块推走（实测 v=0.67 拿 stale 位置空合）—— 该退开重来
@@ -201,7 +203,8 @@ inline constexpr float GRASP_RADIUS_FRAC = 0.70f;
 // 夹爪在帧间完全一致、PSR 天生最高，真机实测 u 恒定 0.520、车转了 250° 也不动，而旧的"误差没变小"
 // 判据被 0.0001 的蠕动反复清零、永不触发。期望位移来自实测增益（du_per_deg / dv_per_cm），比绝对
 // 阈值（旧 GRASP_STUCK_EPS=0.005，已被抖动/透视漂移骗过）稳得多。
-inline constexpr int   GRASP_STUCK_N   = 3;
+inline constexpr int   GRASP_STUCK_N   = 2;       // 3→2(用户实测)：锁到夹爪/反光后连续 2 次后退 v 纹丝不动
+                                                  // 就该中止，退满 3~4 次是在拿车头反复怼目标
 inline constexpr float GRASP_THROTTLE  = 0.25f;
 inline constexpr int   GRASP_LOST_MAX  = 3;       // 连续跟丢帧数上限 → 中止(grasp 里已关追踪器重捕, 跟丢即失败)
 inline constexpr int   GRASP_SPIN_BUDGET = 10;    // 对准阶段累计旋转上限: 转身对不动就中止

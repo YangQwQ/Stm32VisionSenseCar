@@ -639,16 +639,11 @@ func _handle_board_msg(data: Dictionary) -> bool:
 			# 板端物体记忆 + 车姿态快照：喂给记忆地图（画面源=记忆时画）。
 			_video.call("show_map_data", data.get("params"))
 		"track":
-			# 板端跟踪器目标位置（归一化 u/v + 置信度 + 状态）：叠加层画十字/圆圈。
-			# st=idle 表示跟踪已停：清掉叠加，避免残留旧十字。
-			# novid=1：跟踪期板端**不推视频**（省掉整幅软编，真机实测夹取每步快 ~1.5×）→ 手机改显占位。
-			var st_t := str(data.get("st", ""))
-			_video.call("set_track_novid", bool(data.get("novid", false)))
-			if st_t == "idle" or not data.has("u"):
-				_video.call("clear_track")
-			else:
-				_video.call("set_track_target", float(data.get("u", 0.0)),
-					float(data.get("v", 0.0)), float(data.get("conf", 0.0)), st_t)
+			_apply_track(data)
+			# 录进会话：跟踪期板端不推视频，不录这层回放就看不到跟踪画面。
+			Recorder.record_track(float(data.get("u", 0.0)), float(data.get("v", 0.0)),
+				float(data.get("conf", 0.0)), str(data.get("st", "")),
+				bool(data.get("novid", false)))
 		"ai_tool":
 			var tp: Variant = data.get("params")
 			if tp is Dictionary:
@@ -688,6 +683,17 @@ func _handle_board_msg(data: Dictionary) -> bool:
 func _on_stream_toggled(on: bool) -> void:
 	Store.set_stream_on(on)
 	_apply_stream(on)
+
+## 板端 track 上行 → 画面叠加。实时与回放共用（回放事件键名与板端一致）。
+## st=idle / 无坐标：跟踪已停，清掉十字；novid=1：跟踪期板端不推视频，显"标尺网格 + 跟踪点"占位。
+func _apply_track(data: Dictionary) -> void:
+	var st_t := str(data.get("st", ""))
+	_video.call("set_track_novid", bool(data.get("novid", false)))
+	if st_t == "idle" or not data.has("u"):
+		_video.call("clear_track")
+	else:
+		_video.call("set_track_target", float(data.get("u", 0.0)),
+			float(data.get("v", 0.0)), float(data.get("conf", 0.0)), st_t)
 
 ## 控制区收起时输入框贴底、软键盘会盖住它：撑起底部占位把聊天区抬起来，键盘收起即还原。
 ## 弹窗/回放期间不抬（弹窗自带输入框，回放的输入本就禁用）。
@@ -824,6 +830,10 @@ func _on_session_cleared() -> void:
 	_video.call("clear_map")
 
 func _on_replay_event(ev: Dictionary) -> void:
+	# 跟踪叠加层不进聊天区：直接重放到画面上（跟踪期没有帧事件，靠它才有画面）。
+	if str(ev.get("k", "")) == "track":
+		_apply_track(ev)
+		return
 	_chat_panel.call("replay_apply", ev)
 
 func _on_replay_frame(img: Image) -> void:
@@ -832,12 +842,20 @@ func _on_replay_frame(img: Image) -> void:
 func _on_replay_seeked() -> void:
 	# 拖动/回退：清场后由 Recorder 重新抛该点之前的事件。
 	_chat_panel.call("begin_replay")
+	_reset_track_view()
+
+## 清掉跟踪叠加与 novid 占位。回放拖动/退出时用：位置不对的话会残留上一个跟踪期的
+## 网格+十字（回放抛的事件只覆盖它覆盖到的区间），而 novid 残留会让真实画面一直藏着。
+func _reset_track_view() -> void:
+	_video.call("set_track_novid", false)
+	_video.call("clear_track")
 
 func _on_replay_progress(t_ms: int, dur_ms: int) -> void:
 	_playback_bar.call("set_progress", 0.0 if dur_ms <= 0 else float(t_ms) / float(dur_ms))
 
 func _on_replay_finished() -> void:
 	_chat_panel.call("end_replay")
+	_reset_track_view()   # 残留的跟踪占位会让回到实时后画面一直藏着
 	_playback_bar.call("set_paused", true)
 	_apply_layout()
 

@@ -51,6 +51,9 @@ Result update_from_fb(const camera_fb_t* fb, bool light = false);
 // 动作后必然偏差；例如前进 4cm 若按图像预测搜，窗心还停在原地，而目标已经朝画面里挪了。
 // 只在紧随其后的那一次 update 生效（update 末尾会用实测位移重写 pred）。拿不到锁就丢弃（不影响正确性）。
 void hint_motion(float du, float dv);
+// 同 hint_motion，但之后两帧用**宽窗多尺度**（重捕那套窗/门）：给"预期会有大位移"的动作后用
+// （如超近距离的后退，1cm 的画面位移就能超出正常窗）。窗心仍在 hint 位置 —— 是预期位移补偿，非丢后重捕。
+void hint_wide(float du, float dv);
 
 void  stop();                 // 取消跟踪，回 Idle
 // 跟丢后是否允许"放宽搜索窗重捕"(默认允许)。grasp 闭环里关掉: 重捕是宽搜, 抓到什么都可能。

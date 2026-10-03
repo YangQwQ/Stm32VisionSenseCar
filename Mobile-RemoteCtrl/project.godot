@@ -34,7 +34,7 @@ window/handheld/orientation=1
 
 [dotnet]
 
-project/assembly_name="新建游戏项目"
+project/assembly_name="小车遥控"
 
 [editor_plugins]
 
@@ -61,7 +61,8 @@ vjoy_down={
 
 [physics]
 
-3d/physics_engine="Jolt Physics"
+2d/physics_engine="Dummy"
+3d/physics_engine="Dummy"
 
 [rendering]
 

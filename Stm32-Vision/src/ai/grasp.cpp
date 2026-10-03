@@ -54,12 +54,13 @@ static int   s_ep_n = 0;             // 本回合已等的帧数
 // v 方向的搜索窗提示：预测钳到 1.2×窗半径后只取一半。单应把目标**中心**当地面点，近场会高估
 // 每厘米的 Δv（实测 4 倍：预测挪 0.10、实际只挪 0.023）——窗心按满预测放，目标就贴在窗边被
 // PSR 拒掉。半量提示下，实际挪动无论落在 0~预测 之间的哪里，离窗心都 ≤ 半个预测 ⇒ 稳在窗内。
-static float hint_v(float dv_pred) {
+static float hint_v(float dv_pred, bool wide = false) {
   float ru = 0, rv = 0;
   track::search_radius(&ru, &rv);
   const float cap = 1.2f * rv;
   if (cap > 0.0f && fabsf(dv_pred) > cap) dv_pred = (dv_pred > 0.0f ? cap : -cap);
-  track::hint_motion(0.0f, dv_pred * 0.5f);
+  if (wide) track::hint_wide(0.0f, dv_pred * 0.5f);
+  else      track::hint_motion(0.0f, dv_pred * 0.5f);
   return dv_pred * 0.5f;
 }
 
@@ -76,7 +77,7 @@ static float homo_dv_per_cm(float u, float v) {
 }
 
 static uint32_t act_wheels(unsigned long gen, const char* type, JsonDocument& p,
-                           float hint_du = 0.0f, float hint_dv = 0.0f) {
+                           float hint_du = 0.0f, float hint_dv = 0.0f, bool hint_wide = false) {
   s_ep_settled = false; s_ep_has = false; s_ep_n = 0;   // 新动作 ⇒ 新回合，重新等稳态
   exec::act(type, p.as<JsonObjectConst>());
   ai::car_update_pose(type, p.as<JsonObjectConst>());
@@ -85,7 +86,8 @@ static uint32_t act_wheels(unsigned long gen, const char* type, JsonDocument& p,
   ai::settle_wheels(gen, 1500);
   // hint 必须在动作完成后（重新）喂：喂早了会被动作中途处理的帧消费/覆盖（update 每个采纳帧都把
   // pred 改写成图像位移预测），真正需要它的"停车后第一帧"反而拿不到 —— 实测转 13° 窗心纹丝不动。
-  track::hint_motion(hint_du, hint_dv);
+  if (hint_wide) track::hint_wide(hint_du, hint_dv);
+  else           track::hint_motion(hint_du, hint_dv);
   return millis();
 }
 
@@ -442,11 +444,14 @@ static R run(unsigned long gen) {
       ai::logf("[grasp] 已进爪口带(v=%.3f u=%.3f) ⇒ 停止纠正, 直接合爪", (double)tr.v, (double)tr.u);
     }
 
-    // ① 太近优先于对准：v 已冲过可夹点 ⇒ **先退开再说**，别在这里原地转。
-    // 真机实测：一开局就贴着方块（v=0.848 ≈ 2cm）时先去做 u 对准，一转身夹爪就撞上方块，
-    // 之后整段都在跟"随车一起动的夹爪"（u 恒定、conf 满格）。宁可先退几步把距离拉到正常区间。
-    // force_grasp（已决定就地合爪）时跳过：那时再退只会把方块退出爪区。
-    if (!force_grasp && ev > GRASP_V_TOL) {
+    // ① 太近 或 爪口带内 u 超出可夹范围 ⇒ 后退弧：拉开距离的同时把车头摆过去。
+    // 近场的原地转/前进弧都纠不动 u（实测差 0.024 连推三下纹丝不动），退到中距离再转才有效。
+    // 一步退够（u 超限固定 3cm）—— 1cm 地蹭，蹭的总里程够对准两次，还把方块蹭离爪区（实测空夹）。
+    // 真机实测：一开局就贴着方块时先去做 u 对准，一转身夹爪就撞上方块，之后整段都在跟
+    // "随车一起动的夹爪"（u 恒定、conf 满格）。force_grasp（已决定就地合爪）时跳过。
+    const bool u_out_of_grasp = (tr.v >= GRASP_V_TGT - GRASP_V_TOL &&
+                                 fabsf(eu_aim) > GRASP_CLOSE_U_MAX);
+    if (!force_grasp && (ev > GRASP_V_TOL || u_out_of_grasp)) {
       // ★ 物理判据放最前、且**不受 back_n 上限限制**：退了 pend_cm 而 v 没动（相对判据见上），
       //   就说明跟的根本不是"能随车动的物体"（夹爪/影子/反光点）。
       //   旧代码把它关在 `back_n < GRASP_BACK_MAX_N` 里：退满 4 次后整段被跳过 → 直接掉到 ④"合爪"，
@@ -466,6 +471,7 @@ static R run(unsigned long gen) {
           if (hv > 1e-4f) dv_per_cm = hv;
         }
         float bcmf = (float)GRASP_MOVE_GAIN_CM * ev;
+        if (ev <= GRASP_V_TOL) bcmf = (float)GRASP_MOVE_MAX_BACK_CM;   // u 超限（非太近）：退够距离转向才有效
         {
           float ru = 0, rv = 0;
           track::search_radius(&ru, &rv);
@@ -476,10 +482,12 @@ static R run(unsigned long gen) {
         }
         if (bcmf < (float)GRASP_MOVE_MIN_CM) bcmf = (float)GRASP_MOVE_MIN_CM;
         if (bcmf > (float)GRASP_MOVE_MAX_BACK_CM) bcmf = (float)GRASP_MOVE_MAX_BACK_CM;
-        // 超近(v>0.65)时一步 2~3cm 的画面位移/视角变化会让外观分崩掉（实测外观 -0.44 直接判丢）——
-        // 小步退，每次退完滤波器还认得，分几步拉开
-        if (tr.v > 0.65f && bcmf > 1.0f) bcmf = 1.0f;
+        // 超近(v>0.65)的画面位移/视角变化大（实测外观会崩）——最多退 2cm，宽窗兜跟踪
+        if (tr.v > 0.65f && bcmf > 2.0f) bcmf = 2.0f;
         int bcm = (int)(bcmf + 0.5f);
+        // 即便 1cm，超近的画面位移也可能贴满正常窗（实测峰偏移 0.68 仍被 PSR 拒）——
+        // 之后两帧用宽窗：窗心仍在 hint 位置，只是容得住比预测更大的实际位移
+        const bool back_wide = tr.v > 0.65f;
         JsonDocument bp(&g_js_alloc);
         bp["throttle"] = -GRASP_THROTTLE; bp["distance_cm"] = bcm;   // 负油门 = 后退
         // u 也没对准 ⇒ 退的同时把车头摆过去（后退弧）。后退时转向导致的车头旋转与前进相反，符号取反。
@@ -487,37 +495,27 @@ static R run(unsigned long gen) {
         // u 一轮才挪 0.03）；后退弧一步同时修 v 和 u。
         const bool arc_back = !force_grasp && fabsf(eu_aim) > u_tol_use;
         bp["steering"] = arc_back ? (eu_aim > 0.0f ? -1.0f : 1.0f) * GRASP_STEER_ALIGN : 0.0f;
-        ai::logf("[grasp] 太近(v=%.3f 超 %.3f) → 后退 %dcm%s (%d/%d)", (double)tr.v, (double)ev, bcm,
-                 arc_back ? "+摆头" : "", back_n, GRASP_BACK_MAX_N);
-        const float hdv = hint_v(-(dv_per_cm * (float)bcm));   // 后退 ⇒ 目标往 v 减小的方向挪（保守半量提示）
+        if (u_out_of_grasp && ev <= GRASP_V_TOL)
+          ai::logf("[grasp] 爪口带内 u 超可夹范围(差%.3f) → 退 %dcm+摆头 重来 (%d/%d)",
+                   (double)fabsf(eu_aim), bcm, back_n, GRASP_BACK_MAX_N);
+        else
+          ai::logf("[grasp] 太近(v=%.3f 超 %.3f) → 后退 %dcm%s (%d/%d)", (double)tr.v, (double)ev, bcm,
+                   arc_back ? "+摆头" : "", back_n, GRASP_BACK_MAX_N);
+        const float hdv = hint_v(-(dv_per_cm * (float)bcm), back_wide);   // 后退 ⇒ 目标往 v 减小的方向挪（保守半量提示）
         pend_v = tr.v; pend_um = tr.u; pend_cm = (float)bcm;
         motion_cmds++;
-        t_motion_end = act_wheels(gen, "move", bp, 0.0f, hdv);
+        t_motion_end = act_wheels(gen, "move", bp, 0.0f, hdv, back_wide);
         continue;
       }
       // 退到上限还是太近，而 v 并非"完全不动"（否则上面已中止）：说明确实贴得近却拉不开距离。
       // 不再静默掉进 ④"合爪"（那正是贴脸乱夹的来源），明确中止。
-      ai::logf("[grasp] 已后退 %d 次仍太近(v=%.3f 超 %.3f), 中止", back_n, (double)tr.v, (double)ev);
+      ai::logf("[grasp] 已后退 %d 次仍未就位(v=%.3f u差%.3f), 中止", back_n, (double)tr.v,
+               (double)fabsf(eu_aim));
       return R::NoProgress;
     }
 
-    // ② 先对准 u（原地小角，分步收敛）
-    // ★ 贴近后**不再原地旋转**：目标离旋转轴很近，每转一下夹爪就把方块扫开（实测转完 u 反而更歪、
-    //   最后合爪时方块已被推到旁边）。进了可夹纵深就改用**带转向的前进**画弧对准，轮子不走横扫轨迹。
-    if (!force_grasp && (tr.v >= GRASP_V_TGT - GRASP_V_TOL) && fabsf(eu_aim) > u_tol_use) {
-      aligned_n = 0;
-      JsonDocument p(&g_js_alloc);
-      p["throttle"] = GRASP_THROTTLE;
-      p["steering"] = (eu_aim > 0.0f ? 1.0f : -1.0f) * GRASP_STEER_ALIGN;
-      p["distance_cm"] = GRASP_MOVE_MIN_CM + 1;
-      ai::logf("[grasp] 近距纠 u: 带转向前进 %dcm (steer=%+.2f, u=%.3f → %.3f)",
-               GRASP_MOVE_MIN_CM + 1, (double)p["steering"], (double)tr.u, (double)u_aim);
-      pend_v = tr.v; pend_um = tr.u; pend_cm = (float)(GRASP_MOVE_MIN_CM + 1);
-      motion_cmds++;
-      const float hdv = hint_v(dv_per_cm * (float)(GRASP_MOVE_MIN_CM + 1));
-      t_motion_end = act_wheels(gen, "move", p, 0.0f, hdv);
-      continue;
-    }
+    // ② 对准 u：原地小角，分步收敛。爪口带内的 u 纠正已全部交给 ① 的后退弧（近场原地转/前进弧
+    //   都纠不动 u，还会把方块蹭开），能走到这里说明 v 还在带外、旋转是安全的。
     if (!force_grasp && fabsf(eu_aim) > u_tol_use) {
       aligned_n = 0;
       // 步长按**几何角速率**定：目标随车旋转的 bearing 变化 ≈ 转角本身，Δu ≈ 转角/水平FOV。
@@ -526,14 +524,18 @@ static R run(unsigned long gen) {
       int deg = (int)(fabsf(eu_aim) / GRASP_DU_PER_DEG_GEO);
       if (deg < GRASP_SPIN_MIN_DEG) deg = GRASP_SPIN_MIN_DEG;
       if (deg > GRASP_SPIN_MAX_DEG) deg = GRASP_SPIN_MAX_DEG;
-      // ★ 再按**追踪器当前搜索半径**收一层：这一步的预期位移必须落在半径内，
-      // 否则一步就把目标转出窗。
+      // ★ 正常窗半径只容得下 ~0.7×半径的位移；预期位移超出 ⇒ 这之后两帧改用**预期宽窗**
+      //   （窗心仍在 hint 位置，宽窗只是容得住更大的实际位移），步长保持按误差给——
+      //   旧做法把步长砍到一点点，误差 0.4 也要蹭七八轮。
       float ru = 0, rv = 0;
+      bool spin_wide = false;
       track::search_radius(&ru, &rv);
       if (ru > 0.0f) {
-        int deg_cap = (int)(GRASP_RADIUS_FRAC * ru / GRASP_DU_PER_DEG_GEO);
-        if (deg_cap < GRASP_SPIN_MIN_DEG) deg_cap = GRASP_SPIN_MIN_DEG;
-        if (deg > deg_cap) deg = deg_cap;
+        const int deg_cap = (int)(GRASP_RADIUS_FRAC * ru / GRASP_DU_PER_DEG_GEO);
+        if (deg > deg_cap) {
+          spin_wide = true;
+          if (deg > GRASP_SPIN_MAX_DEG) deg = GRASP_SPIN_MAX_DEG;
+        }
       }
       const int dir = eu_aim > 0 ? 1 : -1;
       // 阻尼：本次方向与上次相反 ⇒ 上一脚转过头了，步长减半，避免在目标两侧来回蹭
@@ -549,7 +551,10 @@ static R run(unsigned long gen) {
       pend_u = tr.u; pend_deg = (float)deg;   // 记录在途测量：下一次成功帧用它刷新 du_per_deg
       u_before_action = tr.u;                 // 记录本次旋转前的 u：下一帧判"目标有没有搭理我"
       motion_cmds++;
-      t_motion_end = act_wheels(gen, "spin", p, hdu, 0.0f);
+      // 宽窗旋转的窗心取"旧位置与预测位置的中点"：大角度脉冲有时完全没执行（静摩擦，实测 -19°/-10°
+      // 各有一次车纹丝不动），窗心按满预测放会把还在原地的目标送出窗。中点 + 宽窗半径能同时罩住
+      // "执行了"与"没执行"两种结局；没执行时 u 不变、下一轮自然重发同一脚，stuck 计数兜底。
+      t_motion_end = act_wheels(gen, "spin", p, spin_wide ? hdu * 0.5f : hdu, 0.0f, spin_wide);
       continue;
     }
     // 连续 GRASP_ALIGN_N 帧都对准才继续：单帧读数若是跳变/误匹配，会骗出"已对准"，导致在偏位合爪
@@ -593,10 +598,18 @@ static R run(unsigned long gen) {
       // ★ 再按**实测横向漂移**收一层：一步前进会带偏 du_per_cm×cm，这个偏移必须留在 u 容差里 ——
       //   否则一步就把目标带出容差，而**贴近时旋转对 u 几乎无效**（目标离旋转轴很近，真机实测转 3 次
       //   u 恒定不动），那个"偏右"就再也纠不回来。见 Calibration.h 的 GRASP_DRIFT_BUDGET。
+      const float du_est = (fabsf(du_per_cm) > 1e-4f) ? fabsf(du_per_cm) : GRASP_DRIFT_ASSUMED;
       if (u_tol_now > 0.0f) {
-        const float du_est = (fabsf(du_per_cm) > 1e-4f) ? fabsf(du_per_cm) : GRASP_DRIFT_ASSUMED;
         const float cm_cap3 = GRASP_DRIFT_BUDGET * u_tol_now / du_est;
         if (cm_f > cm_cap3) cm_f = cm_cap3;
+      }
+      // ★ 落点约束：当前误差 + 本步漂移的**落点**必须仍在可夹范围(CLOSE_U_MAX)内 —— 旧账+新账一起算。
+      //   旧逻辑只限本步漂移：eu=0.025 时还前进 4cm（漂移 +0.028），落点 0.053 超出可夹范围，
+      //   紧接着外观崩掉判丢，连修正的机会都没有。
+      {
+        const float remain = GRASP_CLOSE_U_MAX - fabsf(eu_aim);
+        const float cm_cap4 = (remain > 0.0f) ? remain / du_est : 0.0f;
+        if (cm_f > cm_cap4) cm_f = cm_cap4;
       }
       if (cm_f > (float)GRASP_MOVE_MAX_CM) cm_f = (float)GRASP_MOVE_MAX_CM;
       int cm = (int)(cm_f + 0.5f);
