@@ -136,9 +136,7 @@ void mem_tick_stale(void) {
 // 导出车姿态 + 物体记忆为 JSON: 手机端「画面源 = 记忆」时据此画车头系俯视图。
 // 坐标与 mem_feed 完全同一套逆变换(车头系: 右+/前+, cm), 只读。
 void mem_export(JsonObject out) {
-  out["x"] = s_car_x;
-  out["y"] = s_car_y;
-  out["hd"] = (int)s_car_heading;
+  out["hd"] = (int)s_car_heading;   // 车自身只报朝向; 全局 x/y 不再喂给 AI(见 mem_feed 的说明)。手机端记忆地图也不用它。
   JsonArray objs = out["objs"].to<JsonArray>();
   float h = s_car_heading * AI_PI / 180.0f;
   for (int i = 0; i < AI_MEM_MAX; i++) {
@@ -152,15 +150,15 @@ void mem_export(JsonObject out) {
   }
 }
 
-// 生成喂给 AI 的空间记忆文本: 小车的全局 (x,y) 与朝向, 再按新鲜度(最近更新的在前)列出各物体。
-// ⚠️ 两种坐标系别混: 小车报的是**全局** (x,y); 物体位置一栏是**车头系**(按提示词的定义 x=车正前, y=车正右, cm)。
+// 生成喂给 AI 的空间记忆文本: 小车**朝向**, 再按新鲜度(最近更新的在前)列出各物体。
+// ⚠️ 物体位置一栏是**车头系**(按提示词的定义 x=车正前, y=车正右, cm), AI 零换算。
+// (车自身的全局 x,y 已按用户要求不再喂给 AI —— 里程无反馈、撞过就会漂, 拿来推距离反而误导)
 // 久未更新的条目照旧列出(不设喂回上限, 免得找早先记下的物体时找不着), 过期程度由"N轮未更新"表达。
 void mem_feed(char* buf, size_t cap) {
   // 朝向: 说成"相对初始转了多少"(左正右负), 供模型判断转向量, 不是物体方位依据。
   int hd = (int)s_car_heading;
-  int n = (hd == 0) ? snprintf(buf, cap, "小车 (%.0f, %.0f) 朝向: 与初始时同向", s_car_x, s_car_y)
-                    : snprintf(buf, cap, "小车 (%.0f, %.0f) 朝向: 相对初始时%s%d°",
-                               s_car_x, s_car_y, hd > 0 ? "左转" : "右转", hd > 0 ? hd : -hd);
+  int n = (hd == 0) ? snprintf(buf, cap, "小车朝向: 与初始时同向")
+                    : snprintf(buf, cap, "小车朝向: 相对初始时%s%d°", hd > 0 ? "左转" : "右转", hd > 0 ? hd : -hd);
   if (n < 0) n = 0;
   if (n > (int)cap - 1) {                      // 头一句就被截断(缓冲过小): 别让下面的写入越界
     buf[cap - 1] = 0;
