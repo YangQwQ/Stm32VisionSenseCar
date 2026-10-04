@@ -543,22 +543,8 @@ static void round_task_init(RoundCtx& c) {
     ground::screen_to_world(0.5f, 0.5f, &ex, &ey);
     ai::logf("[ai] 单应OK 中心→(%.0f,%.0f)", ex, ey);
   }
-  // 手机框选标注: 若解析出 {x,y,w,h} 就直接种给本地追踪器(标一个范围 → 自动锁定跟住)。
-  // ⚠️ 手机给的是**左上角 + 宽高**(归一化), 追踪器要的是**中心** ⇒ 此处换算; AI 的 observe 则是底部中心。
-  if (c.t.ann && c.t.ann[0]) {
-    JsonDocument d(&g_js_alloc);
-    if (deserializeJson(d, c.t.ann) == DeserializationError::Ok && d.is<JsonObjectConst>()) {
-      float bx = d["x"] | 0.0f, by = d["y"] | 0.0f, bw = d["w"] | 0.0f, bh = d["h"] | 0.0f;
-      if (bw > 0.0f && bh > 0.0f) {
-        const char* label = d["label"] | "标注目标";
-        track::seed(label, bx + bw * 0.5f, by + bh * 0.5f, bw, bh);
-        ai::logf("[track] 标注定范围: '%s' 中心(%.3f,%.3f) 框(%.3f,%.3f) → 已锁定, 后续按帧跟踪",
-                 label, (double)(bx + bw * 0.5f), (double)(by + bh * 0.5f), (double)bw, (double)bh);
-      } else {
-        ai::logf("[track] 标注无有效框(x/y/w/h), 未启用本地跟踪");
-      }
-    }
-  }
+  // 手机框选标注只作意图提示(进状态块给模型看), 不再起本地跟踪: 一起跟就把相机切走 RGB565、
+  // 整段任务手机没有画面。本地跟踪的入口只有 auto_grasp 一处。
   // 打印实际端点/模型, 便于排查 404/401 等云端拒绝(配错路径是常见原因)
   ai::logf("[ai] 端点=%s 模型=%s key=%s", cfg::ai_url().c_str(), cfg::ai_model().c_str(),
                 cfg::ai_key().isEmpty() ? "空" : "已配置");

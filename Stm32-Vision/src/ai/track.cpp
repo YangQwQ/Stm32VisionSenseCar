@@ -611,10 +611,16 @@ Result update_from_fb(const camera_fb_t* fb, bool light) {
   return r;
 }
 
+// 种子框(AI 标的位置): auto_grasp 播种前登记, 供 app_httpd 周期上报 —— 让手机在切跟踪画面**之前**
+// 的最后一帧上把框画出来, 人能看见 AI 到底标到了哪(标歪/标大时一眼看出, 不必等夹空)。
+static float s_seed[4] = { 0, 0, 0, 0 };
+static uint32_t s_seed_ms = 0;
+
 void stop() {
   ensure_mtx();
   const bool lk = take_mtx(2000);
   s_t.st = State::Idle;
+  s_seed_ms = 0;                // 种子框一并作废: 否则跟踪都停了板子还在给手机推这个框
   s_t.miss = 0;
   s_t.name[0] = 0;
   s_last_ok = false;
@@ -661,11 +667,6 @@ float probe_appear0() { return s_pa0; }
 float probe_appear1() { return s_pa1; }
 unsigned long last_update_ms() { return s_last_upd_ms; }
 unsigned long last_capture_ms() { return s_last_cap_ms; }
-
-// 种子框(AI 标的位置): auto_grasp 播种前登记, 供 app_httpd 周期上报 —— 让手机在切跟踪画面**之前**
-// 的最后一帧上把框画出来, 人能看见 AI 到底标到了哪(标歪/标大时一眼看出, 不必等夹空)。
-static float s_seed[4] = { 0, 0, 0, 0 };
-static uint32_t s_seed_ms = 0;
 
 void set_seed_box(float u, float v, float w, float h) {
   s_seed[0] = u; s_seed[1] = v; s_seed[2] = w; s_seed[3] = h;

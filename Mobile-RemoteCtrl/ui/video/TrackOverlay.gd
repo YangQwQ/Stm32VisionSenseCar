@@ -25,6 +25,7 @@ var seed_v := -1.0
 var seed_w := 0.0
 var seed_h := 0.0
 var seed_until := 0
+var _seed_timer: SceneTreeTimer = null
 
 func set_seed_box(u: float, v: float, w: float, h: float) -> void:
 	seed_u = u
@@ -32,7 +33,24 @@ func set_seed_box(u: float, v: float, w: float, h: float) -> void:
 	seed_w = w
 	seed_h = h
 	seed_until = Time.get_ticks_msec() + 2500
+	_seed_arm_timer()
 	queue_redraw()
+
+## 过期那一刻要自己申请一次重绘：没有后续消息时画布不会再画，过期的框会一直糊在屏幕上。
+func _seed_arm_timer() -> void:
+	if _seed_timer != null and _seed_timer.time_left > 0.0:
+		return
+	var left: float = float(seed_until - Time.get_ticks_msec()) / 1000.0 + 0.1
+	_seed_timer = get_tree().create_timer(maxf(left, 0.2))
+	_seed_timer.timeout.connect(_on_seed_timer)
+
+func _on_seed_timer() -> void:
+	if seed_u < 0.0:
+		return
+	if Time.get_ticks_msec() > seed_until:
+		clear_seed_box()
+		return
+	_seed_arm_timer()
 
 func clear_seed_box() -> void:
 	seed_u = -1.0
@@ -75,6 +93,7 @@ func _draw_seed_box() -> void:
 		draw_line(c, c + Vector2(0, 12.0 * cy), col, 4.0)
 
 func clear_target() -> void:
+	seed_u = -1.0   # 跟踪收尾/掉线时种子框一并收掉（它可能停在"已标框但还没起跟"那一步）
 	target_u = -1.0
 	target_v = -1.0
 	target_conf = 0.0
